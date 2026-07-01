@@ -1,0 +1,74 @@
+﻿location: East US
+name: bettersnapai-if
+properties:
+  environmentId: /subscriptions/cf197124-2e9a-48d5-af4b-de22fbbd683e/resourceGroups/bettersnap-ai-rg/providers/Microsoft.App/managedEnvironments/bettersnapai-CE
+  # Pins the job to the A100 80GB serverless-GPU profile (Consumption-GPU-NC24-A100).
+  # WITHOUT this line the job falls back to the env's no-GPU "Consumption" profile
+  # and load_base_model()'s .to("cuda") fails — the silent no-GPU deploy we are
+  # guarding against. The cpu/memory below must match this profile's fixed alloc.
+  workloadProfileName: bettersnapaiWPn
+  configuration:
+    triggerType: Manual
+    # ── A100 cost ceilings ──────────────────────────────────────────────
+    # Each replica is a full A100 80GB that also pays a ~5-min model-load tax
+    # before any inference runs. Keep these tight — a stuck or looping job
+    # burns GPU money fast.
+    #
+    # retryLimit 0: do NOT re-run a failed job on the A100. main.py already
+    # retries the DB connect (5x) and re-raises real inference errors, so a
+    # replica retry almost always just fails again — pure GPU burn. Let the
+    # user resubmit instead. (Was 3 → up to 3x wasted A100 runs per poison job.)
+    replicaRetryLimit: 0
+    # Hard wall-clock cap per replica (max seconds a replica may run).
+    # KEPT AT 1800 deliberately: do NOT lower until logs prove p95/p99 of
+    # successful runs is safely under the new value — cutting this too low turns
+    # slow-but-valid jobs into false failures. Realistic run is ~5-min load +
+    # 4-image inference; once we have real runtime stats, revisit (e.g. 1200).
+    replicaTimeout: 1800
+    # One job execution = exactly one A100 replica; never fan out to several.
+    manualTriggerConfig:
+      parallelism: 1
+      replicaCompletionCount: 1
+    registries:
+      - identity: system-environment
+        server: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io
+  template:
+    containers:
+      - name: bettersnapai-if
+        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v16
+        resources:
+          cpu: 24
+          memory: 220Gi
+        env:
+          # HF_TOKEN intentionally NOT set here. The model is loaded from the
+          # mounted /models Azure File volume with local_files_only=True, so no
+          # Hugging Face call happens at runtime — a token is not needed.
+          # If you ever need to RE-DOWNLOAD a model from Hugging Face, do NOT
+          # put the token in this file. Add it as a Container Apps secret backed
+          # by Key Vault and reference it, e.g.:
+          #   configuration.secrets:
+          #     - name: hf-token
+          #       keyVaultUrl: https://bettersnapkeyvault.vault.azure.net/secrets/hf-token
+          #       identity: system
+          #   env:
+          #     - name: HF_TOKEN
+          #       secretRef: hf-token
+          - name: AZURE_STORAGE_ACCOUNT
+            value: bettersnapaistorage
+          - name: AZURE_QUEUE_NAME
+            value: inference-jobs
+          - name: AZURE_BLOB_CONTAINER
+            value: outputs
+          - name: AZURE_LORA_CONTAINER
+            value: lora-weights
+          - name: SQL_SERVER
+            value: bettersnap-srv.database.windows.net
+          - name: SQL_DATABASE
+            value: bettersnap-db
+        volumeMounts:
+          - volumeName: models
+            mountPath: /models
+    volumes:
+      - name: models
+        storageType: AzureFile
+        storageName: models

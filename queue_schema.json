@@ -1,0 +1,42 @@
+{
+  "_comment": "BetterSnap AI — Azure Queue Message Schema",
+  "_note": "Step 1 warmup message has only job_id and user_id. Full payload sent after Step 8.",
+
+  "warmup_message": {
+    "job_id": "uuid-string",
+    "user_id": "uuid-string",
+    "photo_urls": []
+  },
+
+  "full_payload": {
+    "job_id": "uuid-string",
+    "user_id": "uuid-string",
+    "email": "user@example.com",
+    "category": "linkedin",
+    "gender": "male",
+    "age_range": "25-29",
+    "hair_color": "black",
+    "attire": "navy blue professional business suit with a white shirt",
+    "background": "light_grey",
+    "num_images": 4,
+    "photo_urls": [
+      "https://betttersnapblob.blob.core.windows.net/uploads/user123/photo1.jpg",
+      "https://betttersnapblob.blob.core.windows.net/uploads/user123/photo2.jpg"
+    ]
+  },
+
+  "valid_categories": [
+    "linkedin", "resume", "corporate", "business_casual",
+    "creative", "dating", "social_media", "conference",
+    "executive", "startup", "legal", "medical",
+    "academic", "real_estate", "lifestyle"
+  ],
+
+  "valid_backgrounds": [
+    "white", "gray", "light_grey", "office", "black"
+  ],
+
+  "valid_age_ranges": [
+    "18-20", "21-24", "25-29", "30-40", "41-50", "51-65", "65+"
+  ]
+}

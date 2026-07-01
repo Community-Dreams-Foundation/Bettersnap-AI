@@ -1,0 +1,8 @@
+﻿data_collection/
+__pycache__/
+*.pyc
+*.safetensors
+*.bin
+*.ckpt
+.env
+.venv/

@@ -1,0 +1,11 @@
+azure-functions
+azure-identity
+azure-keyvault-secrets
+azure-storage-blob
+azure-storage-queue
+azure-communication-email
+pyodbc
+pyjwt[crypto]
+cryptography
+requests
+azure-mgmt-appcontainers
