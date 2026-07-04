@@ -7,6 +7,11 @@ sentencepiece
 diffusers==0.36.0
 transformers==4.49.0
 accelerate==1.14.0
+# LoRA adapter backend. diffusers' named-adapter path (load_lora_weights(adapter_name=)
+# + set_adapters) requires PEFT — without it load raises "PEFT backend is required".
+# Resolves to peft 0.19.1; verified via pip --dry-run in the py3.11 image to NOT move
+# the pinned torch/transformers/accelerate/diffusers stack (peft's floors are all met).
+peft>=0.11
 huggingface_hub>=0.34.0
 Pillow
 requests

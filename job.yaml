@@ -35,24 +35,15 @@ properties:
   template:
     containers:
       - name: bettersnapai-if
-        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v16
+        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v23
         resources:
           cpu: 24
           memory: 220Gi
         env:
-          # HF_TOKEN intentionally NOT set here. The model is loaded from the
-          # mounted /models Azure File volume with local_files_only=True, so no
-          # Hugging Face call happens at runtime — a token is not needed.
-          # If you ever need to RE-DOWNLOAD a model from Hugging Face, do NOT
-          # put the token in this file. Add it as a Container Apps secret backed
-          # by Key Vault and reference it, e.g.:
-          #   configuration.secrets:
-          #     - name: hf-token
-          #       keyVaultUrl: https://bettersnapkeyvault.vault.azure.net/secrets/hf-token
-          #       identity: system
-          #   env:
-          #     - name: HF_TOKEN
-          #       secretRef: hf-token
+          # HF_TOKEN intentionally NOT set. SDXL base 1.0 + the fp16-fix VAE are
+          # BAKED INTO THE IMAGE (see Dockerfile) at /models/sdxl-base and
+          # /models/sdxl-vae — both ungated — so there is no runtime Hugging Face
+          # call and no Azure Files mount. The image is fully self-contained.
           - name: AZURE_STORAGE_ACCOUNT
             value: bettersnapaistorage
           - name: AZURE_QUEUE_NAME
@@ -65,10 +56,6 @@ properties:
             value: bettersnap-srv.database.windows.net
           - name: SQL_DATABASE
             value: bettersnap-db
-        volumeMounts:
-          - volumeName: models
-            mountPath: /models
-    volumes:
-      - name: models
-        storageType: AzureFile
-        storageName: models
+        # No volumeMounts: the model is baked into the image, so the /models
+        # AzureFile mount (and the top-level `volumes:` block) is gone. The
+        # 'models' Azure File share can be decommissioned once SDXL is validated.

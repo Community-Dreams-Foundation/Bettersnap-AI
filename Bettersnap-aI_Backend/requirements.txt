@@ -8,4 +8,7 @@ pyodbc
 pyjwt[crypto]
 cryptography
 requests
-azure-mgmt-appcontainers
+# Pinned: 4.0.0's client op-group for listing job executions is `jobs_executions`
+# (older versions used `job_executions`). Unpinned, a deploy silently upgraded and
+# broke count_active_job_executions/dispatch with AttributeError. Pin to lock the API.
+azure-mgmt-appcontainers==4.0.0

@@ -237,6 +237,17 @@ def run(job_id: str, user_id: str, commit: bool):
 
 
 def main_cli():
+    # ── PARKED (FLUX-era) ─────────────────────────────────────────────────
+    # This harness stubs `FluxKontextPipeline` and exercises the OLD FLUX
+    # pipeline. main.py is now SDXL, so this no longer mirrors production and
+    # would give misleading results. Refuses to run unless explicitly forced.
+    # TODO: rebuild against StableDiffusionXLPipeline before un-parking.
+    if os.environ.get("BETTERSNAP_ALLOW_PARKED") != "1":
+        log.error(
+            "PARKED: local_test.py targets the retired FLUX pipeline and no longer "
+            "matches main.py (now SDXL). Set BETTERSNAP_ALLOW_PARKED=1 to override."
+        )
+        sys.exit(2)
     load_dotenv()
     ap = argparse.ArgumentParser(description="Local container-pipeline test (GPU mocked)")
     ap.add_argument("--job-id", default=os.environ.get("JOB_ID"),

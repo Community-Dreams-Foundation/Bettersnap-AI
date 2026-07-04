@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import torch
 import pyodbc
-from diffusers import FluxKontextPipeline
+from diffusers import StableDiffusionXLPipeline, AutoencoderKL
 from azure.keyvault.secrets import SecretClient
 
 from azure.storage.queue import QueueClient, TextBase64DecodePolicy
@@ -141,7 +141,10 @@ PROMPT_TEMPLATES = [
 ]
 
 SEEDS           = [42, 1337, 9999, 77777]
-GUIDANCE_SCALES = [1.5, 2.5, 3.0, 3.5]
+# SDXL CFG range (~5–9). The old [1.5, 2.5, 3.0, 3.5] values were FLUX-Kontext
+# guidance — far too low for SDXL (washed-out, under-conditioned renders). Bumped
+# with the FLUX→SDXL swap; treat these as a starting point, not tuned.
+GUIDANCE_SCALES = [7.0, 6.0, 8.0, 7.5]
 
 
 # ─────────────────────────────────────────────────────────
@@ -162,24 +165,35 @@ def load_base_model():
         write_debug(f"/models listdir ERROR: {e}")
 
     try:
-        write_debug("Calling FluxKontextPipeline.from_pretrained('/models')...")
-        # NOTE: do NOT call .to("cuda") here. enable_model_cpu_offload() takes over
-        # device placement: each component (transformer, T5, CLIP, VAE) lives on CPU
-        # and is paged to GPU only while it runs, then offloaded. This keeps the ~10GB
-        # T5+CLIP+VAE out of VRAM during the transformer denoising loop (the v15 OOM was
-        # all components co-resident on GPU at pipe() start). vae.enable_tiling() caps the
-        # VAE encode/decode peak. Calling .to("cuda") would conflict with the offload hooks.
-        pipe = FluxKontextPipeline.from_pretrained(
-            "/models",
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
+        write_debug("Loading SDXL base 1.0 + fp16-fix VAE from baked /models ...")
+        # SDXL base 1.0 in fp16 with the madebyollin/sdxl-vae-fp16-fix VAE. Stock SDXL
+        # VAE in fp16 overflows to NaN → black/colored-static output (the SAME signature
+        # as the abandoned FLUX failure); the fp16-fix VAE is the standard cure and lets
+        # the whole pipeline stay fp16 (no dtype split between UNet / text encoders / VAE).
+        # Weights are baked into the image (no mount, no HF download) — see Dockerfile.
+        #
+        # NOTE: do NOT call .to("cuda") here. enable_model_cpu_offload() takes over device
+        # placement: each component (UNet, the two text encoders, VAE) lives on CPU and is
+        # paged to GPU only while it runs, then offloaded — keeps them from being co-resident
+        # on the GPU at pipe() start (the v15 OOM). vae.enable_tiling() caps the VAE
+        # encode/decode peak. Calling .to("cuda") would conflict with the offload hooks.
+        vae = AutoencoderKL.from_pretrained(
+            "/models/sdxl-vae",
+            torch_dtype=torch.float16,
+        )
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            "/models/sdxl-base",
+            vae=vae,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
         )
         pipe.enable_model_cpu_offload()
         pipe.vae.enable_tiling()
 
         # One-time VRAM sanity check: confirm the container actually sees the full A100
-        # 80GB. A single 1024 Kontext image (~34GB weights) OOMing an 80GB card would mean
-        # usable VRAM is lower than nominal — something beyond co-residency.
+        # 80GB. SDXL is ~7GB in fp16 — nowhere near an 80GB card — so an OOM here would
+        # mean usable VRAM is far lower than nominal, not model size.
         try:
             props = torch.cuda.get_device_properties(0)
             total_gb = props.total_memory / 1024**3
@@ -217,21 +231,46 @@ def load_category_lora(category: str) -> bool:
 
 
 def load_identity_lora(user_id: str) -> bool:
-    """Download + register the identity LoRA. Returns True if the adapter was
-    loaded, False otherwise. Does NOT call set_adapters (the old code hardcoded
-    ['category_lora', 'identity_lora'] here and crashed when category was absent);
-    the caller activates only the adapters that actually loaded."""
+    """Download + register the identity LoRA from
+    lora-weights/identity/<user_id>/adapter_model.safetensors. Returns True if the
+    adapter was loaded, False otherwise. Does NOT call set_adapters; the caller
+    activates only the adapters that actually loaded.
+
+    A key-format mismatch (kohya vs diffusers) does NOT raise — diffusers WARNS
+    about unexpected/unmatched keys and silently loads nothing, which then renders
+    as a generic (no-effect) image. We capture those WARNING logs and write them to
+    the debug blob so a silent no-op LoRA is diagnosable instead of invisible."""
     lora_path = f"/tmp/lora_identity_{user_id}.safetensors"
     blob_name  = f"identity/{user_id}/adapter_model.safetensors"
     try:
         blob_client = blob_service.get_blob_client(container=AZURE_LORA_CONTAINER, blob=blob_name)
         with open(lora_path, "wb") as f:
             f.write(blob_client.download_blob().readall())
-        pipe.load_lora_weights(lora_path, adapter_name="identity_lora")
-        log.info(f"✅ Identity LoRA loaded: {user_id}")
+
+        import logging as _logging
+        caught = []
+        class _Catch(_logging.Handler):
+            def emit(self, rec):
+                if rec.levelno >= _logging.WARNING:
+                    caught.append(rec.getMessage())
+        root = _logging.getLogger()
+        handler = _Catch()
+        root.addHandler(handler)
+        try:
+            pipe.load_lora_weights(lora_path, adapter_name="identity_lora")
+        finally:
+            root.removeHandler(handler)
+
+        size = os.path.getsize(lora_path)
+        write_debug(
+            f"Identity LoRA loaded: user={user_id} bytes={size} "
+            f"load_warnings={caught if caught else 'none'}"
+        )
+        log.info(f"✅ Identity LoRA loaded: {user_id} (warnings={len(caught)})")
         return True
     except Exception as e:
-        log.warning(f"⚠️ Identity LoRA not found for '{user_id}': {e}")
+        write_debug(f"Identity LoRA load FAILED for '{user_id}': {e}")
+        log.warning(f"⚠️ Identity LoRA not found/failed for '{user_id}': {e}")
         return False
 
 
@@ -265,12 +304,16 @@ def load_image_from_blob(container: str, blob_name: str) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-def resize_for_kontext(img: Image.Image) -> Image.Image:
+def resize_for_sdxl(img: Image.Image) -> Image.Image:
+    # SDXL is trained at ~1024². Cap the long edge at 1024 and snap to a multiple
+    # of 8 (SDXL's latent stride). Today's render is text-to-image so this is only
+    # used to validate the input-blob read path; it becomes load-bearing when the
+    # img2img / identity path lands.
     target = 1024
     w, h   = img.size
     ratio  = min(target / w, target / h)
-    new_w  = (int(w * ratio) // 16) * 16
-    new_h  = (int(h * ratio) // 16) * 16
+    new_w  = (int(w * ratio) // 8) * 8
+    new_h  = (int(h * ratio) // 8) * 8
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
@@ -423,33 +466,60 @@ def run_inference(job: dict) -> list:
 
     bg = BACKGROUNDS.get(background, "soft light grey studio background")
 
+    # Read the input blob to validate the upload→blob path end-to-end. Today's
+    # render is text-to-image (vanilla SDXL, no identity conditioning yet), so the
+    # image is NOT fed to the pipe — it becomes load-bearing with the img2img /
+    # identity milestone. Keeping the read here keeps the queue→blob path exercised.
     container_name, blob_name = input_blob.split("/", 1)
     user_image = load_image_from_blob(container_name, blob_name)
-    user_image = resize_for_kontext(user_image)
-    log.info(f"🖼️ Image size: {user_image.size}")
+    user_image = resize_for_sdxl(user_image)
+    log.info(f"🖼️ Input image size (read-only smoke check): {user_image.size}")
 
-    # ── Per-user/category LoRA: DISABLED (inference-only, no LoRA weights yet).
-    # Base FLUX runs with no adapters. Re-enable the block below when LoRA
-    # weights exist. set_adapters is built from what actually loaded, so a
-    # missing/partial load can never reference an unloaded adapter name.
-    # active, weights = [], []
-    # if load_category_lora(category):
-    #     active.append("category_lora"); weights.append(0.8)
-    # if load_identity_lora(user_id):
-    #     active.append("identity_lora"); weights.append(0.6)
-    # if active:
-    #     pipe.set_adapters(active, adapter_weights=weights)
+    # ── Per-user identity LoRA (Phase 2 activation) ───────────────────────
+    # Base SDXL is baked into the image; the LoRA is the ONLY per-job fetch, pulled
+    # from lora-weights/identity/<user_id>/adapter_model.safetensors. We activate via
+    # set_adapters (NOT fuse_lora): fusing conflicts with enable_model_cpu_offload,
+    # while set_adapters applies the adapter during the offloaded forward pass — same
+    # visible result. active/weights are built from what actually loaded, so a missing
+    # category adapter can never reference an unloaded name.
+    active, weights = [], []
+    if load_category_lora(category):
+        active.append("category_lora"); weights.append(0.8)
+    if load_identity_lora(user_id):
+        active.append("identity_lora")
+        weights.append(float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0")))
+    if active:
+        pipe.set_adapters(active, adapter_weights=weights)
+        write_debug(f"LoRA adapters ACTIVE: {active} weights={weights}")
+    else:
+        write_debug("No LoRA adapters loaded; rendering BASE SDXL (generic).")
 
     result_blob_paths = []
     for i in range(num_images):
         prompt = PROMPT_TEMPLATES[i % len(PROMPT_TEMPLATES)].format(
             bg=bg, attire=attire, descriptor=descriptor
         )
+        # PROMPT_OVERRIDE (test hook): when set, replace the template entirely with a
+        # plain neutral prompt. Used for the LoRA re-test — a neutral prompt with NO
+        # style words means any style in the output must come from the ADAPTER, not text.
+        _override = os.environ.get("PROMPT_OVERRIDE", "").strip()
+        if _override:
+            prompt = _override
+        # LoRA trigger word (test-configurable via env). Many adapters only fully
+        # activate when their trigger token is present in the prompt; prepend it so a
+        # loaded LoRA actually shows. Empty by default = no-op for base SDXL.
+        _trigger = os.environ.get("LORA_TRIGGER", "").strip()
+        if _trigger:
+            prompt = f"{_trigger}, {prompt}"
         log.info(f"📣 Variation {i+1} prompt: {prompt}")
         try:
+            # Text-to-image: StableDiffusionXLPipeline does NOT take image=. This is
+            # the vanilla-SDXL render smoke test (prove clean output, not static);
+            # image conditioning (img2img / identity) is a later milestone.
             output = pipe(
                 prompt=prompt,
-                image=user_image,
+                height=1024,
+                width=1024,
                 guidance_scale=GUIDANCE_SCALES[i % len(GUIDANCE_SCALES)],
                 num_inference_steps=20,
                 generator=torch.Generator("cuda").manual_seed(SEEDS[i % len(SEEDS)]),

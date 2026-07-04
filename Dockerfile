@@ -37,6 +37,25 @@ RUN python3.11 -m pip install --no-cache-dir numpy==1.26.4 && \
         --index-url https://download.pytorch.org/whl/cu121 && \
     python3.11 -m pip install --no-cache-dir -r requirements.txt
 
+# ── Bake SDXL base 1.0 + fp16-fix VAE into the image ────────────────────────
+# NO Azure Files mount, NO runtime HF download: the model ships in the image so
+# the A100 starts inference with zero network dependency (offline, reproducible).
+# Both repos are UNGATED — no HF token needed. Revisions pinned to commit hashes
+# so a rebuild can never silently pull a changed 'main'.
+#
+# Base repo: fetch ONLY the fp16 variant (*.fp16.safetensors) + configs/tokenizers
+# (*.json/*.txt) — skips the fp32 + .bin duplicates to keep the image (and cold-start
+# pull) small. The VAE fp16-fix repo is tiny, so take it whole.
+ENV HF_HUB_ENABLE_HXET=0
+RUN huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
+        --revision 462165984030d82259a11f4367a4eed129e94a7b \
+        --include "*.json" "*.txt" "*.fp16.safetensors" \
+        --local-dir /models/sdxl-base && \
+    huggingface-cli download madebyollin/sdxl-vae-fp16-fix \
+        --revision 207b116dae70ace3637169f1ddd2434b91b3a8cd \
+        --local-dir /models/sdxl-vae && \
+    rm -rf /root/.cache/huggingface
+
 COPY main.py .
 
 CMD ["python3.11", "main.py"]
