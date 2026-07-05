@@ -1,5 +1,9 @@
 <#
-  deploy_v16.ps1 — BetterSnap AI inference deploy (everything EXCEPT triggering a job).
+  deploy.ps1 — BetterSnap AI inference deploy (everything EXCEPT triggering a job).
+
+  Canonical image tag: v23 — the last verified-good SDXL + guarded-dispatch image.
+  job.yaml and this script are kept in lock-step on this tag; bump -ImageTag here
+  AND update job.yaml together, never one alone.
 
   Run this in your VS Code terminal (where `az` is logged in), or paste it to
   Claude Code to execute. It is intentionally SAFE: it never starts an A100 job.
@@ -9,13 +13,13 @@
   Steps:
     0. Preflight — confirm az login + required CLIs
     1. Apply DB migrations 001 + 002 (idempotent; pulls DB password from Key Vault)
-    2. Build + push inference:v16 to ACR
-    3. Point the job at inference:v16
+    2. Build + push inference:v23 to ACR
+    3. Point the job at inference:v23 AND set its A100 resources (cpu + memory)
     4. Publish the Functions backend (dispatch + refund + result-url)
     5. Verify image + GPU profile
 
   Usage:
-    ./deploy_v16.ps1 -FunctionApp "<your-function-app-name>"
+    ./deploy.ps1 -FunctionApp "<your-function-app-name>"
     # add -SkipMigrations if you applied 001/002 in the portal already
 #>
 
@@ -25,7 +29,15 @@ param(
   [string]$JobName       = "bettersnapai-if",
   [string]$Registry      = "bettersnapregistry",
   [string]$ImageRepo     = "bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference",
-  [string]$ImageTag      = "v16",
+  # Canonical tag. v23 = verified-good SDXL + baked weights + guarded dispatch.
+  # MUST match the image tag in job.yaml — bump both together or ACA can serve a
+  # stale image. (History: v16 = FLUX; v17 = FLUX->SDXL swap; v23 = current good.)
+  [string]$ImageTag      = "v23",
+  # A100 resource alloc, set on every redeploy (see Step 3). These MUST match the
+  # Consumption-GPU-NC24-A100 workload profile's fixed alloc AND job.yaml, or a
+  # bare `--image`-only update silently drops the job toward the 1Gi OOM default.
+  [string]$Cpu           = "24",
+  [string]$Memory        = "220Gi",
   [string]$KeyVault      = "bettersnapkeyvault",
   [string]$SqlServer     = "bettersnap-srv.database.windows.net",
   [string]$SqlDatabase   = "bettersnap-db",
@@ -76,14 +88,19 @@ if (-not $SkipMigrations) {
   Step 1 "Migrations SKIPPED (-SkipMigrations)"
 }
 
-# ── 2. Build + push v16 ─────────────────────────────────────────────────────
+# ── 2. Build + push v23 ─────────────────────────────────────────────────────
 Step 2 "Build + push $Image (ACR build)"
 Confirm-Continue "Build and push $ImageTag from $RepoRoot ?"
 az acr build --registry $Registry --image "inference:$ImageTag" $RepoRoot
 
-# ── 3. Point the job at v16 ─────────────────────────────────────────────────
-Step 3 "Update job $JobName -> $Image"
-az containerapp job update --name $JobName --resource-group $ResourceGroup --image $Image | Out-Null
+# ── 3. Point the job at v23 + set A100 resources ────────────────────────────
+# --cpu/--memory are set here too, NOT just --image. An image-only update leaves
+# resources at whatever the job was last created with; if that ever regresses to
+# the ~1Gi default the container OOM-SIGKILLs (exit 137) on model load. Setting
+# them every deploy makes the 220Gi alloc self-healing.
+Step 3 "Update job $JobName -> $Image (cpu=$Cpu memory=$Memory)"
+az containerapp job update --name $JobName --resource-group $ResourceGroup `
+  --image $Image --cpu $Cpu --memory $Memory | Out-Null
 
 # ── 4. Publish Functions backend ────────────────────────────────────────────
 Step 4 "Publish Functions app '$FunctionApp'"
@@ -95,7 +112,7 @@ finally { Pop-Location }
 # ── 5. Verify ───────────────────────────────────────────────────────────────
 Step 5 "Verify image + GPU profile"
 az containerapp job show --name $JobName --resource-group $ResourceGroup `
-  --query "{image:properties.template.containers[0].image, profile:properties.workloadProfileName}" -o table
+  --query "{image:properties.template.containers[0].image, cpu:properties.template.containers[0].resources.cpu, memory:properties.template.containers[0].resources.memory, profile:properties.workloadProfileName}" -o table
 
 Write-Host "`nDONE. Backend + image deployed. No job was triggered." -ForegroundColor Green
 Write-Host "To run the ONE manual test (yourself, when ready):" -ForegroundColor Yellow
