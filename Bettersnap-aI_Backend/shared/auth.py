@@ -1,61 +1,79 @@
 import os
 import jwt
 import logging
-from shared.keyvault import get_secret
+from jwt import PyJWKClient
 
-_secret = None
-
-def get_secret_key():
-    global _secret
-    if _secret is None:
-        _secret = get_secret("supabase-jwt-secret")
-    return _secret
-
-# ── Token validation policy ───────────────────────────────────────────────
-# INTERIM hardening (this pass): Supabase HS256, signature + exp ENFORCED.
-# The previous code decoded with verify_signature=False — it accepted any
-# forged token, so `sub` was fully attacker-controlled. That is closed here.
+# ── Token validation policy — Entra External ID (Azure AD), RS256 + JWKS ──────
+# Migrated off Supabase HS256. Tokens are now Entra access tokens signed with
+# RS256; we validate the signature against the tenant's published JWKS and
+# enforce iss / aud / exp. There is NO shared secret anymore, so the
+# supabase-jwt-secret Key Vault read is gone.
 #
-# Supabase tokens are HS256 (symmetric secret from Key Vault), aud="authenticated",
-# iss="https://<project-ref>.supabase.co/auth/v1". aud/iss are read from env so we
-# don't hardcode the project ref:
-#   - SUPABASE_JWT_AUD defaults to "authenticated" (the Supabase standard) and is
-#     always enforced.
-#   - SUPABASE_JWT_ISS is enforced ONLY when set. It is left unset by default
-#     because a WRONG issuer value locks every user out; set it once the project
-#     ref is confirmed (find it in the Supabase dashboard URL / JWT `iss` claim).
-# ES256 was dropped from the algorithm list: with a symmetric secret only HS256 is
-# valid, and allowing both invites an algorithm-confusion downgrade.
+# All three values come from app settings (Function App configuration):
+#   ENTRA_JWKS_URI — jwks_uri from the tenant's OIDC discovery document, e.g.
+#                    https://<tenant>.ciamlogin.com/<tenant-id>/discovery/v2.0/keys
+#   ENTRA_ISSUER   — the exact `iss` claim, e.g.
+#                    https://<tenant-id>.ciamlogin.com/<tenant-id>/v2.0
+#   ENTRA_AUD      — the API audience the frontend requests a token for, e.g.
+#                    api://d14bccac-4a37-4919-89a3-24272a0825bc
+#                    (may instead be the bare client-id GUID — confirm from a
+#                    real token before setting; see fail-closed note below).
 #
-# The real fix (later milestone) is Azure AD RS256/JWKS — pyjwt[crypto] is already
-# installed for that.
-_EXPECTED_AUD = os.environ.get("SUPABASE_JWT_AUD", "authenticated")
-_EXPECTED_ISS = os.environ.get("SUPABASE_JWT_ISS")  # e.g. https://<ref>.supabase.co/auth/v1
+# FAIL CLOSED: validate_token refuses to validate (raises) unless ENTRA_AUD,
+# ENTRA_ISSUER and ENTRA_JWKS_URI are all set. ENTRA_AUD is intentionally left
+# UNSET until a real token's `aud` is confirmed — so until then every call 401s
+# rather than accepting a token against an unknown/blank audience. Reading env
+# at call time (not import) keeps `import shared.auth` clean even with nothing
+# configured yet.
+_jwks_client = None
+
+
+def _get_jwks_client() -> PyJWKClient:
+    """Lazily build a cached PyJWKClient. Module-level singleton so a warm
+    Function instance reuses it; PyJWKClient also caches the fetched JWK set and
+    individual signing keys, so steady state does no network call per request."""
+    global _jwks_client
+    if _jwks_client is None:
+        jwks_uri = os.environ.get("ENTRA_JWKS_URI")
+        if not jwks_uri:
+            raise RuntimeError("ENTRA_JWKS_URI not set — cannot fetch signing keys")
+        _jwks_client = PyJWKClient(jwks_uri, cache_keys=True)
+    return _jwks_client
 
 
 def validate_token(token: str) -> dict:
     try:
-        secret = get_secret_key()
-        options = {
-            "require": ["exp", "sub"],
-            "verify_signature": True,
-            "verify_exp": True,
-        }
-        decode_kwargs = {"algorithms": ["HS256"], "options": options}
-        if _EXPECTED_AUD:
-            decode_kwargs["audience"] = _EXPECTED_AUD
-        else:
-            options["verify_aud"] = False
-        if _EXPECTED_ISS:
-            decode_kwargs["issuer"] = _EXPECTED_ISS
-        else:
-            logging.warning(
-                "SUPABASE_JWT_ISS not set — issuer is NOT enforced. "
-                "Set it to fully close the auth gate."
+        aud = os.environ.get("ENTRA_AUD")
+        iss = os.environ.get("ENTRA_ISSUER")
+        # Fail closed on missing config. AUD first because it is the value we
+        # deliberately hold back until confirmed from a real token.
+        if not aud:
+            raise RuntimeError(
+                "ENTRA_AUD not set — refusing to validate (fail closed). "
+                "Set it to the confirmed token audience "
+                "(api://<client-id> or the bare client-id GUID)."
             )
+        if not iss:
+            raise RuntimeError("ENTRA_ISSUER not set — refusing to validate (fail closed).")
 
-        payload = jwt.decode(token, secret, **decode_kwargs)
-        logging.info(f"Token validated: sub={payload.get('sub')}")
+        signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=aud,
+            issuer=iss,
+            options={
+                # require: reject a token missing any of these outright — `oid`
+                # included so get_user_id can never KeyError on a malformed token.
+                "require": ["exp", "iss", "aud", "oid"],
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_aud": True,
+                "verify_iss": True,
+            },
+        )
+        logging.info(f"Token validated: oid={payload.get('oid')}")
         return payload
     except Exception as e:
         logging.warning(f"Token validation failed: {e}")
@@ -64,4 +82,8 @@ def validate_token(token: str) -> dict:
 
 def get_user_id(token: str) -> str:
     payload = validate_token(token)
-    return payload["sub"]
+    # oid = Entra object ID (stable per-user GUID). Using it as users.user_id
+    # keeps the existing GUID PK — no primary-key migration. (Note: `sub` is a
+    # per-app pairwise subject and is NOT stable across apps, so it must not be
+    # used as the identity key.)
+    return payload["oid"]

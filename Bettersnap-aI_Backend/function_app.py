@@ -51,7 +51,17 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    user_id = payload["sub"]
+    # oid = Entra object ID — the SAME claim get_user_id() returns, so
+    # registration and every later lookup key off one identity. (Was payload["sub"],
+    # a per-app pairwise subject → users were created under sub but looked up by
+    # oid, a silent split-identity 404 on the first post-register call.)
+    user_id = payload["oid"]
+    # Best-effort profile fields. Entra External ID may name these differently
+    # (email can arrive under a different claim; display name is `name` vs
+    # `preferred_username`). Defaults keep this crash-free; the log below dumps
+    # the actual claim KEYS (not values — no PII/token contents) on a genuine
+    # first registration so we can confirm the real names from a live token
+    # instead of guessing.
     email = payload.get("email", "")
     name = payload.get("name", "")
 
@@ -66,6 +76,11 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200
         )
 
+    logging.info(
+        f"First registration for oid={user_id}; token claim keys="
+        f"{sorted(payload.keys())} (email_present={'email' in payload}, "
+        f"name_present={'name' in payload})"
+    )
     cursor.execute("""
         INSERT INTO users (user_id, email, full_name, credits_remaining)
         VALUES (?, ?, ?, 20)
@@ -98,6 +113,106 @@ def user_credits(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps({"credits_remaining": row[0]}),
         mimetype="application/json",
         status_code=200
+    )
+
+# ── Profile: Get ──────────────────────────────────────────
+# Reads the caller's profile straight off the EXISTING users table (keyed on the
+# Entra oid = users.user_id). No separate profiles table — that would duplicate
+# email / full_name / credits_remaining and drift.
+@app.route(route="profiles/me", methods=["GET"])
+def get_profile(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    # Fresh-start: no row until the user has registered. register_user is the ONLY
+    # path that creates a users row (and grants the initial credits).
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    return func.HttpResponse(
+        json.dumps({
+            "user_id": row[0],
+            "email": row[1],
+            "full_name": row[2],
+            "credits_remaining": row[3],
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+# ── Profile: Update ───────────────────────────────────────
+# PATCH the caller's own users row. ONLY display_name (-> full_name) and email are
+# client-writable. credits_remaining is NEVER read from the body (it moves only via
+# reserve_job_slot -1 / _mark_failed +1), and user_id is always the token oid.
+# PATCH never CREATES a row — credits originate solely in register_user, so a
+# missing row returns 404 ("register first") rather than minting one here.
+@app.route(route="profiles/me", methods=["PATCH"])
+def update_profile(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON body", status_code=400)
+    if not isinstance(body, dict):
+        return func.HttpResponse("Invalid JSON body", status_code=400)
+
+    # Build the SET clause from whichever writable fields were actually sent, so a
+    # PATCH can touch one field without clobbering the other. Anything not in this
+    # allow-list (notably credits_remaining) is ignored.
+    updates = []
+    params = []
+    if "display_name" in body:
+        updates.append("full_name = ?")
+        params.append(body.get("display_name"))
+    if "email" in body:
+        updates.append("email = ?")
+        params.append(body.get("email"))
+
+    if not updates:
+        return func.HttpResponse(
+            "No updatable fields provided (display_name, email)", status_code=400
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", user_id)
+    if not cursor.fetchone():
+        return func.HttpResponse("User not found — register first", status_code=404)
+
+    params.append(user_id)
+    cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
+    conn.commit()
+
+    cursor.execute(
+        "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    return func.HttpResponse(
+        json.dumps({
+            "user_id": row[0],
+            "email": row[1],
+            "full_name": row[2],
+            "credits_remaining": row[3],
+        }),
+        mimetype="application/json",
+        status_code=200,
     )
 
 # ── Upload Photo ──────────────────────────────────────────
@@ -292,6 +407,53 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200
     )
+
+# ── Delete Job ────────────────────────────────────────────
+# Owner-only hard delete: remove the jobs row AND its result blobs
+# (outputs/results/<job_id>/*). 404 if the job doesn't exist, 403 if it isn't the
+# caller's. Route is /jobs/{job_id} (NOT under a reserved prefix like admin/*).
+@app.route(route="jobs/{job_id}", methods=["DELETE"])
+def delete_job(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    job_id = req.route_params.get("job_id")
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Ownership gate: distinguish missing (404) from not-yours (403). Fetch the
+    # owner rather than filtering by user_id so a wrong owner is a 403, not a 404.
+    cursor.execute("SELECT user_id FROM jobs WHERE job_id = ?", job_id)
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    if row[0] != user_id:
+        return func.HttpResponse("Forbidden", status_code=403)
+
+    # Authoritative delete FIRST, committed, THEN blob cleanup. Ordering is
+    # deliberate: a leftover blob (orphaned storage, no DB pointer) is far cheaper
+    # than the reverse — a live jobs row pointing at already-deleted images. If the
+    # row delete/commit fails, nothing external has been touched yet and the whole
+    # operation is cleanly retryable.
+    cursor.execute("DELETE FROM jobs WHERE job_id = ?", job_id)
+    conn.commit()
+
+    # Best-effort blob cleanup, AFTER the commit. The row is already gone, so a blob
+    # error here must NOT 500 the request — the delete genuinely succeeded, and a
+    # retry would now 404. Any orphaned blobs (results/<job_id>/*) can be swept
+    # separately; log and return success. A blob already gone is a no-op.
+    try:
+        blob_client = get_blob_client()
+        container = blob_client.get_container_client("outputs")
+        for blob in container.list_blobs(name_starts_with=f"results/{job_id}/"):
+            container.delete_blob(blob.name)
+    except Exception as e:
+        logging.warning(f"job {job_id} row deleted but blob cleanup failed: {e}")
+
+    return func.HttpResponse(status_code=204)
 
 # ── User Jobs History ─────────────────────────────────────
 @app.route(route="users/jobs", methods=["GET"])
