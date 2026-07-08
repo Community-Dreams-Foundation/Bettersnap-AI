@@ -4,18 +4,22 @@ import json
 import time
 import logging
 import traceback
+import faulthandler
 import requests
+
+faulthandler.enable()   # dumps C++ stack to stderr on SIGSEGV / SIGABRT / SIGFPE / SIGBUS
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont
 
 import torch
 import pyodbc
-from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+from diffusers import StableDiffusionXLImg2ImgPipeline, AutoencoderKL
 from azure.keyvault.secrets import SecretClient
 
 from azure.storage.queue import QueueClient, TextBase64DecodePolicy
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from azure.identity import DefaultAzureCredential
+from azure.communication.email import EmailClient
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -146,6 +150,16 @@ SEEDS           = [42, 1337, 9999, 77777]
 # with the FLUX→SDXL swap; treat these as a starting point, not tuned.
 GUIDANCE_SCALES = [7.0, 6.0, 8.0, 7.5]
 
+# Push the model away from the original photo's environment so strength has
+# room to apply the requested background. Without LoRA this won't fully erase
+# the source background, but it meaningfully reduces bleed-through.
+NEGATIVE_PROMPT = (
+    "wooden door, indoor room, casual setting, party background, "
+    "blurry background, cluttered environment, "
+    "low quality, bad anatomy, distorted face, deformed, ugly, "
+    "watermark, signature, text"
+)
+
 
 # ─────────────────────────────────────────────────────────
 # Model loading
@@ -165,47 +179,28 @@ def load_base_model():
         write_debug(f"/models listdir ERROR: {e}")
 
     try:
-        write_debug("Loading SDXL base 1.0 + fp16-fix VAE from baked /models ...")
-        # SDXL base 1.0 in fp16 with the madebyollin/sdxl-vae-fp16-fix VAE. Stock SDXL
-        # VAE in fp16 overflows to NaN → black/colored-static output (the SAME signature
-        # as the abandoned FLUX failure); the fp16-fix VAE is the standard cure and lets
-        # the whole pipeline stay fp16 (no dtype split between UNet / text encoders / VAE).
-        # Weights are baked into the image (no mount, no HF download) — see Dockerfile.
-        #
-        # NOTE: do NOT call .to("cuda") here. enable_model_cpu_offload() takes over device
-        # placement: each component (UNet, the two text encoders, VAE) lives on CPU and is
-        # paged to GPU only while it runs, then offloaded — keeps them from being co-resident
-        # on the GPU at pipe() start (the v15 OOM). vae.enable_tiling() caps the VAE
-        # encode/decode peak. Calling .to("cuda") would conflict with the offload hooks.
+        write_debug("Loading SDXL img2img + fp16-fix VAE from baked /models ...")
         vae = AutoencoderKL.from_pretrained(
             "/models/sdxl-vae",
             torch_dtype=torch.float16,
         )
-        pipe = StableDiffusionXLPipeline.from_pretrained(
+        pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
             "/models/sdxl-base",
             vae=vae,
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
         )
-        pipe.enable_model_cpu_offload()
-        pipe.vae.enable_tiling()
-
-        # One-time VRAM sanity check: confirm the container actually sees the full A100
-        # 80GB. SDXL is ~7GB in fp16 — nowhere near an 80GB card — so an OOM here would
-        # mean usable VRAM is far lower than nominal, not model size.
+        pipe = pipe.to("cuda")
         try:
             props = torch.cuda.get_device_properties(0)
-            total_gb = props.total_memory / 1024**3
-            peak_gb  = torch.cuda.max_memory_allocated(0) / 1024**3
             msg = (f"GPU={props.name} total_memory={props.total_memory} "
-                   f"({total_gb:.1f} GB), max_memory_allocated={torch.cuda.max_memory_allocated(0)} "
-                   f"({peak_gb:.1f} GB)")
-            log.info(f"🔎 {msg}")
+                   f"({props.total_memory/1024**3:.1f} GB), "
+                   f"max_memory_allocated={torch.cuda.max_memory_allocated(0)} "
+                   f"({torch.cuda.max_memory_allocated(0)/1024**3:.1f} GB)")
             write_debug(msg)
         except Exception as e:
-            write_debug(f"VRAM sanity check failed: {e}")
-
+            write_debug(f"VRAM check failed: {e}")
         write_debug("SUCCESS: Base model loaded")
         log.info("✅ Base model loaded")
     except Exception as e:
@@ -433,6 +428,63 @@ def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
 
 
 # ─────────────────────────────────────────────────────────
+# Completion email
+# ─────────────────────────────────────────────────────────
+
+def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
+    """Best-effort completion email. Never raises — a failure here must NOT mark
+    the job failed (images are already uploaded and the DB row is 'completed')."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT email FROM users WHERE user_id = ?", user_id)
+        row = cursor.fetchone()
+        conn.close()
+        to_email = row[0] if row else None
+        if not to_email:
+            log.info(f"No email on file for user_id={user_id}; skipping completion email")
+            return
+
+        # Build a SAS URL for the first headshot (24 h expiry).
+        storage_key = AZURE_STORAGE_KEY or get_secret("storage-account-key")
+        first_blob = result_blob_paths[0] if result_blob_paths else None
+        if not first_blob:
+            return
+        sas_token = generate_blob_sas(
+            account_name=AZURE_STORAGE_ACCOUNT,
+            container_name=AZURE_BLOB_CONTAINER,
+            blob_name=first_blob,
+            account_key=storage_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+        url = (f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/"
+               f"{AZURE_BLOB_CONTAINER}/{first_blob}?{sas_token}")
+
+        acs_conn_str = get_secret("acs-connection-string")
+        client = EmailClient.from_connection_string(acs_conn_str)
+        client.begin_send({
+            "senderAddress": "noreply@bettersnap.ai",
+            "recipients": {"to": [{"address": to_email}]},
+            "content": {
+                "subject": "Your BetterSnap AI headshot is ready!",
+                "plainText": (
+                    f"Your headshot (Job ID: {job_id}) is ready. "
+                    f"Download it here: {url}"
+                ),
+                "html": (
+                    f"<h2>Your headshot is ready!</h2>"
+                    f"<p>Job ID: {job_id}</p>"
+                    f"<p><a href=\"{url}\">Click here to download your headshot</a></p>"
+                ),
+            },
+        })
+        log.info(f"✅ Completion email sent to {to_email} for job_id={job_id}")
+    except Exception as e:
+        log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
+
+
+# ─────────────────────────────────────────────────────────
 # Core inference
 # ─────────────────────────────────────────────────────────
 
@@ -494,6 +546,15 @@ def run_inference(job: dict) -> list:
     else:
         write_debug("No LoRA adapters loaded; rendering BASE SDXL (generic).")
 
+    try:
+        free_vram, total_vram = torch.cuda.mem_get_info(0)
+        write_debug(
+            f"Pre-inference free VRAM: {free_vram/1024**3:.1f} GB "
+            f"of {total_vram/1024**3:.1f} GB total"
+        )
+    except Exception as e:
+        write_debug(f"mem_get_info failed: {e}")
+
     result_blob_paths = []
     for i in range(num_images):
         prompt = PROMPT_TEMPLATES[i % len(PROMPT_TEMPLATES)].format(
@@ -513,15 +574,15 @@ def run_inference(job: dict) -> list:
             prompt = f"{_trigger}, {prompt}"
         log.info(f"📣 Variation {i+1} prompt: {prompt}")
         try:
-            # Text-to-image: StableDiffusionXLPipeline does NOT take image=. This is
-            # the vanilla-SDXL render smoke test (prove clean output, not static);
-            # image conditioning (img2img / identity) is a later milestone.
+            _strength = float(os.environ.get("IMG2IMG_STRENGTH", "0.60"))
+            write_debug(f"Variation {i+1}: calling pipe() img2img (strength={_strength})...")
             output = pipe(
                 prompt=prompt,
-                height=1024,
-                width=1024,
+                negative_prompt=os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT),
+                image=user_image,
+                strength=_strength,
                 guidance_scale=GUIDANCE_SCALES[i % len(GUIDANCE_SCALES)],
-                num_inference_steps=20,
+                num_inference_steps=int(os.environ.get("NUM_INFERENCE_STEPS", "30")),
                 generator=torch.Generator("cuda").manual_seed(SEEDS[i % len(SEEDS)]),
             ).images[0]
 
@@ -674,6 +735,7 @@ if __name__ == "__main__":
             update_job_status(job_id, "completed", result_blob_paths)
             write_debug(f"SUCCESS: Job {job_id} complete. Output: {result_blob_paths}")
             log.info(f"✅ Job {job_id} complete")
+            notify_user_email(job_id, user_id, result_blob_paths)
         except Exception as se:
             write_debug(
                 f"CRITICAL: Job {job_id} generation succeeded and images uploaded "

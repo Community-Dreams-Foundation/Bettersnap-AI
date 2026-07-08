@@ -19,6 +19,7 @@ azure-storage-queue
 azure-storage-blob
 azure-identity
 azure-keyvault-secrets
+azure-communication-email
 pyodbc
 python-dotenv
 protobuf

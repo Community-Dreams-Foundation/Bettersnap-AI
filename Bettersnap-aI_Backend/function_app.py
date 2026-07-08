@@ -20,6 +20,10 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # Kill-switch pause uses a long, fixed delay (NOT the backoff) so an intentional
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
+# Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds.
+# 'processing' threshold must be >> inference wall-time (SDXL 4-var ≈ 20 min on A100).
+REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "45"))
+REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
 
 def _gpu_dispatch_enabled() -> bool:
@@ -530,9 +534,9 @@ def get_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
-# ── Admin: reconcile stuck dispatch ───────────────────────
-# Manual repair path for jobs stuck in 'dispatching' (dispatcher crashed after
-# claiming but before/around starting the A100). Guarded by ADMIN_API_KEY.
+# ── Ops: manual repair endpoints ─────────────────────────
+# "admin" is a reserved prefix in Azure Functions and routes under it never
+# register — renamed to "ops". Guarded by ADMIN_API_KEY.
 def _admin_authorized(req: func.HttpRequest) -> bool:
     # ADMIN_API_KEY must be a long random value stored ONLY in app settings /
     # Key Vault, never logged. Constant-time compare avoids timing leaks. Auth is
@@ -542,7 +546,7 @@ def _admin_authorized(req: func.HttpRequest) -> bool:
     return bool(key) and hmac.compare_digest(presented, key)
 
 
-@app.route(route="admin/stuck-dispatch", methods=["GET"])
+@app.route(route="ops/stuck-dispatch", methods=["GET"])
 def admin_stuck_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if not _admin_authorized(req):
         return func.HttpResponse("Forbidden", status_code=403)
@@ -568,7 +572,7 @@ def admin_stuck_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps({"stuck": jobs}), mimetype="application/json")
 
 
-@app.route(route="admin/jobs/{job_id}/requeue", methods=["POST"])
+@app.route(route="ops/jobs/{job_id}/requeue", methods=["POST"])
 def admin_requeue(req: func.HttpRequest) -> func.HttpResponse:
     if not _admin_authorized(req):
         return func.HttpResponse("Forbidden", status_code=403)
@@ -600,7 +604,7 @@ def admin_requeue(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps({"requeued": job_id}), mimetype="application/json")
 
 
-@app.route(route="admin/jobs/{job_id}/fail", methods=["POST"])
+@app.route(route="ops/jobs/{job_id}/fail", methods=["POST"])
 def admin_fail_job(req: func.HttpRequest) -> func.HttpResponse:
     """Fail + refund a job stuck in 'processing' (the OOM-SIGKILL case the
     container can't self-report). Use this — NOT requeue — for a 'processing'
@@ -859,3 +863,42 @@ def handle_poison_job(msg: func.QueueMessage):
         # Guarded fail + one-time credit refund (same helper as every other
         # failure path) so a poisoned message doesn't silently cost the user.
         _mark_failed(job_id)
+
+
+# ── Timer-trigger reaper ──────────────────────────────────────────────────────
+# Runs every 10 minutes. Finds jobs stuck in 'processing' past the inference
+# wall-time ceiling (REAPER_STUCK_MINUTES, default 45 min — well above the
+# SDXL 4-variation worst-case ≈ 20 min). Also reaps 'dispatching' rows the
+# dispatcher crashed mid-claim (REAPER_DISPATCHING_MINUTES, default 15 min).
+# Both paths call _mark_failed: guarded transition + one-time credit refund.
+# An OOM SIGKILL (exit 137) leaves the row in 'processing' because the process
+# is killed before it can write — this reaper is the ONLY thing that clears it.
+@app.timer_trigger(schedule="0 */10 * * * *", arg_name="timer", run_on_startup=False)
+def reaper(timer: func.TimerRequest):
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT job_id FROM jobs WHERE status = 'processing' "
+            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            -REAPER_STUCK_MINUTES,
+        )
+        stuck = [str(r[0]) for r in cur.fetchall()]
+
+        cur.execute(
+            "SELECT job_id FROM jobs WHERE status = 'dispatching' "
+            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            -REAPER_DISPATCHING_MINUTES,
+        )
+        stuck += [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for job_id in stuck:
+        logging.warning(f"REAPER: failing stuck job_id={job_id}")
+        _mark_failed(job_id)
+
+    if stuck:
+        logging.info(f"REAPER: reaped {len(stuck)} stuck jobs")
+    else:
+        logging.info("REAPER: no stuck jobs found")

@@ -10,19 +10,19 @@ GPU and no 30GB model download.
 
   read JOB_ID / USER_ID  ->  real main.get_db_connection -> SELECT jobs row
   ->  real main.run_inference(job):
-        real load_image_from_blob -> resize_for_kontext -> MOCKED pipe()
+        real load_image_from_blob -> resize_for_sdxl -> MOCKED pipe()
         -> add_watermark -> real upload_image_to_blob (outputs/results/<job>/)
 
 HOW THE GPU IS MOCKED (the documented swap, done properly)
 ----------------------------------------------------------
-main.py does `import torch` and `from diffusers import FluxKontextPipeline` at
-module top, and `load_base_model()` does `os.listdir("/models")` + `.to("cuda")`,
-and `run_inference` builds `torch.Generator("cuda")`. A laptop has none of that.
-So we:
+main.py does `import torch` and `from diffusers import StableDiffusionXLPipeline,
+AutoencoderKL` at module top, `load_base_model()` uses `enable_model_cpu_offload()`
+and CUDA helpers, and `run_inference` builds `torch.Generator("cuda")`. A laptop
+has none of that.  So we:
   1. Inject stub `torch` / `diffusers` modules into sys.modules BEFORE importing
      main (so the heavy GPU libs need not even be installed).
   2. Replace `main.load_base_model` with a no-op and set `main.pipe` to a mock
-     that returns a correctly-sized PIL image instantly (mock of pipe(...).images[0]).
+     that returns a 1024×1024 PIL image instantly (mock of pipe(...).images[0]).
 
 PROD-ONLY PLUMBING WE OVERRIDE SO IT RUNS OFF-AZURE
 ---------------------------------------------------
@@ -79,7 +79,6 @@ SECRET_ENV_MAP = {
     "Db-Password": "DB_PASSWORD",
     "storage-connection-string": "STORAGE_CONNECTION_STRING",
     "storage-account-key": "STORAGE_ACCOUNT_KEY",
-    "supabase-jwt-secret": "SUPABASE_JWT_SECRET",
 }
 
 
@@ -101,16 +100,13 @@ class _MockImages:
 
 
 def make_mock_pipe():
-    """Stand-in for a loaded FluxKontextPipeline. Returns an instant,
-    correctly-sized PIL image (same size as the input passed as image=...)."""
+    """Stand-in for a loaded StableDiffusionXLPipeline. Returns an instant
+    1024×1024 PIL image (SDXL text-to-image: no image= kwarg)."""
     from PIL import Image
 
     def _pipe(*args, **kwargs):
-        img = kwargs.get("image")
-        size = img.size if img is not None else (1024, 1024)
-        log.info("MOCK pipe() called: out size=%s kwargs=%s",
-                 size, [k for k in kwargs if k != "image"])
-        return _MockImages(Image.new("RGB", size, color=(120, 90, 200)))
+        log.info("MOCK pipe() called: kwargs=%s", list(kwargs.keys()))
+        return _MockImages(Image.new("RGB", (1024, 1024), color=(120, 90, 200)))
 
     return _pipe
 
@@ -124,18 +120,48 @@ def install_gpu_stubs():
         def manual_seed(self, _seed):
             return self
 
-    torch_stub.Generator = lambda *a, **k: _Generator()
+    # SDXL pipeline uses torch.float16
+    torch_stub.float16 = "float16"
     torch_stub.bfloat16 = "bfloat16"
+    torch_stub.Generator = lambda *a, **k: _Generator()
+
+    # Stub cuda helpers used by main.py's VRAM probes
+    cuda_stub = types.ModuleType("torch.cuda")
+
+    class _DeviceProps:
+        name = "MOCK-GPU"
+        total_memory = 80 * 1024 ** 3
+
+    cuda_stub.get_device_properties = lambda _idx: _DeviceProps()
+    cuda_stub.max_memory_allocated = lambda _idx=0: 0
+    torch_stub.cuda = cuda_stub
     sys.modules["torch"] = torch_stub
+    sys.modules["torch.cuda"] = cuda_stub
 
     diffusers_stub = types.ModuleType("diffusers")
 
-    class _FluxKontextPipeline:
+    class _FakePipeline:
         @classmethod
         def from_pretrained(cls, *a, **k):
             return make_mock_pipe()
 
-    diffusers_stub.FluxKontextPipeline = _FluxKontextPipeline
+        def enable_model_cpu_offload(self):
+            pass
+
+        @property
+        def vae(self):
+            class _VAE:
+                def enable_tiling(self):
+                    pass
+            return _VAE()
+
+    class _FakeVAE:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return _FakeVAE()
+
+    diffusers_stub.StableDiffusionXLPipeline = _FakePipeline
+    diffusers_stub.AutoencoderKL = _FakeVAE
     sys.modules["diffusers"] = diffusers_stub
 
 
@@ -166,6 +192,8 @@ def run(job_id: str, user_id: str, commit: bool):
     # ── GPU mock: skip /models + cuda, install the instant mock pipe ──
     main.load_base_model = lambda: log.info("load_base_model: MOCKED no-op (GPU)")
     main.pipe = make_mock_pipe()
+    # Email is best-effort in prod; skip entirely in local tests (no ACS creds).
+    main.notify_user_email = lambda *a, **k: log.info("notify_user_email: MOCKED (local test)")
 
     # ── DB: replace MSI auth with local SQL auth; dry-run writes by default ──
     main.get_db_connection = lambda *a, **k: shared_get_db()
@@ -237,17 +265,6 @@ def run(job_id: str, user_id: str, commit: bool):
 
 
 def main_cli():
-    # ── PARKED (FLUX-era) ─────────────────────────────────────────────────
-    # This harness stubs `FluxKontextPipeline` and exercises the OLD FLUX
-    # pipeline. main.py is now SDXL, so this no longer mirrors production and
-    # would give misleading results. Refuses to run unless explicitly forced.
-    # TODO: rebuild against StableDiffusionXLPipeline before un-parking.
-    if os.environ.get("BETTERSNAP_ALLOW_PARKED") != "1":
-        log.error(
-            "PARKED: local_test.py targets the retired FLUX pipeline and no longer "
-            "matches main.py (now SDXL). Set BETTERSNAP_ALLOW_PARKED=1 to override."
-        )
-        sys.exit(2)
     load_dotenv()
     ap = argparse.ArgumentParser(description="Local container-pipeline test (GPU mocked)")
     ap.add_argument("--job-id", default=os.environ.get("JOB_ID"),
