@@ -36,7 +36,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
 
         cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
         row = cur.fetchone()
-        if not row or row[0] < 1:
+        if not row or row[0] < 20:
             conn.rollback()
             return ReserveResult(False, reason="credits")
 
@@ -63,7 +63,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
         job_id = cur.fetchone()[0]
 
         cur.execute(
-            "UPDATE users SET credits_remaining = credits_remaining - 1 WHERE user_id = ?",
+            "UPDATE users SET credits_remaining = credits_remaining - 20 WHERE user_id = ?",
             user_id,
         )
         conn.commit()   # releases the app lock

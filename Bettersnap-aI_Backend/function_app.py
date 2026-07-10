@@ -38,6 +38,11 @@ from shared.job_reservation import reserve_job_slot
 from shared.queue_client import enqueue_job
 from shared.blob import upload_blob, get_blob_client
 from shared.keyvault import get_secret
+from shared.stripe_client import (
+    ONE_TIME_PLANS, MONTHLY_PLANS,
+    create_onetime_checkout, create_monthly_checkout,
+    cancel_subscription, verify_webhook,
+)
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -95,6 +100,37 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps({"message": "User registered", "credits": 20}),
         mimetype="application/json",
         status_code=201
+    )
+
+# ── User Profile (alias for /profiles/me — used by frontend) ─────────────
+@app.route(route="users/profile", methods=["GET"])
+def user_profile_alias(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    return func.HttpResponse(
+        json.dumps({
+            "user_id": row[0],
+            "email": row[1],
+            "full_name": row[2],
+            "credits_remaining": row[3],
+            "credits": row[3],  # alias so frontend can read either field
+        }),
+        mimetype="application/json",
+        status_code=200,
     )
 
 # ── User Credits ──────────────────────────────────────────
@@ -215,6 +251,57 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
             "full_name": row[2],
             "credits_remaining": row[3],
         }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+# ── Terms: Status ────────────────────────────────────────
+@app.route(route="users/terms-status", methods=["GET"])
+def terms_status(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT terms_accepted_at FROM users WHERE user_id = ?", user_id)
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    return func.HttpResponse(
+        json.dumps({"terms_accepted_at": str(row[0]) if row[0] else None}),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+# ── Terms: Accept ─────────────────────────────────────────
+@app.route(route="users/accept-terms", methods=["POST"])
+def accept_terms(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+        accepted_at = body.get("accepted_at")
+    except Exception:
+        accepted_at = None
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE users SET terms_accepted_at = ? WHERE user_id = ?",
+        accepted_at, user_id,
+    )
+    conn.commit()
+
+    return func.HttpResponse(
+        json.dumps({"terms_accepted_at": accepted_at}),
         mimetype="application/json",
         status_code=200,
     )
@@ -770,7 +857,7 @@ def _mark_failed(job_id: str):
         transitioned = cur.rowcount == 1
         if transitioned:
             cur.execute(
-                "UPDATE users SET credits_remaining = credits_remaining + 1 "
+                "UPDATE users SET credits_remaining = credits_remaining + 20 "
                 "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
                 job_id,
             )
@@ -902,3 +989,326 @@ def reaper(timer: func.TimerRequest):
         logging.info(f"REAPER: reaped {len(stuck)} stuck jobs")
     else:
         logging.info("REAPER: no stuck jobs found")
+
+
+# ── Subscriptions: Plans ──────────────────────────────────
+@app.route(route="subscriptions/plans", methods=["GET"])
+def list_plans(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({
+            "one_time": [
+                {
+                    "plan": plan,
+                    "images": info["images"],
+                    "credits": info["credits"],
+                    "original_price_usd": info["original_cents"] / 100,
+                    "discounted_price_usd": info["discounted_cents"] / 100,
+                }
+                for plan, info in ONE_TIME_PLANS.items()
+            ],
+            "monthly": [
+                {
+                    "plan": plan,
+                    "images": info["images"],
+                    "credits": info["credits"],
+                    "price_usd": info["price_cents"] / 100,
+                }
+                for plan, info in MONTHLY_PLANS.items()
+            ],
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+# ── Subscriptions: Status ─────────────────────────────────
+@app.route(route="subscriptions/status", methods=["GET"])
+def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT subscription_plan, subscription_type, credits_remaining, "
+        "credits_monthly_limit, subscription_renewed_at FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    return func.HttpResponse(
+        json.dumps({
+            "plan": row[0],
+            "type": row[1],
+            "credits_remaining": row[2],
+            "credits_monthly_limit": row[3],
+            "subscription_renewed_at": str(row[4]) if row[4] else None,
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+# ── Subscriptions: Create Checkout ────────────────────────
+@app.route(route="subscriptions/create", methods=["POST"])
+def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    plan          = body.get("plan", "")
+    payment_type  = body.get("type", "")  # "one_time" or "monthly"
+    success_url   = body.get("success_url", "https://bettersnap.ai/subscription/success")
+    cancel_url    = body.get("cancel_url",  "https://bettersnap.ai/subscription/cancel")
+    email         = payload.get("email", "")
+
+    if payment_type == "one_time":
+        if plan not in ONE_TIME_PLANS:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid plan. Choose: basic, pro, expert"}),
+                mimetype="application/json", status_code=400,
+            )
+        try:
+            session = create_onetime_checkout(user_id, email, plan, success_url, cancel_url)
+        except Exception as e:
+            logging.error(f"Stripe one-time checkout failed: {e}")
+            return func.HttpResponse(
+                json.dumps({"error": "Payment provider error"}),
+                mimetype="application/json", status_code=502,
+            )
+
+    elif payment_type == "monthly":
+        if plan not in MONTHLY_PLANS:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid plan. Choose: basic, pro, expert"}),
+                mimetype="application/json", status_code=400,
+            )
+        try:
+            session = create_monthly_checkout(user_id, email, plan, success_url, cancel_url)
+        except Exception as e:
+            logging.error(f"Stripe monthly checkout failed: {e}")
+            return func.HttpResponse(
+                json.dumps({"error": "Payment provider error"}),
+                mimetype="application/json", status_code=502,
+            )
+    else:
+        return func.HttpResponse(
+            json.dumps({"error": "type must be 'one_time' or 'monthly'"}),
+            mimetype="application/json", status_code=400,
+        )
+
+    return func.HttpResponse(
+        json.dumps({"checkout_url": session["url"], "session_id": session["id"]}),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+# ── Subscriptions: Cancel ─────────────────────────────────
+@app.route(route="subscriptions/cancel", methods=["POST"])
+def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stripe_subscription_id, subscription_type FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    stripe_sub_id, sub_type = row[0], row[1]
+    if sub_type != "monthly" or not stripe_sub_id:
+        return func.HttpResponse(
+            json.dumps({"error": "No active monthly subscription to cancel"}),
+            mimetype="application/json", status_code=400,
+        )
+
+    try:
+        cancel_subscription(stripe_sub_id)
+    except Exception as e:
+        logging.error(f"Stripe cancel failed for user {user_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502,
+        )
+
+    return func.HttpResponse(
+        json.dumps({"message": "Subscription will cancel at end of billing period"}),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+# ── Stripe Webhook ────────────────────────────────────────
+@app.route(route="webhooks/stripe", methods=["POST"])
+def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
+    sig_header = req.headers.get("Stripe-Signature", "")
+    if not sig_header:
+        return func.HttpResponse("Missing Stripe-Signature", status_code=400)
+
+    try:
+        event = verify_webhook(req.get_body(), sig_header)
+    except ValueError as e:
+        logging.warning(f"Stripe webhook invalid: {e}")
+        return func.HttpResponse("Invalid signature", status_code=400)
+
+    event_type = event.get("type", "")
+    logging.info(f"Stripe event: {event_type}")
+
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+        payment_type = session.get("metadata", {}).get("payment_type")
+        if payment_type == "one_time":
+            _handle_onetime_payment(session)
+        elif payment_type == "monthly":
+            _handle_monthly_checkout(session)
+
+    elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
+        _handle_invoice_paid(event["data"]["object"])
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+        _handle_subscription_ended(event["data"]["object"])
+
+    return func.HttpResponse("OK", status_code=200)
+
+
+def _handle_onetime_payment(session: dict):
+    user_id = session.get("metadata", {}).get("user_id")
+    plan    = session.get("metadata", {}).get("plan")
+    if not user_id or plan not in ONE_TIME_PLANS:
+        logging.error(f"one_time payment missing metadata: {session}")
+        return
+
+    credits = ONE_TIME_PLANS[plan]["credits"]
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                subscription_plan = ?,
+                subscription_type = 'one_time',
+                credits_remaining = credits_remaining + ?
+            WHERE user_id = ?""",
+            plan, credits, user_id,
+        )
+        conn.commit()
+        logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
+    finally:
+        conn.close()
+
+
+def _handle_monthly_checkout(session: dict):
+    user_id  = session.get("metadata", {}).get("user_id")
+    plan     = session.get("metadata", {}).get("plan")
+    customer = session.get("customer")
+    sub_id   = session.get("subscription")
+
+    if not all([user_id, plan, customer, sub_id]) or plan not in MONTHLY_PLANS:
+        logging.error(f"monthly checkout missing fields: {session}")
+        return
+
+    credits = MONTHLY_PLANS[plan]["credits"]
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                subscription_plan       = ?,
+                subscription_type       = 'monthly',
+                stripe_customer_id      = ?,
+                stripe_subscription_id  = ?,
+                credits_remaining       = ?,
+                credits_monthly_limit   = ?,
+                subscription_renewed_at = GETUTCDATE()
+            WHERE user_id = ?""",
+            plan, customer, sub_id, credits, credits, user_id,
+        )
+        conn.commit()
+        logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+    finally:
+        conn.close()
+
+
+def _handle_invoice_paid(invoice: dict):
+    sub_id = invoice.get("subscription")
+    if not sub_id:
+        return
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                credits_remaining       = credits_monthly_limit,
+                subscription_renewed_at = GETUTCDATE()
+            WHERE stripe_subscription_id = ?""",
+            sub_id,
+        )
+        conn.commit()
+        logging.info(f"Credits reset for subscription={sub_id}")
+    finally:
+        conn.close()
+
+
+def _handle_subscription_ended(sub: dict):
+    sub_id = sub.get("id")
+    status = sub.get("status")
+    if status in ("canceled", "unpaid", "past_due"):
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """UPDATE users SET
+                    subscription_plan      = 'free',
+                    subscription_type      = NULL,
+                    stripe_subscription_id = NULL,
+                    credits_monthly_limit  = 20
+                WHERE stripe_subscription_id = ?""",
+                sub_id,
+            )
+            conn.commit()
+            logging.info(f"Subscription {sub_id} ended → reverted to free")
+        finally:
+            conn.close()
+
+
+# ── Monthly safety-net credit refill ─────────────────────
+@app.timer_trigger(schedule="0 0 1 * * *", arg_name="monthly_timer", run_on_startup=False)
+def monthly_credit_refill(monthly_timer: func.TimerRequest):
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                credits_remaining       = credits_monthly_limit,
+                subscription_renewed_at = GETUTCDATE()
+            WHERE subscription_type = 'monthly'
+            AND (
+                subscription_renewed_at IS NULL
+                OR subscription_renewed_at < DATEADD(MONTH, -1, GETUTCDATE())
+            )""",
+        )
+        updated = cur.rowcount
+        conn.commit()
+        logging.info(f"monthly_credit_refill: topped up {updated} subscriber(s)")
+    finally:
+        conn.close()
