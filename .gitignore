@@ -15,3 +15,16 @@ test_input.*
 *.jpg
 *.jpeg
 *.png
+
+# ── Build + dependency artifacts ────────────────────────────────
+node_modules/
+dist/
+frontend-bettersnap/node_modules/
+frontend-bettersnap/dist/
+
+# Local-only scratch: a snapshot of Sannihitha's commit 0631934, kept while
+# merging. It is IN GIT already (origin/main) — this folder is just a working copy.
+sannihitha-work-0631934/
+
+# Stray artifacts
+BetterSnap_Supabase_to_Azure_Migration_Report.docx

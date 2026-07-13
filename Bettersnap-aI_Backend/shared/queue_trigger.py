@@ -8,11 +8,20 @@ from azure.mgmt.appcontainers.models import (
 SUBSCRIPTION_ID = "cf197124-2e9a-48d5-af4b-de22fbbd683e"
 RESOURCE_GROUP = "bettersnap-ai-rg"
 JOB_NAME = "bettersnapai-if"
+TRAINER_JOB_NAME = "bettersnapai-lora-trainer"
+
+# EVERY job that consumes the A100 workload profile. Both jobs run on the SAME
+# profile (bettersnapaiWPn, Consumption-GPU-NC24-A100, 24 CPU / 220Gi), so the
+# active-job cap must span BOTH or it is not a cap at all: an inference run and a
+# training run would each hold an A100 and MAX_ACTIVE_GPU_JOBS=1 would silently
+# become 2. This was latent-only while the trainer was manual-trigger-only; the
+# moment training is dispatched from code it is real money.
+GPU_JOB_NAMES = (JOB_NAME, TRAINER_JOB_NAME)
 
 # Execution states that mean an A100 replica is (or may be) consuming GPU.
 # Anything NOT terminal counts as active — conservative on purpose: when a
 # state is ambiguous we treat it as active so we don't start another job over
-# the cap. replicaTimeout (1800s) guarantees a stuck execution clears, so this
+# the cap. replicaTimeout guarantees a stuck execution clears, so this
 # can't deadlock the queue permanently.
 _TERMINAL_STATES = {"succeeded", "failed", "stopped", "degraded", "cancelled"}
 
@@ -20,23 +29,25 @@ _TERMINAL_STATES = {"succeeded", "failed", "stopped", "degraded", "cancelled"}
 def count_active_job_executions() -> int:
     """Source of truth for how many A100 jobs are live, read from the Azure
     Container Apps job-executions API (NOT the DB, which can be stale or race
-    the container's own status write)."""
+    the container's own status write). Counts inference AND training executions —
+    they share one GPU profile, so they must share one cap."""
     credential = DefaultAzureCredential()
     client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
     active = 0
-    for ex in client.jobs_executions.list(RESOURCE_GROUP, JOB_NAME):
-        status = (getattr(ex, "status", "") or "").lower()
-        if status not in _TERMINAL_STATES:
-            active += 1
+    for job_name in GPU_JOB_NAMES:
+        for ex in client.jobs_executions.list(RESOURCE_GROUP, job_name):
+            status = (getattr(ex, "status", "") or "").lower()
+            if status not in _TERMINAL_STATES:
+                active += 1
     return active
 
 
-def _newest_execution_name(client) -> str:
-    """Name of the most-recently-started execution for this job. Used to recover the
+def _newest_execution_name(client, job_name: str = JOB_NAME) -> str:
+    """Name of the most-recently-started execution for `job_name`. Used to recover the
     execution id when the begin_start LRO does not resolve cleanly (slow GPU start, or
     a fast container failure makes poller.result() raise)."""
     newest, newest_t = None, None
-    for ex in client.jobs_executions.list(RESOURCE_GROUP, JOB_NAME):
+    for ex in client.jobs_executions.list(RESOURCE_GROUP, job_name):
         t = getattr(getattr(ex, "properties", None), "start_time", None) or getattr(ex, "start_time", None)
         if t is not None and (newest_t is None or t > newest_t):
             newest_t, newest = t, getattr(ex, "name", None)

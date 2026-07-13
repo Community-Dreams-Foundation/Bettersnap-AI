@@ -21,9 +21,21 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
 # Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds.
-# 'processing' threshold must be >> inference wall-time (SDXL 4-var ≈ 20 min on A100).
+# 'processing' threshold must be >> inference wall-time. Measured: 172s startup +
+# ~7.9s/image, so even a 65-image Expert job is ~12 min.
 REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "45"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
+
+# ── Identity-LoRA training ────────────────────────────────────────────────
+# DreamBooth needs enough angles/expressions to generalize, but the run is a fixed
+# 1400 steps regardless of count — so more photos cost quality-nothing and time-nothing.
+MIN_TRAINING_PHOTOS = int(os.environ.get("MIN_TRAINING_PHOTOS", "8"))
+MAX_TRAINING_PHOTOS = int(os.environ.get("MAX_TRAINING_PHOTOS", "12"))
+# Measured training wall-time is ~51 min (17.6 class-image gen + 28.1 train + startup).
+# The watcher fails a run that blows past this, releasing any jobs parked behind it.
+TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
+# Where cropped training images live, under the user's own prefix in `inputs`.
+CROP_SUBDIR = "input/crop_upperbody"
 
 
 def _gpu_dispatch_enabled() -> bool:
@@ -36,15 +48,40 @@ from shared.auth import validate_token, get_user_id
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
 from shared.queue_client import enqueue_job
-from shared.blob import upload_blob, get_blob_client
+from shared.blob import upload_blob, download_blob, get_blob_client
 from shared.keyvault import get_secret
+from shared.plans import (
+    get_plan, credit_cost, public_plans, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY,
+    FREE_RETRAINS, RETRAIN_CREDITS, MAX_TRAININGS_PER_DAY,
+)
+from shared import catalog
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 # ── Health Check ──────────────────────────────────────────
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse("OK", status_code=200)
+    """Liveness, plus a readiness probe for the face-gate dependency.
+
+    OpenCV is the one dependency that can fail in a way nothing else catches: a bad
+    wheel imports cleanly but returns a HOLLOW module, so `import cv2` succeeds and the
+    first real call dies with AttributeError. That surfaced only as a 500 on /train.
+    Loading the cascade here turns a silent, deploy-shaped breakage into something a
+    smoke test (or an uptime check) sees immediately.
+    """
+    face_gate = "ok"
+    try:
+        from shared.crops import _CASCADE
+        if _CASCADE.empty():
+            face_gate = "cascade_empty"
+    except Exception as e:
+        face_gate = f"unavailable: {type(e).__name__}: {e}"
+
+    status = 200 if face_gate == "ok" else 503
+    return func.HttpResponse(
+        json.dumps({"status": "OK" if status == 200 else "DEGRADED",
+                    "face_gate": face_gate}),
+        mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
 @app.route(route="users/register", methods=["POST"])
@@ -85,10 +122,14 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
         f"{sorted(payload.keys())} (email_present={'email' in payload}, "
         f"name_present={'name' in payload})"
     )
+    # plan_name is set EXPLICITLY rather than left to the column default: the default
+    # was 'basic' (30 images = 30 credits) while the grant is 20, so every new user was
+    # created 10 credits short of ever running a single job. New users start on the free
+    # trial plan, which REGISTRATION_CREDITS is sized to cover (see shared/plans.py).
     cursor.execute("""
-        INSERT INTO users (user_id, email, full_name, credits_remaining)
-        VALUES (?, ?, ?, 20)
-    """, user_id, email, name)
+        INSERT INTO users (user_id, email, full_name, credits_remaining, plan_name)
+        VALUES (?, ?, ?, ?, ?)
+    """, user_id, email, name, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY)
     conn.commit()
 
     return func.HttpResponse(
@@ -134,7 +175,9 @@ def get_profile(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",
+        "SELECT user_id, email, full_name, credits_remaining, plan_name, "
+        "ISNULL(lora_status, 'none'), ISNULL(retrain_count, 0) "
+        "FROM users WHERE user_id = ?",
         user_id,
     )
     row = cursor.fetchone()
@@ -143,12 +186,32 @@ def get_profile(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Resolve the plan so the client gets its limits (max_attires / max_backgrounds /
+    # category_rule) + image_count alongside the raw plan key — same source the
+    # backend enforces against, so client and server never disagree.
+    plan = get_plan(row[4])
     return func.HttpResponse(
         json.dumps({
             "user_id": row[0],
             "email": row[1],
             "full_name": row[2],
             "credits_remaining": row[3],
+            "plan_name": plan.key,
+            "plan": {
+                "key": plan.key, "name": plan.name, "image_count": plan.image_count,
+                "max_attires": plan.max_attires, "max_backgrounds": plan.max_backgrounds,
+                "category_rule": plan.category_rule, "plan_type": plan.plan_type,
+                "credits_per_image": plan.credits_per_image,
+            },
+            # The app routes on this at load: 'none'/'failed' -> training flow,
+            # 'training' -> progress screen, 'ready' -> generation. Served here so the
+            # client needs ONE call to decide where the user belongs.
+            "lora_status": row[5],
+            "retrain": {
+                "count": row[6],
+                "free_left": max(0, FREE_RETRAINS - int(row[6] or 0)),
+                "cost": 0 if int(row[6] or 0) < FREE_RETRAINS else RETRAIN_CREDITS,
+            },
         }),
         mimetype="application/json",
         status_code=200,
@@ -250,6 +313,300 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
+# ── Identity-LoRA training ────────────────────────────────
+def _list_training_photos(user_id: str) -> list:
+    """The user's RAW uploads: files sitting DIRECTLY under inputs/<user_id>/input/.
+
+    Anything nested one level deeper is excluded, and that is deliberate rather than
+    just tidy: `input/` already accumulates non-photo material in sub-prefixes — our own
+    generated crops (crop_upperbody/), and at least one account has a template/ folder.
+    Filtering only on file extension would sweep a template PNG into the training set as
+    if it were the user's face. A raw upload is a leaf under input/ (that is exactly what
+    /upload writes: "<user_id>/input/<filename>"), so anything with a further '/' in its
+    relative path is by definition not one.
+    """
+    container = get_blob_client().get_container_client("inputs")
+    prefix = f"{user_id}/input/"
+    photos = []
+    for b in container.list_blobs(name_starts_with=prefix):
+        rel = b.name[len(prefix):]
+        if "/" in rel:                        # nested: crop_upperbody/, template/, ...
+            continue
+        if not rel.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        photos.append(b.name)
+    return sorted(photos)
+
+
+def _purge_stale_training_photos(user_id: str, keep: set):
+    """Delete raw photos under this user's input/ prefix that are NOT part of the set we are
+    about to train on.
+
+    /upload appends and never cleans up. Without this, every upload session piles on top of
+    the last, and the next training silently trains on a MIX of photo sets — two different
+    people's faces blended into one adapter if the folder was ever reused. Scoped strictly
+    to leaf files directly under <user_id>/input/, so it can never touch crops, templates, or
+    anything belonging to another user.
+    """
+    try:
+        container = get_blob_client().get_container_client("inputs")
+        prefix = f"{user_id}/input/"
+        removed = 0
+        for b in container.list_blobs(name_starts_with=prefix):
+            rel = b.name[len(prefix):]
+            if "/" in rel:                       # nested (crop_upperbody/, ...) — never touch
+                continue
+            if b.name in keep:
+                continue
+            container.delete_blob(b.name)
+            removed += 1
+        if removed:
+            logging.info(f"purged {removed} stale training photo(s) for user={user_id}")
+    except Exception as e:
+        # Non-fatal: a failed purge means clutter, not a wrong model — this session's
+        # training set is already pinned to the explicit list.
+        logging.warning(f"could not purge stale photos for user={user_id}: {e}")
+
+
+@app.route(route="train", methods=["POST"])
+def start_training(req: func.HttpRequest) -> func.HttpResponse:
+    """Kick off this user's identity-LoRA training.
+
+    EVERYTHING is computed here — nothing is hand-typed. The user_id comes from the
+    auth token and is the SINGLE source of truth: it selects the input photos AND
+    (inside the trainer) the adapter output path identity/<user_id>/. There is no
+    request field, env var, or config that can point those at different people.
+    """
+    # Authenticate FIRST, before importing anything heavy. shared.crops pulls OpenCV,
+    # and an import failure there used to crash the handler before the auth check even
+    # ran — so an unauthenticated caller got a 500 (leaking that something is broken)
+    # instead of a clean 401. Cheap checks first, always.
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    from shared.crops import crop_head_and_shoulders, NoFaceError
+    from shared.queue_client import enqueue_training_job
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    gender = body.get("gender")
+    force = bool(body.get("force"))
+
+    # ── Don't start a second run for a user who already has one ──────────────
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT lora_status, credits_remaining, retrain_count FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+    lora_status = (row[0] or "none").strip()
+    credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
+
+    if lora_status == "training":
+        return func.HttpResponse(
+            json.dumps({"status": "training", "message": "Training already in progress"}),
+            mimetype="application/json", status_code=409)
+    if lora_status == "ready" and not force:
+        return func.HttpResponse(
+            json.dumps({"status": "ready",
+                        "message": "You already have a trained model. Pass force=true to retrain.",
+                        "retrain_cost": 0 if retrain_count < FREE_RETRAINS else RETRAIN_CREDITS,
+                        "free_retrains_left": max(0, FREE_RETRAINS - retrain_count)}),
+            mimetype="application/json", status_code=409)
+
+    # ── Retrain metering ─────────────────────────────────────────────────────
+    # A retrain is ~32 min of A100 AND (MAX_ACTIVE_GPU_JOBS=1) blocks the queue for every
+    # other user for that whole time — the most expensive action in the product. First one
+    # is free; after that it costs credits. Charged HERE, before any GPU is touched.
+    is_retrain = lora_status in ("ready", "failed") and force
+    retrain_cost = 0
+    if is_retrain and retrain_count >= FREE_RETRAINS:
+        retrain_cost = RETRAIN_CREDITS
+        if credits < retrain_cost:
+            return func.HttpResponse(
+                json.dumps({"error": "Not enough credits to retrain your model.",
+                            "required": retrain_cost, "credits_remaining": credits}),
+                mimetype="application/json", status_code=402)
+
+    # Backstop: even a well-funded account cannot monopolise the single GPU.
+    cur.execute(
+        "SELECT COUNT(*) FROM lora_trainings "
+        "WHERE user_id = ? AND created_at >= CAST(GETUTCDATE() AS DATE)",
+        user_id,
+    )
+    if int(cur.fetchone()[0]) >= MAX_TRAININGS_PER_DAY:
+        return func.HttpResponse(
+            json.dumps({"error": "Daily training limit reached. Try again tomorrow.",
+                        "limit": MAX_TRAININGS_PER_DAY}),
+            mimetype="application/json", status_code=429)
+
+    # ── Which photos? THIS SESSION'S, not "whatever is in the folder" ────────
+    #
+    # THE BUG THIS FIXES: /upload APPENDS to inputs/<user_id>/input/ and nothing ever
+    # clears it. /train used to list the whole folder, so a user's SECOND upload trained on
+    # their old photos AND their new ones, mixed together. On a real account that means a
+    # retrain silently blends two different photo sets; on the test account it meant a new
+    # user's model would have been trained on the previous occupant's face. It also breaks
+    # the count check (6 stale + 8 new = 14 > MAX -> 400 with no way for the user to
+    # understand why).
+    #
+    # The client knows exactly which blobs it just uploaded (/upload returns blob_name), so
+    # it now sends them explicitly. Every path is still verified to live under THIS user's
+    # own prefix, so a caller cannot name someone else's photos.
+    requested = body.get("photos") or []
+    if requested:
+        prefix = f"{user_id}/".lower()
+        stray = [p for p in requested if not str(p).lower().startswith(prefix)]
+        if stray:
+            logging.error(f"REJECTED: user={user_id} named photos outside their prefix: {stray[:3]}")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid photo paths."}),
+                mimetype="application/json", status_code=400)
+        photos = [str(p) for p in requested]
+    else:
+        # Fallback for the ops/curl path, which has no session context.
+        photos = _list_training_photos(user_id)
+
+    if not (MIN_TRAINING_PHOTOS <= len(photos) <= MAX_TRAINING_PHOTOS):
+        return func.HttpResponse(
+            json.dumps({
+                "error": f"Upload between {MIN_TRAINING_PHOTOS} and {MAX_TRAINING_PHOTOS} photos "
+                         f"to train your model.",
+                "uploaded": len(photos),
+                "min": MIN_TRAINING_PHOTOS, "max": MAX_TRAINING_PHOTOS,
+            }),
+            mimetype="application/json", status_code=400)
+
+    # ── Crop + FACE GATE ─────────────────────────────────────────────────────
+    # Every photo must contain a detectable face. A faceless photo is REJECTED here,
+    # in milliseconds, before a single GPU-second is spent — never silently centre-
+    # cropped into the training set, which would poison the adapter and only surface
+    # ~51 minutes of A100 later as a bad likeness. Nothing is uploaded unless ALL
+    # photos pass, so a rejected batch leaves no half-written crop set behind.
+    crops, rejected = [], []
+    for i, blob_name in enumerate(photos):
+        try:
+            crops.append(crop_head_and_shoulders(download_blob("inputs", blob_name)))
+        except NoFaceError:
+            rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
+                             "reason": "no face detected"})
+        except ValueError as e:
+            rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
+                             "reason": str(e)})
+
+    if rejected:
+        names = ", ".join(str(r["index"]) for r in rejected)
+        return func.HttpResponse(
+            json.dumps({
+                "error": f"Photo {names} doesn't show your face clearly, please replace it."
+                         if len(rejected) == 1 else
+                         f"Photos {names} don't show your face clearly, please replace them.",
+                "rejected": rejected,
+            }),
+            mimetype="application/json", status_code=400)
+
+    # ── Upload crops + build FILES_JSON programmatically ──────────────────────
+    # Paths are RELATIVE to the `inputs` container (no container prefix) because the
+    # trainer joins them against INPUT_CONTAINER=inputs. Captions are omitted entirely:
+    # this is DreamBooth, identity keys off --instance_prompt, and the trainer reads and
+    # discards the caption field. Hand-typing them was pure waste.
+    files = []
+    for i, data in enumerate(crops):
+        rel = f"{user_id}/{CROP_SUBDIR}/img{i}.jpg"
+        upload_blob("inputs", rel, data)
+        files.append({"blob": rel})
+
+    # Purge raw photos from any PREVIOUS session. /upload appends and never cleans up, so
+    # without this a user's folder accumulates every set they have ever uploaded — and the
+    # next training (or the ops fallback that lists the folder) would blend them together.
+    # Only runs once this session's photos have been cropped and safely written.
+    _purge_stale_training_photos(user_id, keep=set(photos))
+
+    cword = catalog.class_word(gender)
+
+    # Insert the run, flip the user to 'training', and CHARGE the retrain in ONE
+    # transaction — so a crash between them can't take credits without starting a run,
+    # or start a run without charging.
+    conn2 = new_connection()
+    try:
+        conn2.autocommit = False
+        cur2 = conn2.cursor()
+        cur2.execute("""
+            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json)
+            OUTPUT INSERTED.training_id
+            VALUES (?, 'queued', ?, ?, ?)
+        """, user_id, len(files), cword, json.dumps(files))
+        training_id = cur2.fetchone()[0]
+        if is_retrain:
+            cur2.execute(
+                "UPDATE users SET lora_status = 'training', retrain_count = retrain_count + 1, "
+                "credits_remaining = credits_remaining - ? WHERE user_id = ?",
+                retrain_cost, user_id,
+            )
+        else:
+            cur2.execute(
+                "UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    enqueue_training_job({"training_id": str(training_id), "user_id": str(user_id)})
+    logging.info(
+        f"training queued: training_id={training_id} user={user_id} "
+        f"photos={len(files)} class_word={cword}"
+    )
+
+    return func.HttpResponse(
+        json.dumps({"training_id": str(training_id), "status": "training",
+                    "photos": len(files), "class_word": cword,
+                    "retrain": is_retrain, "credits_charged": retrain_cost,
+                    # Warm class-image cache -> ~32 min; a cold cache (first user of a
+                    # gender) still pays the ~17.6 min class-image build on top.
+                    "estimated_minutes": 32}),
+        mimetype="application/json", status_code=202)
+
+
+@app.route(route="train/status", methods=["GET"])
+def training_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Poll target for the frontend while the LoRA builds."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT lora_status FROM users WHERE user_id = ?", user_id)
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    cur.execute("""
+        SELECT TOP 1 training_id, status, photo_count, error, created_at, completed_at
+        FROM lora_trainings WHERE user_id = ? ORDER BY created_at DESC
+    """, user_id)
+    t = cur.fetchone()
+
+    payload = {"lora_status": (row[0] or "none").strip()}
+    if t:
+        payload["training"] = {
+            "training_id": str(t[0]), "status": t[1], "photos": t[2],
+            "error": t[3],
+            "created_at": t[4].isoformat() if t[4] else None,
+            "completed_at": t[5].isoformat() if t[5] else None,
+        }
+    return func.HttpResponse(json.dumps(payload), mimetype="application/json", status_code=200)
+
+
 # ── Submit Job ────────────────────────────────────────────
 @app.route(route="jobs/submit", methods=["POST"])
 def submit_job(req: func.HttpRequest) -> func.HttpResponse:
@@ -263,32 +620,126 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     gender = body.get("gender")
     age_range = body.get("age_range")
     hair_color = body.get("hair_color")
-    purpose = body.get("purpose")
-    background = body.get("background")
     input_blob_path = body.get("input_blob_path")
+    # GLOBAL cross-category selections (category-qualified refs, e.g.
+    # "business_suit.navy_suit_tie"). custom_prompt (scene-only text) is the
+    # custom_scene mode; when present the attire/background menus are skipped.
+    attire_ids = body.get("attire_ids") or []
+    background_ids = body.get("background_ids") or []
+    custom_prompt = (body.get("custom_prompt") or "").strip()
 
-    if not all([gender, age_range, hair_color, purpose, background, input_blob_path]):
-        return func.HttpResponse("Missing required fields", status_code=400)
+    # input_blob_path is NOT required. This is txt2img: identity comes entirely from the
+    # user's trained LoRA, and there is no source photo to seed from — the field is a
+    # leftover from the old img2img flow. Requiring it forced the client to invent a dummy
+    # value for something the pipeline never reads. Kept as an optional passthrough (it is
+    # still stored on the job row for provenance).
+    if not all([gender, age_range, hair_color]):
+        return func.HttpResponse(
+            json.dumps({"error": "gender, age_range and hair_color are required"}),
+            mimetype="application/json", status_code=400)
+    input_blob_path = input_blob_path or ""
+
+    # ── Resolve the user's plan (image_count + selection limits live in shared/plans) ──
+    conn0 = get_db()
+    cur0 = conn0.cursor()
+    cur0.execute("SELECT plan_name, lora_status FROM users WHERE user_id = ?", user_id)
+    prow = cur0.fetchone()
+    if not prow:
+        return func.HttpResponse("User not found", status_code=404)
+    plan = get_plan(prow[0])
+    lora_status = (prow[1] or "none").strip()
+
+    # ── Identity-LoRA gate ───────────────────────────────────────────────────
+    # Without the user's adapter, txt2img has NOTHING carrying their identity and
+    # main.py would render base SDXL — a photogenic stranger. So:
+    #   ready    → dispatch normally.
+    #   training → ACCEPT and PARK (below): reserve credits, insert 'waiting_lora', do
+    #              NOT enqueue. The training watcher enqueues it the instant the adapter
+    #              lands, so there is no polling lag and no defer-backoff churn.
+    #   none/failed → REJECT here, BEFORE reserving credits. A parked job with no
+    #              training in flight would wait forever; tell them to train instead.
+    if lora_status not in ("ready", "training"):
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Your model isn't trained yet. Upload your photos and start training first.",
+                "lora_status": lora_status,
+                "train_endpoint": "/api/train",
+            }),
+            mimetype="application/json", status_code=409)
+
+    # ── Validate selections + enforce plan limits ─────────────────────────────
+    is_custom = bool(custom_prompt)
+    if is_custom:
+        if len(custom_prompt) > 400:
+            return func.HttpResponse("Custom scene text too long (max 400 chars)", status_code=400)
+    else:
+        if not attire_ids or not background_ids:
+            return func.HttpResponse(
+                "Select at least one attire and one background", status_code=400)
+        # Every ref must exist in the catalog (drops typos / stale ids).
+        bad = ([a for a in attire_ids if not catalog.valid_attire_ref(a)] +
+               [b for b in background_ids if not catalog.valid_background_ref(b)])
+        if bad:
+            return func.HttpResponse(
+                json.dumps({"error": "Unknown attire/background ids", "invalid": bad}),
+                mimetype="application/json", status_code=400)
+        # Count limits.
+        if len(attire_ids) > plan.max_attires:
+            return func.HttpResponse(
+                json.dumps({"error": f"{plan.name} allows up to {plan.max_attires} attires",
+                            "limit": plan.max_attires}),
+                mimetype="application/json", status_code=403)
+        if len(background_ids) > plan.max_backgrounds:
+            return func.HttpResponse(
+                json.dumps({"error": f"{plan.name} allows up to {plan.max_backgrounds} backgrounds",
+                            "limit": plan.max_backgrounds}),
+                mimetype="application/json", status_code=403)
+        # Type rule: single_type plans (Basic) cannot mix professional + personal.
+        if plan.category_rule == "single_type":
+            types = {catalog.ref_type(r) for r in (attire_ids + background_ids)}
+            types.discard(None)
+            if len(types) > 1:
+                return func.HttpResponse(
+                    json.dumps({"error": f"{plan.name} cannot mix professional and personal; "
+                                         "pick all selections from one type",
+                                "types": sorted(types)}),
+                    mimetype="application/json", status_code=403)
+
+    image_count = plan.image_count
+    cost = credit_cost(plan, image_count)
 
     job_params = json.dumps({
         "gender": gender,
         "age_range": age_range,
         "hair_color": hair_color,
-        "purpose": purpose,
-        "background": background,
-        "input_blob_path": input_blob_path
+        "attire_ids": attire_ids,
+        "background_ids": background_ids,
+        "custom_prompt": custom_prompt,
+        "image_count": image_count,
+        "credit_cost": cost,            # for the refund path on terminal failure
+        "plan_name": plan.key,
+        "input_blob_path": input_blob_path,
     })
 
     # Atomic credits + daily-cap check + insert + decrement (serialized across
     # all instances via sp_getapplock). See shared/job_reservation.py. Daily caps
     # exist because credits alone don't bound spend: multi-account abuse,
-    # duplicate-job bugs, or a test account can all flood the GPU.
+    # duplicate-job bugs, or a test account can all flood the GPU. credit_cost is
+    # image_count * plan.credits_per_image — the counter tracks images, not jobs.
+    # 'waiting_lora' rows are reserved (credits taken, cap counted) but deliberately
+    # NOT enqueued — see the identity-LoRA gate above.
+    parked = lora_status == "training"
     result = reserve_job_slot(
-        user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP
+        user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
+        credit_cost=cost,
+        initial_status="waiting_lora" if parked else "queued",
     )
     if not result.ok:
         if result.reason == "credits":
-            return func.HttpResponse("Insufficient credits", status_code=402)
+            return func.HttpResponse(
+                json.dumps({"error": "Insufficient credits", "required": cost,
+                            "images": image_count}),
+                mimetype="application/json", status_code=402)
         if result.reason == "busy":
             return func.HttpResponse(
                 json.dumps({"error": "Service busy, please retry"}),
@@ -304,10 +755,22 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     job_id = result.job_id
+
+    if parked:
+        logging.info(
+            f"job_id={job_id} parked as 'waiting_lora' (user={user_id} is still training); "
+            f"the training watcher will release it"
+        )
+        return func.HttpResponse(
+            json.dumps({"job_id": str(job_id), "status": "waiting_lora",
+                        "message": "We're still building your model. "
+                                   "Your photos will start automatically when it's ready."}),
+            mimetype="application/json", status_code=202)
+
     enqueue_job({"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params})
 
     return func.HttpResponse(
-        json.dumps({"job_id": str(job_id)}),
+        json.dumps({"job_id": str(job_id), "status": "queued"}),
         mimetype="application/json",
         status_code=202
     )
@@ -478,13 +941,28 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
     """, user_id)
     rows = cursor.fetchall()
 
+    def _paths(v):
+        """output_blob_path is stored as a JSON STRING (main.py json.dumps's the list), but
+        the API contract — and every client — expects a real array. Returning the raw column
+        meant the dashboard's "Photos Generated" count could never work: it can't count the
+        images in an opaque string. Parse it here, once, at the boundary."""
+        if not v:
+            return []
+        if isinstance(v, list):
+            return v
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except (TypeError, ValueError):
+            return [v]          # legacy rows that stored a bare path
+
     jobs = [
         {
             "job_id": str(r[0]),
             "status": r[1],
             "job_type": r[2],
             "category": r[3],
-            "output_blob_path": r[4],
+            "output_blob_path": _paths(r[4]),
             "created_at": str(r[5])
         }
         for r in rows
@@ -532,6 +1010,29 @@ def get_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps({"backgrounds": backgrounds}),
         mimetype="application/json",
         status_code=200
+    )
+
+# ── Catalog (categories + attire/background options) ──────
+# The SINGLE source of truth for the frontend pickers — served from shared/catalog
+# so the UI never hardcodes options (and can't drift from the inference prompts).
+# Each option carries a category-qualified `ref` for the global cross-category picker.
+@app.route(route="catalog", methods=["GET"])
+def get_catalog(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({"categories": catalog.public_catalog()}),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+# ── Plans (pricing + selection limits) ────────────────────
+# Served from shared/plans so the frontend renders prices/limits and enforces the
+# same max_attires / max_backgrounds / category_rule the backend enforces.
+@app.route(route="plans", methods=["GET"])
+def get_plans(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({"plans": public_plans()}),
+        mimetype="application/json",
+        status_code=200,
     )
 
 # ── Ops: manual repair endpoints ─────────────────────────
@@ -768,16 +1269,29 @@ def _mark_failed(job_id: str):
             job_id,
         )
         transitioned = cur.rowcount == 1
+        refund = 0
         if transitioned:
+            # Refund the FULL amount spent at submit (image_count * credits_per_image),
+            # stored as credit_cost in job_params. Falls back to 1 for any legacy job
+            # written before per-image charging. Tied to the same state-transition
+            # rowcount guard above, so it can never double-refund.
+            cur.execute("SELECT job_params, user_id FROM jobs WHERE job_id = ?", job_id)
+            r = cur.fetchone()
+            refund = 1
+            if r and r[0]:
+                try:
+                    refund = max(1, int(json.loads(r[0]).get("credit_cost", 1)))
+                except (TypeError, ValueError):
+                    refund = 1
             cur.execute(
-                "UPDATE users SET credits_remaining = credits_remaining + 1 "
+                "UPDATE users SET credits_remaining = credits_remaining + ? "
                 "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                job_id,
+                refund, job_id,
             )
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
-            f"credit_refunded={transitioned})"
+            f"credits_refunded={refund if transitioned else 0})"
         )
     finally:
         conn.close()
@@ -842,6 +1356,306 @@ def _defer_job(payload: dict, job_id: str):
     )
 
 
+# ── Identity-LoRA training dispatch ───────────────────────────────────────────
+# Deliberately mirrors process_inference_job beat for beat, and takes the SAME
+# dispatch lease and the SAME active-job cap — training and inference run on one
+# shared A100 profile, so they must serialize against each other, not just against
+# themselves. (count_active_job_executions now spans both job names.)
+def _record_training_error(training_id: str, err: str):
+    """Persist the ROOT CAUSE of a dispatch failure on the training row.
+
+    Without this, a dispatch that throws is retried 3x and then poisoned, and the only
+    thing ever written is the poison handler's "exceeded retry limit" — which says
+    nothing about WHY. That is exactly what happened on the first live run, and App
+    Insights sampling/ingestion lag made the real exception invisible for the entire
+    debug session. The DB is the one place we control, so the cause goes there.
+
+    Keeps the FIRST error (WHERE error IS NULL): the root cause is more useful than the
+    retry-limit message that lands last.
+    """
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE lora_trainings SET error = ? WHERE training_id = ? AND error IS NULL",
+                err[:1000], training_id,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logging.exception("could not persist training error (non-fatal)")
+
+
+@app.queue_trigger(arg_name="msg", queue_name="lora-training-jobs", connection="AzureWebJobsStorage")
+def process_training_job(msg: func.QueueMessage):
+    payload = json.loads(msg.get_body().decode("utf-8"))
+    training_id = payload["training_id"]
+    user_id = payload["user_id"]
+    try:
+        _dispatch_training(payload, training_id, user_id)
+    except Exception as e:
+        logging.exception(f"training dispatch FAILED training_id={training_id}")
+        _record_training_error(training_id, f"{type(e).__name__}: {e}")
+        raise
+
+
+def _dispatch_training(payload: dict, training_id: str, user_id: str):
+    from shared.queue_trigger import count_active_job_executions
+    from shared.training_trigger import trigger_training_job
+    from shared.queue_client import enqueue_training_job
+    from shared.gpu_lease import (
+        acquire_dispatch_lease, release_dispatch_lease,
+        mark_dispatched, recent_dispatch_pending, DispatchConfigError,
+    )
+
+    if not _gpu_dispatch_enabled():
+        enqueue_training_job(payload, visibility_timeout=KILL_SWITCH_PAUSE_DELAY)
+        logging.warning(f"GPU_DISPATCH_ENABLED=false; paused training_id={training_id}")
+        return
+
+    try:
+        owner = acquire_dispatch_lease()
+    except DispatchConfigError as e:
+        logging.error(
+            f"DISPATCH_CONFIG_ERROR: {e}; failing training_id={training_id}. "
+            f"ALERT: apply migration 001 / check the lease table."
+        )
+        _fail_training(training_id, "dispatch config error")
+        return
+    if owner is None:
+        _defer_training(payload, training_id)
+        return
+
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+
+            # Dispatch idempotency: a retried message must never start a SECOND A100
+            # for the same training run.
+            cur.execute(
+                "SELECT status, external_execution_id, files_json, class_word "
+                "FROM lora_trainings WHERE training_id = ?",
+                training_id,
+            )
+            row = cur.fetchone()
+            if row is None:
+                logging.error(f"training_id={training_id} not found; dropping message")
+                return
+            status, exec_id, files_json, class_word = row[0], row[1], row[2], row[3]
+            if exec_id or status in ("dispatching", "training", "completed", "failed"):
+                logging.info(
+                    f"training_id={training_id} already dispatched/terminal "
+                    f"(status={status}, execution_id={exec_id}); not starting again"
+                )
+                return
+
+            active = count_active_job_executions()
+            if recent_dispatch_pending():
+                active += 1
+            if active >= MAX_ACTIVE_GPU_JOBS:
+                _defer_training(payload, training_id)
+                return
+
+            cur.execute(
+                "UPDATE lora_trainings SET status = 'dispatching' "
+                "WHERE training_id = ? AND status = 'queued'",
+                training_id,
+            )
+            claimed = cur.rowcount == 1
+            conn.commit()
+            if not claimed:
+                logging.info(f"training_id={training_id} claim lost (concurrent); skipping")
+                return
+        finally:
+            conn.close()
+
+        try:
+            # user_id is passed ONCE and drives both the input photo paths and the
+            # adapter output path. trigger_training_job re-verifies every file lives
+            # under this user's prefix before it will start.
+            execution_id = trigger_training_job(user_id, json.loads(files_json), class_word)
+        except Exception as e:
+            logging.exception(f"training start failed for training_id={training_id}")
+            # No A100 was started. Revert to 'queued' so the queue retry can pick it up
+            # again — unless the payload itself is bad (ValueError from the prefix guard),
+            # which will never succeed and must fail loudly instead of looping.
+            if isinstance(e, ValueError):
+                _fail_training(training_id, str(e))
+                return
+            conn3 = new_connection()
+            try:
+                c3 = conn3.cursor()
+                c3.execute(
+                    "UPDATE lora_trainings SET status = 'queued' "
+                    "WHERE training_id = ? AND status = 'dispatching'",
+                    training_id,
+                )
+                conn3.commit()
+            finally:
+                conn3.close()
+            raise
+
+        mark_dispatched(owner)
+        conn4 = new_connection()
+        try:
+            c4 = conn4.cursor()
+            c4.execute(
+                "UPDATE lora_trainings SET status = 'training', external_execution_id = ? "
+                "WHERE training_id = ?",
+                execution_id, training_id,
+            )
+            conn4.commit()
+        finally:
+            conn4.close()
+        logging.info(
+            f"Started training_id={training_id} user={user_id} "
+            f"execution_id={execution_id} (active before={active})"
+        )
+    finally:
+        release_dispatch_lease(owner)
+
+
+def _defer_training(payload: dict, training_id: str):
+    """Same exponential back-pressure as _defer_job. A training run that can never get
+    a GPU is failed rather than churning the queue forever."""
+    from shared.queue_client import enqueue_training_job
+
+    defer_count = int(payload.get("defer_count", 0))
+    if defer_count >= MAX_DISPATCH_DEFERS:
+        logging.error(
+            f"DISPATCH_TIMEOUT: training_id={training_id} exceeded {MAX_DISPATCH_DEFERS} "
+            f"deferrals; marking failed"
+        )
+        _fail_training(training_id, "could not get a GPU (dispatch timeout)")
+        return
+
+    delay = min(GPU_BACKPRESSURE_BASE * (2 ** defer_count), GPU_BACKPRESSURE_MAX)
+    payload["defer_count"] = defer_count + 1
+    enqueue_training_job(payload, visibility_timeout=delay)
+    logging.info(
+        f"GPU at cap; deferred training_id={training_id} "
+        f"(defer {defer_count + 1}/{MAX_DISPATCH_DEFERS}) for {delay}s"
+    )
+
+
+def _identity_adapter_exists(user_id: str) -> bool:
+    """Does this user already have a usable identity LoRA in blob storage?
+
+    Asked on a FAILED training run to decide whether that failure actually cost them
+    anything. The trainer writes the adapter only at the very end (after its format gate),
+    so a failed run leaves any previous adapter untouched. Fails CLOSED (False) if blob
+    storage can't be reached — better to mark them 'failed' and let them retrain than to
+    claim they have a model we can't confirm.
+    """
+    try:
+        blob = get_blob_client().get_blob_client(
+            container="lora-weights",
+            blob=f"identity/{user_id}/adapter_model.safetensors",
+        )
+        return bool(blob.exists())
+    except Exception as e:
+        logging.warning(f"could not check adapter for user={user_id}: {e}")
+        return False
+
+
+def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None):
+    """Terminal transition for a training run, and the release of everything parked
+    behind it. Guarded by the status check + rowcount so it runs EXACTLY once even if
+    the watcher and a retry both see the same completed execution.
+
+    On success: lora_status='ready', and every job the user parked in 'waiting_lora'
+    flips to 'queued' and is enqueued IMMEDIATELY (visibility 0) — no polling lag.
+    On failure: lora_status='failed', and the parked jobs are failed + refunded rather
+    than left waiting for an adapter that will never arrive.
+    """
+    from shared.queue_client import enqueue_job
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        # COALESCE: never clobber a root cause already recorded by _record_training_error.
+        # The poison handler's "exceeded retry limit" arrives LAST and is the least useful
+        # message; the first error written is the one that explains the failure.
+        cur.execute(
+            "UPDATE lora_trainings SET status = ?, error = COALESCE(error, ?), "
+            "completed_at = GETUTCDATE() "
+            "WHERE training_id = ? AND status NOT IN ('completed', 'failed')",
+            "completed" if ok else "failed", (error[:1000] if error else None), training_id,
+        )
+        transitioned = cur.rowcount == 1
+        if not transitioned:
+            conn.commit()
+            return
+
+        # A FAILED RETRAIN MUST NOT STRAND A USER WHO ALREADY HAD A WORKING MODEL.
+        # The trainer overwrites the adapter only at the very END, after its format gate —
+        # so when a run fails, any PREVIOUS adapter is still sitting in blob, untouched and
+        # perfectly usable. Blindly setting lora_status='failed' would 409 that user out of
+        # /jobs/submit and take away a product they already had, over a failure that damaged
+        # nothing. So on failure, ask blob storage whether an adapter still exists and keep
+        # them 'ready' if it does.
+        recovered = not ok and _identity_adapter_exists(user_id)
+        if recovered:
+            logging.warning(
+                f"training FAILED for user={user_id} but a previous adapter is intact; "
+                f"keeping lora_status='ready' (their existing model still works)"
+            )
+        new_status = "ready" if (ok or recovered) else "failed"
+        cur.execute(
+            "UPDATE users SET lora_status = ? WHERE user_id = ?", new_status, user_id)
+
+        # `ok` stays the TRUTH about the training run (for the row + the log). `usable` is
+        # the separate question of whether the user has an adapter to render with, which is
+        # what parked jobs actually depend on. Conflating the two would either strand the
+        # user or log a failed run as "completed".
+        usable = ok or recovered
+        cur.execute(
+            "SELECT job_id, job_params FROM jobs WHERE user_id = ? AND status = 'waiting_lora'",
+            user_id,
+        )
+        parked = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        if usable and parked:
+            cur.execute(
+                "UPDATE jobs SET status = 'queued' WHERE user_id = ? AND status = 'waiting_lora'",
+                user_id,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    logging.info(
+        f"training_id={training_id} user={user_id} -> {'completed' if ok else 'failed'}"
+        f"{'' if ok else f' ({error})'}; lora_status={new_status} "
+        f"{'(RECOVERED: prior adapter intact) ' if recovered else ''}parked_jobs={len(parked)}"
+    )
+
+    if usable:
+        # Release: enqueue with no visibility delay so the GPU picks them up at once.
+        for job_id, job_params in parked:
+            enqueue_job({"job_id": job_id, "user_id": str(user_id), "job_params": job_params})
+            logging.info(f"released parked job_id={job_id} for user={user_id}")
+    else:
+        # Never leave a user waiting on an adapter that will never exist.
+        # _mark_failed refunds their credits (guarded, once).
+        for job_id, _ in parked:
+            _mark_failed(job_id)
+
+
+def _fail_training(training_id: str, error: str):
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM lora_trainings WHERE training_id = ?", training_id)
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if row:
+        _finish_training(training_id, str(row[0]), ok=False, error=error)
+
+
 # ── Poison handler ────────────────────────────────────────────────────────
 # After maxDequeueCount (3) failed processing attempts the host auto-moves a
 # message to "<queue>-poison". Mark the job failed so a bad message stops
@@ -897,6 +1711,90 @@ def reaper(timer: func.TimerRequest):
     for job_id in stuck:
         logging.warning(f"REAPER: failing stuck job_id={job_id}")
         _mark_failed(job_id)
+
+
+# ── Training poison handler ───────────────────────────────────────────────────
+@app.queue_trigger(arg_name="msg", queue_name="lora-training-jobs-poison",
+                   connection="AzureWebJobsStorage")
+def handle_poison_training(msg: func.QueueMessage):
+    try:
+        payload = json.loads(msg.get_body().decode("utf-8"))
+        training_id = payload.get("training_id")
+    except Exception:
+        logging.error(f"POISON(train): unparseable message dropped: {msg.get_body()!r}")
+        return
+
+    logging.error(
+        f"POISON(train): training_id={training_id} exceeded retry limit "
+        f"(dequeue_count={msg.dequeue_count}); marking failed"
+    )
+    if training_id:
+        # Fails the run AND releases anything parked behind it (failing + refunding
+        # those jobs), so a poisoned training message can't strand a paying user.
+        _fail_training(training_id, "training message exceeded retry limit")
+
+
+# ── Training watcher ──────────────────────────────────────────────────────────
+# Runs every MINUTE, not every 10, and this interval is the whole point.
+#
+# The adapter is uploaded by a throwaway GPU container that holds no SQL credentials,
+# so SOMETHING has to notice it finished and flip lora_status. If that something ran on
+# the 10-minute reaper cadence, a user could sit staring at a finished LoRA for up to 10
+# minutes before their photos even started. Polling the ACA executions API once a minute
+# for the handful of in-flight runs is cheap (one SELECT + one list call, and only while
+# a training is actually running), and it collapses that dead time to ~60s.
+#
+# _finish_training does the rest: flips lora_status and enqueues every parked job with
+# ZERO visibility delay. Nothing waits on a backoff timer.
+@app.timer_trigger(schedule="0 */1 * * * *", arg_name="timer", run_on_startup=False)
+def training_watcher(timer: func.TimerRequest):
+    from shared.training_trigger import get_execution_status
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT training_id, user_id, external_execution_id,
+                   DATEDIFF(MINUTE, created_at, GETUTCDATE()) AS age_min
+            FROM lora_trainings
+            WHERE status IN ('dispatching', 'training')
+        """)
+        inflight = [(str(r[0]), str(r[1]), r[2], int(r[3] or 0)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    if not inflight:
+        return
+
+    for training_id, user_id, execution_id, age_min in inflight:
+        # Hard timeout: a run past the ceiling is failed so the jobs parked behind it are
+        # released (failed + refunded) instead of waiting forever on a dead container.
+        if age_min > TRAINING_STUCK_MINUTES:
+            logging.warning(
+                f"TRAINING_TIMEOUT: training_id={training_id} age={age_min}min "
+                f"exceeds {TRAINING_STUCK_MINUTES}min; failing"
+            )
+            _finish_training(training_id, user_id, ok=False,
+                             error=f"training exceeded {TRAINING_STUCK_MINUTES} minutes")
+            continue
+
+        if not execution_id:
+            continue  # still dispatching; nothing to poll yet
+
+        try:
+            status = get_execution_status(execution_id)
+        except Exception as e:
+            logging.warning(f"watcher: could not read execution {execution_id}: {e}")
+            continue
+
+        if status == "succeeded":
+            # The trainer's own FORMAT GATE already refused to upload a broken adapter
+            # (it reloads base SDXL and checks the adapter actually activates), so a
+            # 'succeeded' execution means a usable adapter is in blob storage.
+            _finish_training(training_id, user_id, ok=True)
+        elif status in ("failed", "degraded", "cancelled", "stopped"):
+            _finish_training(training_id, user_id, ok=False,
+                             error=f"training execution {status}")
 
     if stuck:
         logging.info(f"REAPER: reaped {len(stuck)} stuck jobs")

@@ -8,6 +8,20 @@ pyodbc
 pyjwt[crypto]
 cryptography
 requests
+# Face-detect + head-and-shoulders crop for the training set (shared/crops.py).
+# HEADLESS build: the plain opencv-python wheel pulls GUI libs (libGL) that do not
+# exist in the Functions Linux image and fail at import.
+#
+# PINNED, and the pin is load-bearing. Unpinned, pip resolved opencv 5.0.0.93 (a
+# brand-new major) whose native extension does not load under the Functions Python
+# 3.13 Linux worker. It fails SILENTLY: `import cv2` succeeds but returns a hollow
+# module, so the first use dies with
+#   AttributeError: module 'cv2' has no attribute 'CascadeClassifier'
+# which reads like a code bug and is not one. Keep this on a proven 4.x.
+opencv-python-headless==4.11.0.86
+# Python 3.13 needs numpy >= 2.1 (1.26 has no cp313 wheels); opencv 4.11 is numpy-2 safe.
+numpy>=2.1,<3
+Pillow
 # Pinned: 4.0.0's client op-group for listing job executions is `jobs_executions`
 # (older versions used `job_executions`). Unpinned, a deploy silently upgraded and
 # broke count_active_job_executions/dispatch with AttributeError. Pin to lock the API.

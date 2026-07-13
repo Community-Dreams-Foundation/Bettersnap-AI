@@ -2,3 +2,13 @@
 !Dockerfile
 !main.py
 !requirements.txt
+!rrdbnet.py
+# Whitelisting a DEEPLY NESTED file requires walking the directory chain: un-ignore
+# each parent dir, re-ignore its contents, then un-ignore the specific file. Without
+# this, `*` excludes Bettersnap-aI_Backend and the Dockerfile's
+# `COPY Bettersnap-aI_Backend/shared/catalog.py` fails ("file not found in context").
+!Bettersnap-aI_Backend
+Bettersnap-aI_Backend/*
+!Bettersnap-aI_Backend/shared
+Bettersnap-aI_Backend/shared/*
+!Bettersnap-aI_Backend/shared/catalog.py

@@ -47,6 +47,9 @@ class _FakeFunctionApp:
     def queue_trigger(self, *a, **k):
         return lambda fn: fn
 
+    def timer_trigger(self, *a, **k):
+        return lambda fn: fn
+
 
 class _AuthLevel:
     ANONYMOUS = "anonymous"
@@ -87,12 +90,31 @@ _mod("azure.storage.blob",
 # the tests exercise the real reservation logic (it uses the stubbed shared.db).
 _mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"))
 _mod("shared.db", get_db=mock.Mock(), new_connection=mock.Mock())
-_mod("shared.queue_client", enqueue_job=mock.Mock())
-_mod("shared.blob", upload_blob=mock.Mock(), get_blob_client=mock.Mock())
+_mod("shared.queue_client",
+     enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock())
+_mod("shared.blob",
+     upload_blob=mock.Mock(), download_blob=mock.Mock(return_value=b""),
+     get_blob_client=mock.Mock())
 _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
 _mod("shared.queue_trigger",
      trigger_container_job=mock.Mock(return_value="exec-123"),
      count_active_job_executions=mock.Mock(return_value=0))
+
+
+# Identity-LoRA training deps. crops pulls opencv and training_trigger pulls
+# azure-mgmt, neither of which the decision-logic tests need.
+class _NoFaceError(Exception):
+    pass
+
+
+_mod("shared.crops",
+     crop_head_and_shoulders=mock.Mock(return_value=b"jpeg"),
+     NoFaceError=_NoFaceError)
+_mod("shared.training_trigger",
+     trigger_training_job=mock.Mock(return_value="train-exec-1"),
+     get_execution_status=mock.Mock(return_value="running"))
+
+
 class _DispatchConfigError(Exception):
     pass
 
@@ -118,6 +140,7 @@ class FakeCursor:
 
     def execute(self, sql, *params):
         self.executed.append((" ".join(sql.split()), params))
+        self._fetchall = []
         s = sql.lower()
         # simulate a crash mid-operation (e.g. while recording execution id)
         raise_on = self.cfg.get("raise_on")
@@ -125,13 +148,35 @@ class FakeCursor:
             raise RuntimeError(f"simulated crash on: {raise_on}")
         if "sp_getapplock" in s:
             self._fetch = (self.cfg.get("applock_rc", 0),)
+        # NOTE: must precede the `jobs` variant — the lora_trainings SELECT also
+        # contains the substring "select status, external_execution_id".
+        elif "from lora_trainings" in s and "select status" in s:
+            self._fetch = self.cfg.get(
+                "training_row",
+                ("queued", None, '[{"blob": "user-1/input/crop_upperbody/img0.jpg"}]', "woman"),
+            )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
         elif "update jobs set status = 'dispatching'" in s:
             self.rowcount = self.cfg.get("claim_rowcount", 1)
+        elif "update lora_trainings set status = 'dispatching'" in s:
+            self.rowcount = self.cfg.get("training_claim_rowcount", 1)
+        elif "update lora_trainings set status = ?" in s:
+            self.rowcount = self.cfg.get("training_finish_rowcount", 1)
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
+        # Plan + identity-LoRA gate lookup in submit_job.
+        elif "select plan_name, lora_status" in s:
+            self._fetch = (self.cfg.get("plan_name", "basic"),
+                           self.cfg.get("lora_status", "ready"))
+        # _mark_failed reads the amount actually charged so it refunds the FULL cost.
+        elif "select job_params, user_id from jobs" in s:
+            self._fetch = (self.cfg.get("job_params",
+                                        json.dumps({"credit_cost": 1})), "user-1")
+        elif "select job_id, job_params from jobs" in s:
+            self._fetch = None
+            self._fetchall = self.cfg.get("parked_jobs", [])
         elif "select credits_remaining" in s:
             self._fetch = (self.cfg.get("credits", 20),)
         elif "count(*) from jobs where user_id" in s:
@@ -140,9 +185,14 @@ class FakeCursor:
             self._fetch = (self.cfg.get("global_count", 0),)
         elif "insert into jobs" in s:
             self._fetch = (self.cfg.get("new_job_id", 999),)
+        elif "select user_id from lora_trainings" in s:
+            self._fetch = (self.cfg.get("training_user", "user-1"),)
         else:
             self._fetch = None
         return self
+
+    def fetchall(self):
+        return getattr(self, "_fetchall", [])
 
     def fetchone(self):
         return self._fetch
@@ -309,14 +359,21 @@ class DispatchTests(unittest.TestCase):
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_not_called()
 
-    # 11) a terminal failure refunds the credit exactly once (guarded transition)
-    def test_failed_path_refunds_credit(self):
+    # 11) a terminal failure refunds the credit exactly once (guarded transition).
+    #     The refund is the FULL amount charged at submit (image_count *
+    #     credits_per_image, carried in job_params.credit_cost) — NOT a hardcoded 1.
+    #     A 30-image job that fails must return 30 credits, not 1.
+    def test_failed_path_refunds_full_credit_cost(self):
         gl = sys.modules["shared.gpu_lease"]
         gl.acquire_dispatch_lease.side_effect = gl.DispatchConfigError("no lease row")
+        self._cfg["job_params"] = json.dumps({"credit_cost": 30})
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
-        sqls = [sql for sql, _ in self._cfg["executed"]]
-        self.assertTrue(any("status = 'failed'" in s for s in sqls))      # failed
-        self.assertTrue(any("credits_remaining + 1" in s for s in sqls))  # refunded
+        executed = self._cfg["executed"]
+        sqls = [sql for sql, _ in executed]
+        self.assertTrue(any("status = 'failed'" in s for s in sqls))          # failed
+        refunds = [p for s, p in executed if "credits_remaining + ?" in s]
+        self.assertEqual(len(refunds), 1)                                     # exactly once
+        self.assertEqual(refunds[0][0], 30)                                   # FULL cost
 
     # 12) refund is NOT issued when the transition does nothing (already terminal)
     def test_no_refund_when_not_transitioned(self):
@@ -325,30 +382,41 @@ class DispatchTests(unittest.TestCase):
         self._cfg["fail_rowcount"] = 0   # row was already failed/completed
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         sqls = [sql for sql, _ in self._cfg["executed"]]
-        self.assertFalse(any("credits_remaining + 1" in s for s in sqls))  # no double refund
+        self.assertFalse(any("credits_remaining + ?" in s for s in sqls))  # no double refund
 
 
 class DailyCapTests(unittest.TestCase):
     """submit_job cap logic (the SQL serialization itself is integration-tested)."""
     def setUp(self):
-        self._cfg = {"applock_rc": 0, "credits": 20}
+        # lora_status defaults to 'ready' — the cap tests are about caps, not the
+        # identity gate, and an untrained user is rejected before the caps are reached.
+        self._cfg = {"applock_rc": 0, "credits": 200, "lora_status": "ready",
+                     "plan_name": "basic"}
         # submit_job -> reserve_job_slot -> shared.job_reservation.new_connection
         self._patch = mock.patch(
             "shared.job_reservation.new_connection",
             side_effect=lambda: FakeConn(self._cfg))
         self._patch.start()
+        # submit_job ALSO reads plan_name + lora_status via get_db() before reserving.
+        self._patch_db = mock.patch.object(
+            function_app, "get_db", side_effect=lambda: FakeConn(self._cfg))
+        self._patch_db.start()
         sys.modules["shared.auth"].get_user_id.return_value = "user-1"
         sys.modules["shared.queue_client"].enqueue_job.reset_mock()
 
     def tearDown(self):
         self._patch.stop()
+        self._patch_db.stop()
 
     def _req(self):
         r = _HttpRequest()
         r.headers = {"Authorization": "Bearer t"}
-        r.get_json = lambda: {"gender": "m", "age_range": "25-29", "hair_color": "black",
-                              "purpose": "linkedin", "background": "white",
-                              "input_blob_path": "inputs/u/in.jpg"}
+        r.get_json = lambda: {
+            "gender": "m", "age_range": "25-29", "hair_color": "black",
+            "input_blob_path": "inputs/u/in.jpg",
+            "attire_ids": ["business_suit.navy_suit_tie"],
+            "background_ids": ["business_suit.studio_gray"],
+        }
         return r
 
     def test_per_user_cap_blocks_at_limit(self):
@@ -381,6 +449,153 @@ class DailyCapTests(unittest.TestCase):
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 202)
         sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+
+
+class IdentityLoraGateTests(unittest.TestCase):
+    """The gate that stops a user without a trained adapter being handed a STRANGER'S
+    face. Without an identity LoRA, txt2img renders base SDXL — a photogenic stranger —
+    and the old code uploaded that as the user's headshots."""
+
+    def setUp(self):
+        self._cfg = {"applock_rc": 0, "credits": 200, "plan_name": "basic",
+                     "new_job_id": 777, "user_count": 0, "global_count": 0}
+        self._p1 = mock.patch("shared.job_reservation.new_connection",
+                              side_effect=lambda: FakeConn(self._cfg))
+        self._p2 = mock.patch.object(function_app, "get_db",
+                                     side_effect=lambda: FakeConn(self._cfg))
+        self._p3 = mock.patch.object(function_app, "new_connection",
+                                     side_effect=lambda: FakeConn(self._cfg))
+        self._p1.start(); self._p2.start(); self._p3.start()
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+        sys.modules["shared.queue_client"].enqueue_job.reset_mock()
+
+    def tearDown(self):
+        self._p1.stop(); self._p2.stop(); self._p3.stop()
+
+    def _req(self):
+        r = _HttpRequest()
+        r.headers = {"Authorization": "Bearer t"}
+        r.get_json = lambda: {
+            "gender": "f", "age_range": "25-29", "hair_color": "black",
+            "input_blob_path": "inputs/u/in.jpg",
+            "attire_ids": ["business_suit.navy_suit_tie"],
+            "background_ids": ["business_suit.studio_gray"],
+        }
+        return r
+
+    # Never trained -> 409 BEFORE any credit is spent. A parked job with no training
+    # in flight would wait forever, so this must reject rather than park.
+    def test_untrained_user_rejected_and_charged_nothing(self):
+        self._cfg["lora_status"] = "none"
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 409)
+        sqls = [s.lower() for s, _ in self._cfg.get("executed", [])]
+        self.assertFalse(any("insert into jobs" in s for s in sqls))     # no job row
+        self.assertFalse(any("credits_remaining -" in s for s in sqls))  # no charge
+        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+
+    # A failed LoRA is equally unusable -> same rejection, not an infinite park.
+    def test_failed_lora_rejected(self):
+        self._cfg["lora_status"] = "failed"
+        self.assertEqual(function_app.submit_job(self._req()).status_code, 409)
+
+    # Training in flight -> ACCEPT, reserve credits, park as 'waiting_lora',
+    # and deliberately DO NOT enqueue (the watcher releases it).
+    def test_training_in_flight_parks_without_enqueueing(self):
+        self._cfg["lora_status"] = "training"
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn("waiting_lora", resp.body)
+        inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertEqual(inserts[0][1], "waiting_lora")                  # parked status
+        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+
+    def test_ready_lora_dispatches_normally(self):
+        self._cfg["lora_status"] = "ready"
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+        inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertEqual(inserts[0][1], "queued")
+        sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+
+    # Training SUCCEEDS -> parked jobs are released IMMEDIATELY (no visibility delay,
+    # so no waiting on a backoff timer while the adapter sits there ready).
+    def test_training_success_releases_parked_jobs(self):
+        self._cfg["parked_jobs"] = [("job-a", "{}"), ("job-b", "{}")]
+        function_app._finish_training("t-1", "user-1", ok=True)
+        qc = sys.modules["shared.queue_client"]
+        self.assertEqual(qc.enqueue_job.call_count, 2)
+        sqls = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertTrue(any("update jobs set status = 'queued'" in s for s in sqls))
+
+    # FIRST training FAILS (no prior adapter) -> parked jobs must NOT hang forever waiting
+    # on an adapter that will never exist. They are failed and refunded instead.
+    def test_training_failure_fails_and_refunds_parked_jobs(self):
+        self._cfg["parked_jobs"] = [("job-a", "{}")]
+        self._cfg["job_params"] = json.dumps({"credit_cost": 30})
+        with mock.patch.object(function_app, "_identity_adapter_exists", return_value=False):
+            function_app._finish_training("t-1", "user-1", ok=False, error="boom")
+        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+        executed = self._cfg["executed"]
+        self.assertTrue(any("status = 'failed'" in s.lower() for s, _ in executed))
+        refunds = [p for s, p in executed if "credits_remaining + ?" in s]
+        self.assertEqual(refunds[0][0], 30)     # full cost returned, not 1
+
+    # A failed RETRAIN must NOT strand a user whose previous model still works.
+    # The trainer only overwrites the adapter at the very end (after its format gate), so a
+    # failed run leaves the old one intact. Marking them 'failed' would 409 them out of
+    # /jobs/submit and take away a product they already had, over a failure that damaged
+    # nothing. They stay 'ready' and their parked jobs are RELEASED, not refunded.
+    def test_failed_retrain_keeps_user_ready_when_prior_adapter_intact(self):
+        self._cfg["parked_jobs"] = [("job-a", "{}")]
+        with mock.patch.object(function_app, "_identity_adapter_exists", return_value=True):
+            function_app._finish_training("t-1", "user-1", ok=False, error="OOM")
+        # the RUN is still recorded as failed ...
+        executed = self._cfg["executed"]
+        finish = [p for s, p in executed if "update lora_trainings set status = ?" in s.lower()]
+        self.assertEqual(finish[0][0], "failed")
+        # ... but the USER keeps a working model, and their job runs instead of dying.
+        user_sets = [p for s, p in executed if "update users set lora_status" in s.lower()]
+        self.assertEqual(user_sets[0][0], "ready")
+        sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+
+    # A retried training message must never start a SECOND A100 for the same run.
+    def test_training_dispatch_is_idempotent(self):
+        tt = sys.modules["shared.training_trigger"]
+        tt.trigger_training_job.reset_mock()
+        gl = sys.modules["shared.gpu_lease"]
+        gl.acquire_dispatch_lease.return_value = "owner-1"
+        gl.acquire_dispatch_lease.side_effect = None
+        self._cfg["training_row"] = ("training", "already-running-exec", "[]", "woman")
+        function_app.process_training_job(
+            _QueueMessage({"training_id": "t-1", "user_id": "user-1"}))
+        tt.trigger_training_job.assert_not_called()
+
+
+class PlanAffordabilityTests(unittest.TestCase):
+    """The registration grant MUST cover one job on the default plan.
+
+    This exact invariant was broken in production: the grant was 20 credits while the
+    default plan (Basic) cost 30, so every single registered user was created unable to
+    ever generate anything — a permanent 402, with no billing flow to escape it. Nothing
+    failed loudly; the users table just filled up with dead accounts. This test is the
+    tripwire, so changing a plan's image_count or the grant can never silently do it again.
+    """
+
+    def test_registration_grant_covers_one_job_on_the_default_plan(self):
+        from shared import plans
+        plan = plans.get_plan(plans.DEFAULT_PLAN_KEY)
+        cost = plans.credit_cost(plan, plan.image_count)
+        self.assertLessEqual(
+            cost, plans.REGISTRATION_CREDITS,
+            f"a new user gets {plans.REGISTRATION_CREDITS} credits but one job on the "
+            f"default plan '{plan.key}' costs {cost} — every signup would 402 forever",
+        )
+        self.assertTrue(plans.affordable(plan, plans.REGISTRATION_CREDITS))
+
+    def test_default_plan_exists(self):
+        from shared import plans
+        self.assertIn(plans.DEFAULT_PLAN_KEY, plans.PLANS)
 
 
 if __name__ == "__main__":

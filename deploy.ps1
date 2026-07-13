@@ -1,7 +1,7 @@
 <#
   deploy.ps1 — BetterSnap AI inference deploy (everything EXCEPT triggering a job).
 
-  Canonical image tag: v23 — the last verified-good SDXL + guarded-dispatch image.
+  Canonical image tag: v33 — SDXL txt2img + per-user LoRA generation (Aragon-style), baked ohwx trigger.
   job.yaml and this script are kept in lock-step on this tag; bump -ImageTag here
   AND update job.yaml together, never one alone.
 
@@ -29,10 +29,14 @@ param(
   [string]$JobName       = "bettersnapai-if",
   [string]$Registry      = "bettersnapregistry",
   [string]$ImageRepo     = "bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference",
-  # Canonical tag. v23 = verified-good SDXL + baked weights + guarded dispatch.
+  # Canonical tag. v33 = SDXL txt2img per-user LoRA GENERATION (Aragon/BetterPic
+  # model): gender-driven attire + subject noun, robust age mapping, demographic-
+  # neutral negatives, one job spans ~6 (background,attire) tuples, and the baked
+  # `ohwx {subject}` trigger so each user's identity LoRA fires by default.
   # MUST match the image tag in job.yaml — bump both together or ACA can serve a
-  # stale image. (History: v16 = FLUX; v17 = FLUX->SDXL swap; v23 = current good.)
-  [string]$ImageTag      = "v23",
+  # stale image. (History: v23 = SDXL img2img good; v30 = + identity LoRA;
+  # v31 = + depth-ControlNet; v32 = txt2img rework; v33 = + baked ohwx trigger.)
+  [string]$ImageTag      = "v35",
   # A100 resource alloc, set on every redeploy (see Step 3). These MUST match the
   # Consumption-GPU-NC24-A100 workload profile's fixed alloc AND job.yaml, or a
   # bare `--image`-only update silently drops the job toward the 1Gi OOM default.
@@ -75,7 +79,7 @@ if (-not $SkipMigrations) {
   } else {
     $dbpwd = az keyvault secret show --vault-name $KeyVault --name "Db-Password" --query "value" -o tsv
     if (-not $dbpwd) { Write-Error "Could not read Db-Password from Key Vault $KeyVault"; exit 1 }
-    foreach ($m in @("migrations/001_gpu_dispatch_lease.sql", "migrations/002_jobs_dispatch_idempotency.sql")) {
+    foreach ($m in @("migrations/001_gpu_dispatch_lease.sql", "migrations/002_jobs_dispatch_idempotency.sql", "migrations/003_user_plans.sql")) {
       $path = Join-Path $RepoRoot "Bettersnap-aI_Backend/$m"
       Write-Host "Applying $m ..."
       sqlcmd -S $SqlServer -d $SqlDatabase -U $SqlUser -P $dbpwd -b -i $path

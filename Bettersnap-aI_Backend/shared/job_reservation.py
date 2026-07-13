@@ -17,7 +17,20 @@ class ReserveResult:
 
 
 def reserve_job_slot(user_id, input_blob_path, job_params,
-                     per_user_cap, global_cap, lock_timeout_ms=5000) -> ReserveResult:
+                     per_user_cap, global_cap, lock_timeout_ms=5000,
+                     credit_cost=1, initial_status="queued") -> ReserveResult:
+    """credit_cost = total credits this job consumes = image_count *
+    plan.credits_per_image (resolved by the caller). One-time plans use
+    credits_per_image=1 so credit_cost == number of images. The decrement and the
+    'enough credits' check both use this amount so the counter tracks images, not jobs.
+
+    initial_status: 'queued' (normal — caller enqueues immediately) or 'waiting_lora'
+    (the user has no trained identity LoRA yet). A 'waiting_lora' row is deliberately
+    NOT enqueued: the training watcher flips it to 'queued' and enqueues it the moment
+    the adapter is ready. Credits are still reserved here, so a user cannot submit more
+    work than they paid for while waiting. The reaper only touches 'processing' and
+    'dispatching', so a parked row is never reaped out from under the trainer."""
+    credit_cost = max(1, int(credit_cost))
     conn = new_connection()
     try:
         conn.autocommit = False
@@ -36,7 +49,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
 
         cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
         row = cur.fetchone()
-        if not row or row[0] < 1:
+        if not row or row[0] < credit_cost:
             conn.rollback()
             return ReserveResult(False, reason="credits")
 
@@ -58,13 +71,13 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
         cur.execute("""
             INSERT INTO jobs (user_id, status, input_blob_path, job_params)
             OUTPUT INSERTED.job_id
-            VALUES (?, 'queued', ?, ?)
-        """, user_id, input_blob_path, job_params)
+            VALUES (?, ?, ?, ?)
+        """, user_id, initial_status, input_blob_path, job_params)
         job_id = cur.fetchone()[0]
 
         cur.execute(
-            "UPDATE users SET credits_remaining = credits_remaining - 1 WHERE user_id = ?",
-            user_id,
+            "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
+            credit_cost, user_id,
         )
         conn.commit()   # releases the app lock
         return ReserveResult(True, job_id=job_id)

@@ -35,7 +35,7 @@ properties:
   template:
     containers:
       - name: bettersnapai-if
-        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v23
+        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v35
         resources:
           cpu: 24
           memory: 220Gi
