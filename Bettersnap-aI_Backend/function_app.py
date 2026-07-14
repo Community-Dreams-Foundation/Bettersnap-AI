@@ -474,7 +474,7 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    from shared.crops import crop_head_and_shoulders, NoFaceError
+    from shared.crops import crop_head_and_shoulders, NoFaceError, MultipleFacesError
     from shared.queue_client import enqueue_training_job
 
     try:
@@ -584,10 +584,13 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
             crops.append(crop_head_and_shoulders(download_blob("inputs", blob_name)))
         except NoFaceError:
             rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
-                             "reason": "no face detected"})
+                             "code": "FACE_NOT_FOUND", "reason": "no face detected"})
+        except MultipleFacesError:
+            rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
+                             "code": "MULTIPLE_FACES", "reason": "more than one face"})
         except ValueError as e:
             rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
-                             "reason": str(e)})
+                             "code": "NOT_AN_IMAGE", "reason": str(e)})
 
     if rejected:
         names = ", ".join(str(r["index"]) for r in rejected)

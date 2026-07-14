@@ -22,6 +22,7 @@ bad adapter the user sees. /train rejects the upload in milliseconds instead. Th
 crop remains available as `center_square_crop` for callers that explicitly want it.
 """
 import io
+import math
 import os
 
 import cv2
@@ -35,29 +36,119 @@ DEFAULT_FACE_FRAC = 0.32
 # Space above the face, in face-heights, for hair.
 DEFAULT_HEADROOM = 0.8
 
-# Bundled Haar frontal-face cascade (Apache-2.0, ships inside opencv — no download,
-# no extra weights). Commercial-safe — do NOT swap to a non-commercial face detector.
-_CASCADE = cv2.CascadeClassifier(
-    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-)
+# Bundled Haar cascades (Apache-2.0, ship inside opencv — no download, no extra
+# weights). Commercial-safe — do NOT swap to a non-commercial face detector.
+#
+# WHY MULTIPLE CASCADES + ROTATION
+# --------------------------------
+# The single frontal `default` cascade is blind to head ROLL (a leaning head, a
+# hand-on-cheek pose) and to three-quarter turns, and rejected clearly-visible faces
+# in those poses. We now try, in order: two frontal cascades upright, then the frontal
+# cascades on a few rotated copies (mapping the box back to original coords), then the
+# profile cascade and its mirror. A photo is only rejected once ALL of those fail — so
+# a genuinely faceless photo is still caught, but a real face at an odd angle passes.
+_HAAR = cv2.data.haarcascades
+_FRONTAL = [
+    cv2.CascadeClassifier(os.path.join(_HAAR, "haarcascade_frontalface_default.xml")),
+    cv2.CascadeClassifier(os.path.join(_HAAR, "haarcascade_frontalface_alt2.xml")),
+]
+_PROFILE = cv2.CascadeClassifier(os.path.join(_HAAR, "haarcascade_profileface.xml"))
+
+# Degrees to straighten the image by when an upright pass finds nothing. Covers the
+# head-roll range of a typical "leaning" headshot. Only reached for photos the fast
+# upright pass fails, so the common (frontal) case pays nothing for this.
+_ROTATIONS = (12, -12, 25, -25)
 
 
 class NoFaceError(Exception):
     """No face could be detected. The caller must reject the photo, never guess."""
 
 
-def detect_largest_face(bgr):
-    """(x, y, w, h) of the largest detected face, or None. The subject is almost
-    always the largest/closest face."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    faces = _CASCADE.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5,
+class MultipleFacesError(Exception):
+    """More than one distinct face — a group/couple photo. Training needs solo shots,
+    or the adapter blends two identities into one face."""
+
+
+def _detect(gray, cascade):
+    return cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=4,
         minSize=(max(40, gray.shape[0] // 20), max(40, gray.shape[1] // 20)),
     )
+
+
+def _detect_frontal(gray):
+    """Boxes from the first frontal cascade that finds anything ([] if none do)."""
+    for cascade in _FRONTAL:
+        faces = _detect(gray, cascade)
+        if len(faces):
+            return faces
+    return []
+
+
+def _largest(faces):
     if len(faces) == 0:
         return None
-    return max(faces, key=lambda f: f[2] * f[3])
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+    return (int(x), int(y), int(w), int(h))
+
+
+def _map_box(box, mat):
+    """Apply 2x3 affine `mat` to a box's centre, keeping its w/h. Used to carry a face
+    box found in a rotated frame back into the original image's coordinates."""
+    x, y, bw, bh = box
+    cx, cy = x + bw / 2.0, y + bh / 2.0
+    nx = mat[0, 0] * cx + mat[0, 1] * cy + mat[0, 2]
+    ny = mat[1, 0] * cx + mat[1, 1] * cy + mat[1, 2]
+    return (int(round(nx - bw / 2.0)), int(round(ny - bh / 2.0)), int(bw), int(bh))
+
+
+def detect_largest_face(bgr):
+    """(x, y, w, h) of the largest detected face in ORIGINAL image coords, or None.
+    The subject is almost always the largest/closest face. Tolerant of head roll and
+    three-quarter turns (see cascade notes above)."""
+    gray = cv2.equalizeHist(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+    h, w = gray.shape[:2]
+
+    # 1) Upright frontal — the fast, overwhelmingly common case.
+    box = _largest(_detect_frontal(gray))
+    if box is not None:
+        return box
+
+    # 2) Rotated retries — straighten head roll, detect, map the box back to original.
+    center = (w / 2.0, h / 2.0)
+    for angle in _ROTATIONS:
+        mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rot = cv2.warpAffine(gray, mat, (w, h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+        box = _largest(_detect_frontal(rot))
+        if box is not None:
+            return _map_box(box, cv2.invertAffineTransform(mat))
+
+    # 3) Profile, then its horizontal mirror — three-quarter turns either way.
+    box = _largest(_detect(gray, _PROFILE))
+    if box is not None:
+        return box
+    box = _largest(_detect(cv2.flip(gray, 1), _PROFILE))
+    if box is not None:
+        x, y, bw, bh = box
+        return (w - x - bw, y, bw, bh)   # un-mirror the x coordinate
+
+    return None
+
+
+def count_faces(bgr):
+    """Number of distinct, significant upright faces — for the group-photo check.
+    Deliberately upright-frontal only (no rotation/profile passes) and area-filtered:
+    the Haar cascade emits spurious small boxes, so counting everything would
+    over-reject a valid solo photo. A box counts only if it is at least 45% of the
+    largest box's area."""
+    gray = cv2.equalizeHist(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+    faces = _detect_frontal(gray)
+    if len(faces) <= 1:
+        return len(faces)
+    areas = [int(w) * int(h) for (_, _, w, h) in faces]
+    biggest = max(areas)
+    return sum(1 for a in areas if a >= 0.45 * biggest)
 
 
 def head_and_shoulders_box(face, img_w, img_h,
@@ -97,6 +188,8 @@ def crop_head_and_shoulders(image_bytes: bytes, size: int = DEFAULT_SIZE,
 
     bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
+    if count_faces(bgr) > 1:
+        raise MultipleFacesError("more than one face detected")
     face = detect_largest_face(bgr)
     if face is None:
         raise NoFaceError("no face detected")
