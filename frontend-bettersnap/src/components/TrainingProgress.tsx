@@ -106,8 +106,8 @@ export default function TrainingProgress({ onReady, onFailed }: Props) {
       <div>
         <h3 className="text-lg font-semibold">Building your personal model</h3>
         <p className="mt-1 text-sm text-muted-foreground">
-          This takes about {ESTIMATED_MINUTES} minutes. You can close this page — we'll keep
-          going, and any photos you've requested will start automatically when it's done.
+          This takes about {ESTIMATED_MINUTES} minutes. You can close this page — we'll keep going, and any photos
+          you've requested will start automatically when it's done.
         </p>
       </div>
 
@@ -118,11 +118,7 @@ export default function TrainingProgress({ onReady, onFailed }: Props) {
         </p>
       </div>
 
-      {pollError && (
-        <p className="text-xs text-muted-foreground">
-          Reconnecting… ({pollError})
-        </p>
-      )}
+      {pollError && <p className="text-xs text-muted-foreground">Reconnecting… ({pollError})</p>}
     </div>
   );
 }

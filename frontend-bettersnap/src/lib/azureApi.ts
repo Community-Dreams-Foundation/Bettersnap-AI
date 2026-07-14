@@ -56,17 +56,90 @@ export async function getUserCredits(): Promise<{ credits_remaining: number }> {
   return res.json();
 }
 
+/** Server-side terms acceptance (compliance record). GET reads terms_accepted_at;
+ *  POST records it. Replaces the old localStorage-only persistence. */
+export async function getTermsStatus(): Promise<{ terms_accepted_at: string | null }> {
+  const headers = await authHeaders();
+  const res = await fetch(`${BASE_URL}/users/terms-status`, { method: "GET", headers });
+  if (!res.ok) throw new Error(`terms-status failed: ${res.status}`);
+  return res.json();
+}
+
+export async function acceptTerms(acceptedAt: string): Promise<void> {
+  const headers = await authHeaders();
+  const res = await fetch(`${BASE_URL}/users/accept-terms`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ accepted_at: acceptedAt }),
+  });
+  if (!res.ok) throw new Error(`accept-terms failed: ${res.status}`);
+}
+
+// ── Subscriptions / Stripe checkout ──────────────────────────────────────────
+export type PaymentType = "one_time" | "monthly";
+export interface OneTimePlanInfo {
+  plan: string;
+  credits: number;
+  images: number;
+  original_cents: number;
+  discounted_cents: number;
+}
+export interface MonthlyPlanInfo {
+  plan: string;
+  credits: number;
+  images: number;
+  price_cents: number;
+}
+
+export async function getSubscriptionPlans(): Promise<{ one_time: OneTimePlanInfo[]; monthly: MonthlyPlanInfo[] }> {
+  const res = await fetch(`${BASE_URL}/subscriptions/plans`, { method: "GET" });
+  if (!res.ok) throw new Error(`subscription plans failed: ${res.status}`);
+  return res.json();
+}
+
+export async function getSubscriptionStatus(): Promise<{
+  subscription_plan: string | null;
+  subscription_type: string | null;
+  credits_remaining: number;
+}> {
+  const headers = await authHeaders();
+  const res = await fetch(`${BASE_URL}/subscriptions/status`, { method: "GET", headers });
+  if (!res.ok) throw new Error(`subscription status failed: ${res.status}`);
+  return res.json();
+}
+
+/** Create a Stripe Checkout session and return its URL to redirect the browser to. */
+export async function createCheckout(plan: string, type: PaymentType): Promise<{ checkout_url: string }> {
+  const headers = await authHeaders();
+  const origin = window.location.origin;
+  const res = await fetch(`${BASE_URL}/subscriptions/create`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      plan,
+      type,
+      success_url: `${origin}/billing?checkout=success`,
+      cancel_url: `${origin}/billing?checkout=cancel`,
+    }),
+  });
+  if (!res.ok) {
+    let msg = `Checkout failed: ${res.status}`;
+    try {
+      const e = await res.json();
+      if (e?.error) msg = e.error;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 // "waiting_lora" = the job was ACCEPTED and its credits reserved, but the user's identity
 // model is still training. The backend deliberately does NOT enqueue it; the training
 // watcher releases it the instant the model is ready. It is a normal, healthy state — not
 // an error — and the UI must not treat it as "stuck".
-export type JobStatus =
-  | "waiting_lora"
-  | "queued"
-  | "dispatching"
-  | "processing"
-  | "completed"
-  | "failed";
+export type JobStatus = "waiting_lora" | "queued" | "dispatching" | "processing" | "completed" | "failed";
 
 export interface AzureJob {
   job_id: string;
@@ -110,6 +183,9 @@ export interface StartTrainingResult {
 export interface RejectedPhoto {
   photo: string;
   index: number;
+  /** Machine-readable reason code from the backend face gate:
+   *  "FACE_NOT_FOUND" | "MULTIPLE_FACES" | "NOT_AN_IMAGE". Optional for back-compat. */
+  code?: string;
   reason: string;
 }
 
@@ -130,20 +206,28 @@ export class TrainingRejectedError extends Error {
  * Throws TrainingRejectedError when a photo fails the face gate, so the caller can point
  * at the specific photo instead of showing a generic failure.
  */
+/**
+ * Kick off this user's identity-LoRA training. The client sends gender AND the explicit
+ * list of blob_names returned by /upload for THIS session — never an empty array, and
+ * never letting the server auto-list the folder (which would risk training on stale
+ * photos from a previous upload).
+ *
+ * Throws TrainingRejectedError when a photo fails the face gate, so the caller can point
+ * at the specific photo instead of showing a generic failure.
+ */
 export async function startTraining(
   gender: string,
   photos: string[],
   force = false,
 ): Promise<StartTrainingResult> {
+  if (!Array.isArray(photos) || photos.length === 0) {
+    throw new Error("Cannot start training without an explicit photos list");
+  }
   const headers = await authHeaders();
-  // `photos` = the blob_names just returned by /upload, i.e. THIS session's set.
-  // Without it the server falls back to listing the whole folder — and since /upload only
-  // ever appends, that folder can still hold a previous upload. Training would then blend
-  // two different photo sets (in the worst case, two different people) into one model.
   const res = await fetch(`${BASE_URL}/train`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ gender, force, photos }),
+    body: JSON.stringify({ gender, photos, force }),
   });
   if (!res.ok) {
     let body: any = {};
@@ -191,13 +275,9 @@ export async function getUserJobs(): Promise<AzureJob[]> {
   const headers = await authHeaders();
   const res = await fetch(`${BASE_URL}/users/jobs`, { method: "GET", headers });
   if (!res.ok) throw new Error(`Jobs fetch failed: ${res.status}`);
-  // The API returns { jobs: [...] }, not a bare array. This used to `return res.json()`
-  // while claiming to return AzureJob[], so callers got an OBJECT and every
-  // `jobs.filter(...)` threw "filter is not a function". Dashboard and History caught it
-  // and logged to console, so both pages just silently rendered empty — they have never
-  // actually shown a job.
+  // Backend returns { jobs: [...] }. Fall back to a bare array for safety.
   const data = await res.json();
-  return (Array.isArray(data) ? data : (data?.jobs ?? [])) as AzureJob[];
+  return (data?.jobs ?? (Array.isArray(data) ? data : [])) as AzureJob[];
 }
 
 export async function deleteJob(jobId: string): Promise<void> {
@@ -239,7 +319,7 @@ export async function uploadPhoto(file: File): Promise<{ url: string; blob_name:
 // drift from server-side validation. Fetch these once and cache in the page.
 export interface CatalogOption {
   id: string;
-  ref: string;   // category-qualified "category.option" — send THIS in attire_ids/background_ids
+  ref: string; // category-qualified "category.option" — send THIS in attire_ids/background_ids
   label: string;
 }
 export interface CatalogCategory {

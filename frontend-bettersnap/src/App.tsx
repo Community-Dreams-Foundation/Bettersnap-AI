@@ -1,5 +1,6 @@
+import { useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
+import { BrowserRouter, Route, Routes, Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import type { IPublicClientApplication } from "@azure/msal-browser";
 import { InteractionStatus } from "@azure/msal-browser";
@@ -18,7 +19,8 @@ import Signup from "./pages/Signup";
 import UniversitySignup from "./pages/UniversitySignup";
 import Onboarding from "./pages/Onboarding";
 import Dashboard from "./pages/Dashboard";
-import HeadshotGenerator from "./pages/HeadshotGenerator";
+// ProfileOptimizer + HeadshotGenerator removed — the redesigned 5-step Generate flow
+// lives in Onboarding.tsx and is served at BOTH /generate and /onboarding.
 import History from "./pages/History";
 import Settings from "./pages/Settings";
 import Billing from "./pages/Billing";
@@ -29,8 +31,33 @@ import UseCasePage from "./pages/UseCasePage";
 import ForCompanies from "./pages/ForCompanies";
 import OrgOnboarding from "./pages/OrgOnboarding";
 import NotFound from "./pages/NotFound";
+import { hasPlanIntent } from "@/lib/planIntent";
 
 const queryClient = new QueryClient();
+
+// After MSAL finishes login and drops the user back into the app, if they had
+// picked a plan on the landing page, take them to /billing instead of the
+// public landing/login pages. Runs once per authentication transition.
+const PlanIntentRedirector = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const isAuthenticated = useIsAuthenticated();
+  const { inProgress } = useMsal();
+
+  useEffect(() => {
+    if (inProgress !== InteractionStatus.None) return;
+    if (!isAuthenticated) return;
+    if (!hasPlanIntent()) return;
+    const p = location.pathname;
+    // Only intercept the entry surfaces — never yank the user off Billing,
+    // Onboarding, Dashboard, etc.
+    if (p === "/" || p === "/login" || p === "/signup" || p === "/university-login" || p === "/university-signup") {
+      navigate("/billing", { replace: true });
+    }
+  }, [isAuthenticated, inProgress, location.pathname, navigate]);
+
+  return null;
+};
 
 const AppContent = ({ msalInstance: _msalInstance }: { msalInstance: IPublicClientApplication }) => {
   const { inProgress } = useMsal();
@@ -49,8 +76,10 @@ const AppContent = ({ msalInstance: _msalInstance }: { msalInstance: IPublicClie
   }
 
   return (
-    <Routes>
-      <Route path="/" element={<Index />} />
+    <>
+      <PlanIntentRedirector />
+      <Routes>
+        <Route path="/" element={<Index />} />
       <Route path="/login" element={<Login />} />
       <Route path="/university-login" element={<UniversityLogin />} />
       <Route path="/signup" element={<Signup />} />
@@ -75,7 +104,7 @@ const AppContent = ({ msalInstance: _msalInstance }: { msalInstance: IPublicClie
         path="/generate"
         element={
           <ProtectedRoute>
-            <HeadshotGenerator />
+            <Onboarding />
           </ProtectedRoute>
         }
       />
@@ -110,7 +139,8 @@ const AppContent = ({ msalInstance: _msalInstance }: { msalInstance: IPublicClie
       <Route path="/for-companies" element={<ForCompanies />} />
       <Route path="/org/onboarding" element={<OrgOnboarding />} />
       <Route path="*" element={<NotFound />} />
-    </Routes>
+      </Routes>
+    </>
   );
 };
 

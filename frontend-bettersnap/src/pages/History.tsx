@@ -35,6 +35,7 @@ import {
   ChevronLeft,
   Trash2,
   Check,
+  AlertCircle,
 } from "lucide-react";
 import { downloadImage } from "@/lib/download";
 import { motion, AnimatePresence } from "framer-motion";
@@ -86,6 +87,7 @@ const History = () => {
   const [jobs, setJobs] = useState<HeadshotJob[]>([]);
   const [brokenIds, setBrokenIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
   const [filter, setFilter] = useState<string>("all");
   const [openSession, setOpenSession] = useState<Session | null>(null);
@@ -106,6 +108,8 @@ const History = () => {
       setLoggedIn(true);
 
       try {
+        setLoadError(null);
+        // getUserJobs() unwraps { jobs: [...] } from GET /users/jobs.
         const jobs = await getUserJobs();
 
         // Each job IS a session — fetch its output URLs and flatten into
@@ -138,8 +142,9 @@ const History = () => {
           .sort((a, b) => b.created_at.localeCompare(a.created_at));
 
         setJobs(flattened);
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to load history:", err);
+        setLoadError(err?.message ?? "Could not load your history. Please try again.");
       } finally {
         setLoading(false);
       }
@@ -301,6 +306,19 @@ const History = () => {
         {!loading && loggedIn === false && (
           <div className="text-center py-16 glass rounded-2xl shadow-glass">
             <p className="text-muted-foreground">Please log in to view your history.</p>
+          </div>
+        )}
+
+        {!loading && loggedIn && loadError && (
+          <div
+            role="alert"
+            className="mb-6 flex items-start gap-2 rounded-xl border border-destructive/40 bg-destructive/5 p-4"
+          >
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+            <div>
+              <p className="text-sm font-medium text-destructive">Couldn't load your history</p>
+              <p className="text-xs text-destructive/80 mt-1">{loadError}</p>
+            </div>
           </div>
         )}
 

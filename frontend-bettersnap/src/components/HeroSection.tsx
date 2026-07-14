@@ -22,8 +22,8 @@ const HeroSection = () => {
   const onPointerUp = () => setIsDragging(false);
 
   return (
-    <section className="relative min-h-screen flex items-center pt-16 overflow-hidden" role="banner">
-      <div className="container relative z-10 mx-auto px-4 py-16 lg:py-20">
+    <section className="relative flex pt-12 pb-16 overflow-hidden" role="banner">
+      <div className="container relative z-10 mx-auto px-4 py-4 lg:py-8">
         <div className="grid lg:grid-cols-2 gap-12 lg:gap-16 items-center">
           {/* Left column */}
           <motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>

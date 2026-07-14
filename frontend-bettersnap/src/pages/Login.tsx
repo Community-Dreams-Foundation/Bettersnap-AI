@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Camera, Loader2, ArrowRight, ArrowLeft } from "lucide-react";
 import { GoogleLogo } from "@/components/GoogleLogo";
 import { toast } from "sonner";
+import { hasPlanIntent } from "@/lib/planIntent";
 
 const Login = () => {
   const [email, setEmail] = useState("");
@@ -21,7 +22,10 @@ const Login = () => {
   const isAuthenticated = useIsAuthenticated();
 
   if (inProgress === InteractionStatus.None && isAuthenticated) {
-    return <Navigate to="/dashboard" replace />;
+    // If a plan was picked on the landing page, take the user straight to
+    // Billing so they can complete that selection instead of dropping them on
+    // the dashboard.
+    return <Navigate to={hasPlanIntent() ? "/billing" : "/dashboard"} replace />;
   }
 
   const fromOrgOnboarding = (location.state as any)?.fromOrgOnboarding === true;

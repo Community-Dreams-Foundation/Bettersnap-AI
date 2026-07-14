@@ -78,7 +78,7 @@ const Navbar = () => {
         setActiveSection("");
         return;
       }
-      const cutoff = y + 80;
+      const cutoff = y + 120;
       let currentId = "";
       let currentTop = -Infinity;
       ids.forEach((id) => {
@@ -177,6 +177,7 @@ const Navbar = () => {
                       type="button"
                       onClick={() => {
                         setUseCasesOpen(false);
+                        setActiveSection("use-cases");
                         goToLandingSection("use-cases");
                       }}
                       aria-haspopup="menu"
@@ -246,7 +247,10 @@ const Navbar = () => {
                 <button
                   key={link.href}
                   type="button"
-                  onClick={() => goToLandingSection(sectionId)}
+                  onClick={() => {
+                    setActiveSection(sectionId);
+                    goToLandingSection(sectionId);
+                  }}
                   className={`text-sm font-medium px-3 py-2 rounded-lg transition-colors ${
                     isActive ? "text-white bg-white/10" : "text-white/70 hover:text-white hover:bg-white/5"
                   }`}
@@ -365,6 +369,7 @@ const Navbar = () => {
                         onClick={() => {
                           setMobileOpen(false);
                           setMobileUseCasesOpen(false);
+                          setActiveSection("use-cases");
                           goToLandingSection("use-cases");
                         }}
                         className="flex-1 text-left text-sm font-medium py-2.5 text-white/70 hover:text-white transition-colors"
@@ -421,6 +426,7 @@ const Navbar = () => {
                   type="button"
                   onClick={() => {
                     setMobileOpen(false);
+                    setActiveSection(sectionId);
                     goToLandingSection(sectionId);
                   }}
                   className="block w-full text-left text-sm font-medium py-2.5 text-white/70 hover:text-white transition-colors"

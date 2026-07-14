@@ -4,7 +4,6 @@ import Navbar from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/contexts/AuthContext";
 import { authHeaders } from "@/lib/azureApi";
 import { useMsal } from "@azure/msal-react";
@@ -16,12 +15,7 @@ const Settings = () => {
   const { instance } = useMsal();
   const [profile, setProfile] = useState<{ full_name?: string; [key: string]: any }>({});
   const [savingName, setSavingName] = useState(false);
-
   const [resettingPassword, setResettingPassword] = useState(false);
-
-
-  const [emailUpdates, setEmailUpdates] = useState(true);
-  const [productAnnouncements, setProductAnnouncements] = useState(false);
 
   const fetchProfile = async () => {
     try {
@@ -129,28 +123,6 @@ const Settings = () => {
             >
               {resettingPassword ? "Redirecting..." : "Reset password"}
             </Button>
-          </section>
-
-
-          {/* Notification Preferences */}
-          <section className="glass rounded-2xl p-6 shadow-glass border border-border bg-card">
-            <h2 className="text-xl font-semibold text-foreground mb-4">Notification Preferences</h2>
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-foreground font-medium">Email updates</p>
-                  <p className="text-sm text-muted-foreground">Account activity and important changes</p>
-                </div>
-                <Switch checked={emailUpdates} onCheckedChange={setEmailUpdates} />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-foreground font-medium">Product announcements</p>
-                  <p className="text-sm text-muted-foreground">New features and tips from BetterSnap AI</p>
-                </div>
-                <Switch checked={productAnnouncements} onCheckedChange={setProductAnnouncements} />
-              </div>
-            </div>
           </section>
 
           {/* Delete Account */}
