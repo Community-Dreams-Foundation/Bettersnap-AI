@@ -36,6 +36,10 @@ MAX_TRAINING_PHOTOS = int(os.environ.get("MAX_TRAINING_PHOTOS", "12"))
 TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
 # Where cropped training images live, under the user's own prefix in `inputs`.
 CROP_SUBDIR = "input/crop_upperbody"
+# Data retention: N days after the clock starts, the user's BLOBS (photos, LoRA,
+# results) are deleted; DB rows are KEPT for analytics. One-time plans start the clock
+# on each generation (last-gen + N); monthly plans on subscription end (period-end + N).
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "3"))
 
 
 def _gpu_dispatch_enabled() -> bool:
@@ -847,6 +851,22 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     job_id = result.job_id
+
+    # One-time plans: (re)start the retention clock at each generation (last-gen + N days).
+    # Monthly plans keep retention_expires_at NULL until the subscription ends. Best-effort
+    # — a miss here just means the hourly cleanup won't pick this user up yet.
+    if plan.plan_type == "one_time":
+        try:
+            rconn = new_connection()
+            try:
+                rconn.cursor().execute(
+                    "UPDATE users SET retention_expires_at = DATEADD(DAY, ?, GETUTCDATE()) "
+                    "WHERE user_id = ?", RETENTION_DAYS, user_id)
+                rconn.commit()
+            finally:
+                rconn.close()
+        except Exception as e:
+            logging.warning(f"retention window not set for user={user_id}: {e}")
 
     if parked:
         logging.info(
@@ -2141,7 +2161,8 @@ def _handle_monthly_checkout(session: dict):
                 stripe_subscription_id  = ?,
                 credits_remaining       = ?,
                 credits_monthly_limit   = ?,
-                subscription_renewed_at = GETUTCDATE()
+                subscription_renewed_at = GETUTCDATE(),
+                retention_expires_at    = NULL
             WHERE user_id = ?""",
             plan, customer, sub_id, credits, credits, user_id,
         )
@@ -2178,19 +2199,84 @@ def _handle_subscription_ended(sub: dict):
         conn = new_connection()
         try:
             cur = conn.cursor()
+            # Subscription is truly over (period-end) → the user keeps their data for
+            # RETENTION_DAYS more, then the hourly cleanup deletes the blobs.
             cur.execute(
                 """UPDATE users SET
                     subscription_plan      = 'free',
                     subscription_type      = NULL,
                     stripe_subscription_id = NULL,
-                    credits_monthly_limit  = 20
+                    credits_monthly_limit  = 20,
+                    retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())
                 WHERE stripe_subscription_id = ?""",
-                sub_id,
+                RETENTION_DAYS, sub_id,
             )
             conn.commit()
-            logging.info(f"Subscription {sub_id} ended → reverted to free")
+            logging.info(f"Subscription {sub_id} ended → free; retention starts (+{RETENTION_DAYS}d)")
         finally:
             conn.close()
+
+
+# ── Data retention cleanup ────────────────────────────────
+def _delete_blobs(container_name: str, prefix: str) -> int:
+    """Delete every blob under `prefix` in `container_name`. Best-effort; returns count."""
+    n = 0
+    try:
+        container = get_blob_client().get_container_client(container_name)
+        for b in container.list_blobs(name_starts_with=prefix):
+            container.delete_blob(b.name)
+            n += 1
+    except Exception as e:
+        logging.warning(f"retention: blob cleanup failed for {container_name}/{prefix}: {e}")
+    return n
+
+
+@app.timer_trigger(schedule="0 0 * * * *", arg_name="timer", run_on_startup=False)
+def retention_cleanup(timer: func.TimerRequest) -> None:
+    """Hourly: for users past their retention window, delete BLOBS (photos, LoRA,
+    generated results) but KEEP the DB rows (users/jobs/lora_trainings) for analytics.
+    lora_status is reset and the user's jobs are marked expired so History can show
+    'expired' instead of loading a deleted image. The window is set per plan elsewhere:
+    one-time on each generation, monthly on subscription end (see RETENTION_DAYS)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id FROM users "
+        "WHERE retention_expires_at IS NOT NULL AND retention_expires_at < GETUTCDATE()"
+    )
+    due = [str(r[0]) for r in cur.fetchall()]
+    if not due:
+        return
+    logging.info(f"retention_cleanup: {len(due)} user(s) due")
+
+    for user_id in due:
+        # Photos (raw + crops) and the trained adapter (+ backups) live under the user's
+        # own prefix; results are per-job in the 'outputs' container, so look those up.
+        n_photos = _delete_blobs("inputs", f"{user_id}/")
+        n_lora = _delete_blobs("lora-weights", f"identity/{user_id}/")
+        cur.execute("SELECT job_id FROM jobs WHERE user_id = ?", user_id)
+        job_ids = [str(r[0]) for r in cur.fetchall()]
+        n_results = 0
+        for jid in job_ids:
+            n_results += _delete_blobs("outputs", f"results/{jid}/")
+            _delete_blobs("outputs", f"debug/{jid}.txt")
+
+        # Keep the rows: reset the user, mark jobs expired, clear the window — one txn so a
+        # crash can't leave the window set (which would re-delete every hour) or half-done.
+        conn2 = new_connection()
+        try:
+            conn2.autocommit = False
+            cur2 = conn2.cursor()
+            cur2.execute("UPDATE jobs SET expired = 1 WHERE user_id = ?", user_id)
+            cur2.execute(
+                "UPDATE users SET lora_status = 'none', retention_expires_at = NULL "
+                "WHERE user_id = ?", user_id)
+            conn2.commit()
+        finally:
+            conn2.close()
+        logging.info(
+            f"retention_cleanup: user={user_id} deleted photos={n_photos} lora={n_lora} "
+            f"results={n_results} jobs_expired={len(job_ids)}")
 
 
 # ── Monthly safety-net credit refill ─────────────────────
