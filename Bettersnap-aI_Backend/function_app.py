@@ -56,7 +56,7 @@ from shared.blob import upload_blob, download_blob, get_blob_client
 from shared.keyvault import get_secret
 from shared.plans import (
     get_plan, credit_cost, public_plans, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY,
-    FREE_RETRAINS, RETRAIN_CREDITS, MAX_TRAININGS_PER_DAY,
+    FREE_RETRAINS, RETRAIN_CREDITS, MAX_TRAININGS_PER_DAY, plan_key_for,
 )
 from shared import catalog
 from shared.stripe_client import (
@@ -2129,9 +2129,10 @@ def _handle_onetime_payment(session: dict):
             """UPDATE users SET
                 subscription_plan = ?,
                 subscription_type = 'one_time',
+                plan_name         = ?,
                 credits_remaining = credits_remaining + ?
             WHERE user_id = ?""",
-            plan, credits, user_id,
+            plan, plan_key_for(plan, "one_time"), credits, user_id,
         )
         conn.commit()
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
@@ -2157,6 +2158,7 @@ def _handle_monthly_checkout(session: dict):
             """UPDATE users SET
                 subscription_plan       = ?,
                 subscription_type       = 'monthly',
+                plan_name               = ?,
                 stripe_customer_id      = ?,
                 stripe_subscription_id  = ?,
                 credits_remaining       = ?,
@@ -2164,7 +2166,7 @@ def _handle_monthly_checkout(session: dict):
                 subscription_renewed_at = GETUTCDATE(),
                 retention_expires_at    = NULL
             WHERE user_id = ?""",
-            plan, customer, sub_id, credits, credits, user_id,
+            plan, plan_key_for(plan, "monthly"), customer, sub_id, credits, credits, user_id,
         )
         conn.commit()
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
@@ -2205,6 +2207,7 @@ def _handle_subscription_ended(sub: dict):
                 """UPDATE users SET
                     subscription_plan      = 'free',
                     subscription_type      = NULL,
+                    plan_name              = 'trial',
                     stripe_subscription_id = NULL,
                     credits_monthly_limit  = 20,
                     retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())

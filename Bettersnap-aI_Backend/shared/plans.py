@@ -1,23 +1,27 @@
 """Single source of truth for BetterSnap plans.
 
-EVERY plan number lives here so a price/quota/limit tweak is a one-line edit
-(e.g. Basic 30 -> 35 images, or $35 -> $30). Nothing else in the codebase should
-hardcode a plan quota or a per-plan limit — import from here.
+EVERY plan number lives here so a price/quota/limit tweak is a one-line edit. Nothing
+else in the codebase should hardcode a plan quota or a per-plan limit — import from here.
 
-Model (see milestone1-spec):
-  • One-time plans (Basic/Pro/Expert): buy once, get image_count images. Internally
-    a "credit" == one image (credits_per_image = 1), so credits_remaining counts
-    down per generated image exactly like the monthly model will.
-  • Monthly (structure wired, not fully enabled): credit-based, credits_per_image ~4-5,
-    so ~20 images from a larger credit grant; LoRA trained once and reused all month.
+Model (reconciled with Stripe, 2026-07):
+  • Credit model: 5 credits == 1 image (credits_per_image = 5), matching Stripe's
+    "1 job = 20 credits = 4 images". So a plan's credit grant == image_count * 5.
+  • One-time (Basic/Pro/Expert): buy once, get image_count images (20 / 40 / 60).
+  • Monthly (Basic/Pro/Expert): same image quota per month; the LoRA is trained once and
+    reused all month, and the user generates until their monthly credits run out.
+  • Trial: free, the default at signup.
+
+Plan KEYS are distinct per (tier, billing type) because Stripe prices them differently
+(Basic one-time $10 vs Basic monthly $25/mo). The Stripe handlers set users.plan_name to
+one of these keys via plan_key_for(); submit resolves the user's plan from plan_name.
 
 Selection limits per plan:
-  • max_attires / max_backgrounds — how many attire/background options a user may
-    pick in one generation.
-  • category_rule:
-      "single_type" — all selections must come from ONE type (professional OR
-                      personal); user cannot mix. (Basic)
-      "mixable"     — selections may span professional AND personal. (Pro/Expert)
+  • max_attires / max_backgrounds — how many options a user may pick per generation.
+  • category_rule: "single_type" (all picks from ONE of professional|personal) or
+    "mixable" (may span both).
+
+  ⚠️ NEEDS-DECISION (carried from the old config, not from Stripe): the per-tier
+  attire/background limits and category_rule below are placeholders — confirm them.
 
 Enforcement lives in function_app.submit_job; this module is pure data + helpers.
 """
@@ -29,76 +33,87 @@ class Plan:
     key: str                 # stable id stored on users.plan_name
     name: str                # display name
     price_usd: int
-    image_count: int         # images generated per one-time purchase / per session baseline
+    image_count: int         # images per one-time purchase / per monthly session baseline
     max_attires: int
     max_backgrounds: int
     category_rule: str       # "single_type" | "mixable"
     plan_type: str           # "one_time" | "monthly"
-    credits_per_image: int   # internal counter cost per generated image
-    # Monthly-only extras (ignored for one_time). min_session_images bounds how few
-    # images a single monthly session may request; monthly_images is the ~quota/month.
+    credits_per_image: int   # internal counter cost per generated image (5, Stripe-aligned)
     min_session_images: int = 1
     monthly_images: int = 0
 
 
-# Credits granted at registration (/users/register). This MUST cover at least one
-# generation on the DEFAULT plan, or every new user is created unable to generate
-# anything: the grant used to be 20 while the default plan (Basic) cost 30, so every
-# single signup hit "402 Insufficient credits" on their first job, permanently, with no
-# billing flow to top up. The trial plan below is what the grant is sized against.
+# Credits granted at registration. 5 credits/image → 20 credits == 4 free trial images
+# (one free "job"). MUST cover one generation on the DEFAULT (trial) plan, or every new
+# user is created unable to generate — see the `affordable` guard test.
 REGISTRATION_CREDITS = 20
 
 # ── Retraining ───────────────────────────────────────────────────────────────
-# The first retrain is FREE (it covers the legitimate "my photos were bad" / "it doesn't
-# look like me" case). Every one after costs credits.
-#
-# This is a FLAT cost, deliberately not scaled by plan: a retrain is ~32 minutes of A100
-# whatever plan you are on, and with MAX_ACTIVE_GPU_JOBS=1 it also blocks the queue for
-# every other user for that whole time. It is the single most expensive action a user can
-# take, so it is metered rather than plan-priced.
+# First retrain FREE; each after costs credits. Flat (not plan-scaled): a retrain is
+# ~32 min of A100 and, with MAX_ACTIVE_GPU_JOBS=1, blocks the queue for everyone.
 FREE_RETRAINS = 1
-RETRAIN_CREDITS = 10          # == one trial session
-# Backstop so a well-funded account still cannot monopolise the single GPU.
+RETRAIN_CREDITS = 50          # == 10 images at 5 credits/image
 MAX_TRAININGS_PER_DAY = 3
 
 
-# ── The plans. Tweak numbers freely; structure is final. ──────────────────────
+# ── The plans. Numbers below match the Stripe products/prices. ────────────────
 PLANS = {
-    # The DEFAULT for every new signup. Free, no billing, and deliberately cheap enough
-    # that REGISTRATION_CREDITS buys a real session (10 images = 10 credits, so the 20
-    # granted covers two). Paid plans are entered by purchase, which grants credits.
-    # Limits mirror Basic (single_type) so the trial teaches the real product's rules.
+    # DEFAULT for every new signup. Free; REGISTRATION_CREDITS covers exactly one
+    # 4-image trial session (20 credits). Limits mirror Basic so the trial teaches the
+    # real rules.
     "trial": Plan(
-        key="trial", name="Free Trial", price_usd=0, image_count=10,
+        key="trial", name="Free Trial", price_usd=0, image_count=4,
         max_attires=2, max_backgrounds=2, category_rule="single_type",
-        plan_type="one_time", credits_per_image=1,
+        plan_type="one_time", credits_per_image=5,
     ),
+    # ── One-time (single payment) ──
     "basic": Plan(
-        key="basic", name="Basic", price_usd=35, image_count=30,
+        key="basic", name="Basic", price_usd=10, image_count=20,
         max_attires=2, max_backgrounds=2, category_rule="single_type",
-        plan_type="one_time", credits_per_image=1,
+        plan_type="one_time", credits_per_image=5,
     ),
     "pro": Plan(
-        key="pro", name="Pro", price_usd=45, image_count=50,
+        key="pro", name="Pro", price_usd=17, image_count=40,
         max_attires=3, max_backgrounds=3, category_rule="mixable",
-        plan_type="one_time", credits_per_image=1,
+        plan_type="one_time", credits_per_image=5,
     ),
     "expert": Plan(
-        key="expert", name="Expert", price_usd=60, image_count=65,
+        key="expert", name="Expert", price_usd=28, image_count=60,
         max_attires=5, max_backgrounds=5, category_rule="mixable",
-        plan_type="one_time", credits_per_image=1,
+        plan_type="one_time", credits_per_image=5,
     ),
-    # Structure wired so it's easy to enable later. credits_per_image=4 → a ~80-credit
-    # grant yields ~20 images/month. Enforcement can read this exactly like one_time.
-    "monthly": Plan(
-        key="monthly", name="Monthly", price_usd=25, image_count=20,
+    # ── Monthly (recurring) ──
+    "monthly_basic": Plan(
+        key="monthly_basic", name="Basic (Monthly)", price_usd=25, image_count=20,
+        max_attires=2, max_backgrounds=2, category_rule="single_type",
+        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=20,
+    ),
+    "monthly_pro": Plan(
+        key="monthly_pro", name="Pro (Monthly)", price_usd=45, image_count=40,
         max_attires=3, max_backgrounds=3, category_rule="mixable",
-        plan_type="monthly", credits_per_image=4,
-        min_session_images=5, monthly_images=20,
+        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=40,
+    ),
+    "monthly_expert": Plan(
+        key="monthly_expert", name="Expert (Monthly)", price_usd=65, image_count=60,
+        max_attires=5, max_backgrounds=5, category_rule="mixable",
+        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=60,
     ),
 }
 
 DEFAULT_PLAN_KEY = "trial"
+
+
+def plan_key_for(tier: str, subscription_type: str) -> str:
+    """Map a Stripe (tier, type) pair to a PLANS key. one-time 'basic' -> 'basic';
+    monthly 'basic' -> 'monthly_basic'. Falls back to the tier itself, then default.
+    The Stripe webhook handlers use this to set users.plan_name so submit resolves the
+    right plan."""
+    tier = (tier or "").strip().lower()
+    if (subscription_type or "").strip().lower() == "monthly":
+        key = f"monthly_{tier}"
+    else:
+        key = tier
+    return key if key in PLANS else (tier if tier in PLANS else DEFAULT_PLAN_KEY)
 
 
 def affordable(plan: Plan, credits: int) -> bool:
@@ -109,7 +124,7 @@ def affordable(plan: Plan, credits: int) -> bool:
 
 def get_plan(plan_key: str | None) -> Plan:
     """Resolve a plan by key, falling back to the default when unset/unknown so a
-    missing users.plan_name never crashes submit (it just gets Basic limits)."""
+    missing users.plan_name never crashes submit."""
     return PLANS.get((plan_key or "").strip().lower(), PLANS[DEFAULT_PLAN_KEY])
 
 
