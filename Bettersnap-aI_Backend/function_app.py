@@ -738,12 +738,13 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # ── Resolve the user's plan (image_count + selection limits live in shared/plans) ──
     conn0 = get_db()
     cur0 = conn0.cursor()
-    cur0.execute("SELECT plan_name, lora_status FROM users WHERE user_id = ?", user_id)
+    cur0.execute("SELECT plan_name, lora_status, credits_remaining FROM users WHERE user_id = ?", user_id)
     prow = cur0.fetchone()
     if not prow:
         return func.HttpResponse("User not found", status_code=404)
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
+    credits_remaining = int(prow[2] or 0)
 
     # ── Identity-LoRA gate ───────────────────────────────────────────────────
     # Without the user's adapter, txt2img has NOTHING carrying their identity and
@@ -801,7 +802,16 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
                                 "types": sorted(types)}),
                     mimetype="application/json", status_code=403)
 
-    image_count = plan.image_count
+    # One-time = the whole pack in ONE batch. Monthly = a per-session slice so the monthly
+    # credit pool spreads across MANY generations: default to the plan's session size, let
+    # the client request more, clamp to the monthly quota and to what credits can pay for.
+    if plan.plan_type == "monthly":
+        requested = int(body.get("image_count") or plan.min_session_images)
+        max_by_credits = credits_remaining // plan.credits_per_image
+        image_count = max(plan.min_session_images,
+                          min(requested, plan.monthly_images, max_by_credits))
+    else:
+        image_count = plan.image_count
     cost = credit_cost(plan, image_count)
 
     job_params = json.dumps({
@@ -1963,6 +1973,12 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Compute the NEXT renewal (last renewal + ~1 month) so the frontend can show
+    # "renews {date}" without date math. Only meaningful for an active monthly plan.
+    next_renewal = None
+    if row[1] == "monthly" and row[4]:
+        next_renewal = str(row[4] + timedelta(days=30))
+
     return func.HttpResponse(
         json.dumps({
             "plan": row[0],
@@ -1970,6 +1986,7 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "credits_remaining": row[2],
             "credits_monthly_limit": row[3],
             "subscription_renewed_at": str(row[4]) if row[4] else None,
+            "next_renewal": next_renewal,
         }),
         mimetype="application/json",
         status_code=200,
