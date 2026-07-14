@@ -605,21 +605,13 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
             log.info(f"No email on file for user_id={user_id}; skipping completion email")
             return
 
-        # Build a SAS URL for the first headshot (24 h expiry).
-        storage_key = AZURE_STORAGE_KEY or get_secret("storage-account-key")
-        first_blob = result_blob_paths[0] if result_blob_paths else None
-        if not first_blob:
-            return
-        sas_token = generate_blob_sas(
-            account_name=AZURE_STORAGE_ACCOUNT,
-            container_name=AZURE_BLOB_CONTAINER,
-            blob_name=first_blob,
-            account_key=storage_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.now(timezone.utc) + timedelta(hours=24),
-        )
-        url = (f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/"
-               f"{AZURE_BLOB_CONTAINER}/{first_blob}?{sas_token}")
+        # Link the user to their DASHBOARD (not a single-image download). The results
+        # live there, it's retention/plan-aware, and one link covers the whole batch.
+        # APP_BASE_URL is env-driven so staging/prod point at the right frontend host.
+        app_base = os.environ.get("APP_BASE_URL", "https://bettersnap.ai").rstrip("/")
+        dashboard_url = f"{app_base}/dashboard"
+        count = len(result_blob_paths or [])
+        noun = "headshots" if count != 1 else "headshot"
 
         acs_conn_str = get_secret("acs-connection-string")
         client = EmailClient.from_connection_string(acs_conn_str)
@@ -627,19 +619,19 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
             "senderAddress": "noreply@bettersnap.ai",
             "recipients": {"to": [{"address": to_email}]},
             "content": {
-                "subject": "Your BetterSnap AI headshot is ready!",
+                "subject": "Your BetterSnap AI headshots are ready!",
                 "plainText": (
-                    f"Your headshot (Job ID: {job_id}) is ready. "
-                    f"Download it here: {url}"
+                    f"Great news — your {count} AI {noun} are ready. "
+                    f"View and download them in your dashboard: {dashboard_url}"
                 ),
                 "html": (
-                    f"<h2>Your headshot is ready!</h2>"
-                    f"<p>Job ID: {job_id}</p>"
-                    f"<p><a href=\"{url}\">Click here to download your headshot</a></p>"
+                    f"<h2>Your headshots are ready! 🎉</h2>"
+                    f"<p>Your {count} BetterSnap AI {noun} have finished generating.</p>"
+                    f"<p><a href=\"{dashboard_url}\">Open your dashboard to view and download</a></p>"
                 ),
             },
         })
-        log.info(f"✅ Completion email sent to {to_email} for job_id={job_id}")
+        log.info(f"✅ Completion email (dashboard) sent to {to_email} for job_id={job_id}")
     except Exception as e:
         log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
 
