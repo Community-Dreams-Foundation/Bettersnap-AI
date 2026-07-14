@@ -1,0 +1,100 @@
+# Unified BetterSnap image — ONE image that runs BOTH inference (main.py) and per-user
+# LoRA training (run_training.py), selected at runtime by the MODE env var.
+#
+# WHY THIS EXISTS
+# ---------------
+# The standalone trainer image downloaded SDXL from HuggingFace on every run with no
+# timeout; a stalled download hung the A100 for hours (observed: stuck at 4/19 files,
+# ~2h, zero GPU work). This image BAKES the model (which inference already needs) and the
+# trainer reads it from /models — no runtime download, no hang. One image to build and
+# keep in sync instead of two divergent ones.
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    libgl1 \
+    libglib2.0-0 \
+    git \
+    fonts-liberation \
+    curl \
+    gnupg \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# requirements.txt already pins diffusers/transformers/accelerate/peft/torch to the EXACT
+# versions the trainer needs (verified identical). The trainer's ONLY extra dep is `datasets`.
+RUN python3.11 -m pip install --no-cache-dir numpy==1.26.4 && \
+    python3.11 -m pip install --no-cache-dir \
+        torch==2.5.1 \
+        torchvision==0.20.1 \
+        torchaudio==2.5.1 \
+        --index-url https://download.pytorch.org/whl/cu121 && \
+    python3.11 -m pip install --no-cache-dir -r requirements.txt && \
+    python3.11 -m pip install --no-cache-dir datasets
+
+# ── Bake SDXL base 1.0 + fp16-fix VAE (used by BOTH inference AND training) ──────
+# Revisions pinned to commit hashes so a rebuild can never silently pull a changed 'main'.
+ENV HF_HUB_ENABLE_HXET=0
+RUN huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
+        --revision 462165984030d82259a11f4367a4eed129e94a7b \
+        --include "*.json" "*.txt" "*.fp16.safetensors" \
+        --local-dir /models/sdxl-base && \
+    huggingface-cli download madebyollin/sdxl-vae-fp16-fix \
+        --revision 207b116dae70ace3637169f1ddd2434b91b3a8cd \
+        --local-dir /models/sdxl-vae && \
+    rm -rf /root/.cache/huggingface
+
+# The training script loads every component (incl. the VAE) with --variant=fp16, but the
+# fp16-fix VAE repo ships only the default-named safetensors. Expose the SAME weights under
+# the fp16 variant filename so `variant=fp16` resolves it. Inference loads the default name
+# and is unaffected.
+RUN cd /models/sdxl-vae && \
+    src="$(ls diffusion_pytorch_model.safetensors 2>/dev/null || ls *.safetensors | head -1)" && \
+    cp "$src" diffusion_pytorch_model.fp16.safetensors
+
+# ── ControlNet-depth + MiDaS + Real-ESRGAN (inference post-process; unused by training) ──
+RUN huggingface-cli download xinsir/controlnet-depth-sdxl-1.0 \
+        --revision 961552fa2913e3aa82cdfb32cb51bf182d95207c \
+        --include "config.json" "diffusion_pytorch_model.safetensors" \
+        --local-dir /models/controlnet-depth-sdxl && \
+    huggingface-cli download Intel/dpt-hybrid-midas \
+        --revision 11eaf7a1cf4bd70740697dbc216f98980c0aeb03 \
+        --include "config.json" "preprocessor_config.json" "pytorch_model.bin" \
+        --local-dir /models/dpt-hybrid-midas && \
+    rm -rf /root/.cache/huggingface
+
+RUN mkdir -p /models/realesrgan && \
+    curl -fL -o /models/realesrgan/RealESRGAN_x4plus.pth \
+      https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+# ── Inference app (/app) ─────────────────────────────────────────────────────────
+COPY rrdbnet.py .
+COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
+COPY main.py .
+
+# ── Trainer (/workspace) — reads the baked /models above; NO runtime HF download ──
+COPY training/trainer/train_dreambooth_lora_sdxl.py /workspace/train_dreambooth_lora_sdxl.py
+COPY training/trainer/train_text_to_image_lora_sdxl.py /workspace/train_text_to_image_lora_sdxl.py
+COPY training/trainer/run_training.py /workspace/run_training.py
+
+# MODE=train -> trainer, anything else -> inference.
+COPY entrypoint.py /entrypoint.py
+CMD ["python3.11", "/entrypoint.py"]

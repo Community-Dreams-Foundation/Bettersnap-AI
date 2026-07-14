@@ -62,6 +62,14 @@ CLASS_WORD       = os.environ.get("CLASS_WORD", "woman").strip().lower()
 # changes NO math (identical gradients, identical adapter) — only speed vs memory.
 # Flip to 0 once PEAK TRAIN VRAM (logged below) shows the headroom.
 GRAD_CKPT        = os.environ.get("GRADIENT_CHECKPOINTING", "1").strip() != "0"
+# Base model + VAE. Default to the copies BAKED INTO THE IMAGE (the unified train+infer
+# image), so training does NOT re-download SDXL from HuggingFace at runtime. The live
+# download had no timeout and could silently hang the A100 for hours (stalled at 4/19
+# files) — reading the baked weights from disk removes that failure mode entirely.
+# Overridable via env for a standalone/dev run that wants to pull from the Hub.
+BASE_MODEL    = os.environ.get("BASE_MODEL", "/models/sdxl-base")
+VAE_MODEL     = os.environ.get("VAE_MODEL", "/models/sdxl-vae")
+MODEL_VARIANT = os.environ.get("MODEL_VARIANT", "fp16")
 
 WORK  = "/workspace"
 DATA  = "/workspace/instance_data"
@@ -146,8 +154,9 @@ cmd = [
     "accelerate", "launch", "--num_processes=1", "--num_machines=1",
     "--mixed_precision=bf16", "--dynamo_backend=no",
     f"{WORK}/train_dreambooth_lora_sdxl.py",
-    "--pretrained_model_name_or_path=stabilityai/stable-diffusion-xl-base-1.0",
-    "--pretrained_vae_model_name_or_path=madebyollin/sdxl-vae-fp16-fix",
+    f"--pretrained_model_name_or_path={BASE_MODEL}",
+    f"--pretrained_vae_model_name_or_path={VAE_MODEL}",
+    f"--variant={MODEL_VARIANT}",
     f"--instance_data_dir={DATA}",
     f"--instance_prompt={INSTANCE_PROMPT}",
     "--with_prior_preservation",
@@ -242,8 +251,8 @@ import torch, logging as _logging
 from diffusers import StableDiffusionXLImg2ImgPipeline
 log.info("FORMAT GATE: loading base SDXL fp16 + adapter with warning capture ...")
 pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to("cuda")
+    BASE_MODEL,
+    torch_dtype=torch.float16, variant=MODEL_VARIANT, use_safetensors=True).to("cuda")
 caught = []
 class Catch(_logging.Handler):
     def emit(self, rec):

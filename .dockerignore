@@ -1,8 +1,19 @@
 *
 !Dockerfile
+!Dockerfile.unified
+!entrypoint.py
 !main.py
 !requirements.txt
 !rrdbnet.py
+# Trainer scripts, for the unified image's COPY training/trainer/... (same nested-whitelist
+# walk as catalog.py below).
+!training
+training/*
+!training/trainer
+training/trainer/*
+!training/trainer/run_training.py
+!training/trainer/train_dreambooth_lora_sdxl.py
+!training/trainer/train_text_to_image_lora_sdxl.py
 # Whitelisting a DEEPLY NESTED file requires walking the directory chain: un-ignore
 # each parent dir, re-ignore its contents, then un-ignore the specific file. Without
 # this, `*` excludes Bettersnap-aI_Backend and the Dockerfile's
