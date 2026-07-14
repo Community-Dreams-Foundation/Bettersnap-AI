@@ -76,8 +76,10 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
     """
     face_gate = "ok"
     try:
-        from shared.crops import _CASCADE
-        if _CASCADE.empty():
+        from shared.crops import _FRONTAL, _PROFILE
+        # Verify EVERY cascade the detector relies on actually loaded (a hollow cv2
+        # wheel yields empty classifiers). Covers the two frontal cascades + profile.
+        if any(c.empty() for c in (*_FRONTAL, _PROFILE)):
             face_gate = "cascade_empty"
     except Exception as e:
         face_gate = f"unavailable: {type(e).__name__}: {e}"
