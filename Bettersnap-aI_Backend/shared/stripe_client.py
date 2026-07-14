@@ -10,10 +10,12 @@ STRIPE_API_BASE = "https://api.stripe.com/v1"
 # 1 job = 20 credits = 4 image variations
 CREDITS_PER_JOB = 20
 
+# One-time = image packs. No credit concept for the user: internally 1 credit == 1 image,
+# so "credits" granted == images. (credits == images below.)
 ONE_TIME_PLANS = {
-    "basic":  {"credits": 100, "images": 20, "original_cents": 1900, "discounted_cents": 1000},
-    "pro":    {"credits": 200, "images": 40, "original_cents": 3500, "discounted_cents": 1700},
-    "expert": {"credits": 300, "images": 60, "original_cents": 5500, "discounted_cents": 2800},
+    "basic":  {"credits": 30, "images": 30, "original_cents": 3500, "discounted_cents": 3500},
+    "pro":    {"credits": 50, "images": 50, "original_cents": 4500, "discounted_cents": 4500},
+    "expert": {"credits": 70, "images": 70, "original_cents": 6500, "discounted_cents": 6500},
 }
 
 MONTHLY_PLANS = {

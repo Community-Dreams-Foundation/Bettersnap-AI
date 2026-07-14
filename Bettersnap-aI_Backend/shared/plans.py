@@ -3,12 +3,12 @@
 EVERY plan number lives here so a price/quota/limit tweak is a one-line edit. Nothing
 else in the codebase should hardcode a plan quota or a per-plan limit — import from here.
 
-Model (reconciled with Stripe, 2026-07):
-  • Credit model: 5 credits == 1 image (credits_per_image = 5), matching Stripe's
-    "1 job = 20 credits = 4 images". So a plan's credit grant == image_count * 5.
-  • One-time (Basic/Pro/Expert): buy once, get image_count images (20 / 40 / 60).
-  • Monthly (Basic/Pro/Expert): same image quota per month; the LoRA is trained once and
-    reused all month, and the user generates until their monthly credits run out.
+Model (2026-07):
+  • One-time (Basic/Pro/Expert) + Trial: an IMAGE PACK, no credit concept shown to the
+    user. Internally credits_per_image = 1, so the credit counter == images remaining.
+    Basic 30 / Pro 50 / Expert 70 images.
+  • Monthly (Basic/Pro/Expert): CREDIT-based, credits_per_image = 5 (100/200/300 credits
+    = 20/40/60 images/month); LoRA trained once, reused all month until credits run out.
   • Trial: free, the default at signup.
 
 Plan KEYS are distinct per (tier, billing type) because Stripe prices them differently
@@ -43,16 +43,18 @@ class Plan:
     monthly_images: int = 0
 
 
-# Credits granted at registration. 5 credits/image → 20 credits == 4 free trial images
-# (one free "job"). MUST cover one generation on the DEFAULT (trial) plan, or every new
-# user is created unable to generate — see the `affordable` guard test.
-REGISTRATION_CREDITS = 20
+# Credits granted at registration. One-time model = 1 credit/image, so this is the
+# number of FREE trial images (4). MUST cover one generation on the DEFAULT (trial)
+# plan — see the `affordable` guard test.  ⚠️ NEEDS-DECISION: free trial image count.
+REGISTRATION_CREDITS = 4
 
 # ── Retraining ───────────────────────────────────────────────────────────────
 # First retrain FREE; each after costs credits. Flat (not plan-scaled): a retrain is
 # ~32 min of A100 and, with MAX_ACTIVE_GPU_JOBS=1, blocks the queue for everyone.
+# ⚠️ NEEDS-DECISION: with the mixed model a flat credit value means different image
+# counts for one-time (1cr/img) vs monthly (5cr/img) — confirm the number.
 FREE_RETRAINS = 1
-RETRAIN_CREDITS = 50          # == 10 images at 5 credits/image
+RETRAIN_CREDITS = 10
 MAX_TRAININGS_PER_DAY = 3
 
 
@@ -64,23 +66,23 @@ PLANS = {
     "trial": Plan(
         key="trial", name="Free Trial", price_usd=0, image_count=4,
         max_attires=2, max_backgrounds=2, category_rule="single_type",
-        plan_type="one_time", credits_per_image=5,
+        plan_type="one_time", credits_per_image=1,
     ),
-    # ── One-time (single payment) ──
+    # ── One-time image packs (single payment; 1 credit == 1 image, no credits shown) ──
     "basic": Plan(
-        key="basic", name="Basic", price_usd=10, image_count=20,
+        key="basic", name="Basic", price_usd=35, image_count=30,
         max_attires=2, max_backgrounds=2, category_rule="single_type",
-        plan_type="one_time", credits_per_image=5,
+        plan_type="one_time", credits_per_image=1,
     ),
     "pro": Plan(
-        key="pro", name="Pro", price_usd=17, image_count=40,
+        key="pro", name="Pro", price_usd=45, image_count=50,
         max_attires=3, max_backgrounds=3, category_rule="mixable",
-        plan_type="one_time", credits_per_image=5,
+        plan_type="one_time", credits_per_image=1,
     ),
     "expert": Plan(
-        key="expert", name="Expert", price_usd=28, image_count=60,
+        key="expert", name="Expert", price_usd=65, image_count=70,
         max_attires=5, max_backgrounds=5, category_rule="mixable",
-        plan_type="one_time", credits_per_image=5,
+        plan_type="one_time", credits_per_image=1,
     ),
     # ── Monthly (recurring) ──
     "monthly_basic": Plan(
