@@ -22,12 +22,24 @@ def _conn_str():
 
 
 def get_db():
-    """Cached connection for simple read endpoints.
+    """Cached connection for simple read endpoints AND single-statement writes
+    (register, accept_terms, update_profile, delete_job, admin requeue/fail).
 
-    NOTE: this is a single module-global connection and is NOT safe for
-    concurrent use across threads. For transactional / locked critical sections
-    (daily-cap check+insert, GPU dispatch lease) use new_connection() instead so
-    each caller gets its own isolated transaction.
+    autocommit=True is DELIBERATE and load-bearing: pyodbc defaults to
+    autocommit=False, which opens an implicit transaction on the first statement.
+    On this *cached, never-closed* connection, any handler that executed a write
+    (or even a SELECT) and then failed/timed out before conn.commit() left that
+    transaction OPEN — holding the row/table lock forever. Concurrent signups then
+    blocked on that lock and chained into a pile-up of stuck sessions that took
+    registration down product-wide (every new user's INSERT hung). With autocommit
+    each statement commits immediately, so no lock can outlive a request and the
+    leftover conn.commit() calls in these handlers become harmless no-ops.
+
+    For MULTI-statement atomic work (daily-cap check+insert, GPU dispatch lease,
+    Stripe webhook grants) use new_connection() instead — those manage their own
+    transaction and close the connection in a finally (close → rollback), so they
+    cannot leak. This connection is still NOT safe for concurrent use across
+    threads; the atomic paths must not share it.
     """
     global _connection
     try:
@@ -37,7 +49,7 @@ def get_db():
     except Exception:
         _connection = None
 
-    _connection = pyodbc.connect(_conn_str())
+    _connection = pyodbc.connect(_conn_str(), autocommit=True)
     return _connection
 
 

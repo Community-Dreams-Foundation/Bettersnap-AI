@@ -47,11 +47,21 @@ def _post(path: str, data: dict) -> dict:
     return resp.json()
 
 
+def _maybe_email(params: dict, email: str) -> dict:
+    """Only attach customer_email when it's a real address. Stripe rejects an EMPTY
+    customer_email with `400 Invalid email address` — and Entra tokens frequently have
+    no `email` claim, so passing "" broke every checkout. Omitting it lets Stripe's
+    hosted page collect the email instead. (Credits are granted off metadata.user_id,
+    not the email, so nothing downstream depends on this.)"""
+    if email and "@" in email:
+        params["customer_email"] = email
+    return params
+
+
 def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("onetime", plan)
-    return _post("checkout/sessions", {
+    return _post("checkout/sessions", _maybe_email({
         "mode": "payment",
-        "customer_email": email,
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": "1",
         "success_url": success_url,
@@ -59,14 +69,13 @@ def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: st
         "metadata[user_id]": user_id,
         "metadata[plan]": plan,
         "metadata[payment_type]": "one_time",
-    })
+    }, email))
 
 
 def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("monthly", plan)
-    return _post("checkout/sessions", {
+    return _post("checkout/sessions", _maybe_email({
         "mode": "subscription",
-        "customer_email": email,
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": "1",
         "success_url": success_url,
@@ -76,7 +85,7 @@ def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: st
         "metadata[payment_type]": "monthly",
         "subscription_data[metadata][user_id]": user_id,
         "subscription_data[metadata][plan]": plan,
-    })
+    }, email))
 
 
 def cancel_subscription(stripe_subscription_id: str) -> dict:

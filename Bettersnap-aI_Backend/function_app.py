@@ -114,7 +114,13 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
     # the actual claim KEYS (not values — no PII/token contents) on a genuine
     # first registration so we can confirm the real names from a live token
     # instead of guessing.
-    email = payload.get("email", "")
+    # Entra tokens often carry the address in preferred_username/upn rather than `email`
+    # (social/CIAM tokens may omit it entirely). Fall back through them, and store NULL —
+    # NOT "" — when there's genuinely no address. An empty string collides on the email
+    # uniqueness rule (only one "" allowed), which is exactly what 500'd every email-less
+    # signup; NULL is excluded from the (now filtered) unique index, so many can coexist.
+    email = (payload.get("email") or payload.get("preferred_username")
+             or payload.get("upn") or None)
     name = payload.get("name", "")
 
     conn = get_db()
@@ -1928,13 +1934,17 @@ def training_watcher(timer: func.TimerRequest):
 def list_plans(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps({
+            # Field names + units MUST match the frontend (Billing.tsx reads
+            # discounted_cents/original_cents for one-time and price_cents for monthly,
+            # then divides by 100). Emitting *_price_usd here made every price render as
+            # $NaN. Send integer CENTS under the exact keys the frontend consumes.
             "one_time": [
                 {
                     "plan": plan,
                     "images": info["images"],
                     "credits": info["credits"],
-                    "original_price_usd": info["original_cents"] / 100,
-                    "discounted_price_usd": info["discounted_cents"] / 100,
+                    "original_cents": info["original_cents"],
+                    "discounted_cents": info["discounted_cents"],
                 }
                 for plan, info in ONE_TIME_PLANS.items()
             ],
@@ -1943,7 +1953,7 @@ def list_plans(req: func.HttpRequest) -> func.HttpResponse:
                     "plan": plan,
                     "images": info["images"],
                     "credits": info["credits"],
-                    "price_usd": info["price_cents"] / 100,
+                    "price_cents": info["price_cents"],
                 }
                 for plan, info in MONTHLY_PLANS.items()
             ],
@@ -1981,6 +1991,12 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps({
+            # Frontend (Billing.tsx / getSubscriptionStatus) reads subscription_plan /
+            # subscription_type. Emitting "plan"/"type" made the badge always show "Free"
+            # even after a paid plan updated the row. Send the keys the frontend consumes;
+            # keep plan/type as aliases so any other caller keeps working.
+            "subscription_plan": row[0],
+            "subscription_type": row[1],
             "plan": row[0],
             "type": row[1],
             "credits_remaining": row[2],
@@ -2012,7 +2028,11 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     payment_type  = body.get("type", "")  # "one_time" or "monthly"
     success_url   = body.get("success_url", "https://bettersnap.ai/subscription/success")
     cancel_url    = body.get("cancel_url",  "https://bettersnap.ai/subscription/cancel")
-    email         = payload.get("email", "")
+    # Entra tokens don't always carry an `email` claim — the address is often in
+    # preferred_username or upn. Fall back through them; if none is an address, we pass
+    # nothing and Stripe collects the email on its hosted page (see _maybe_email).
+    email         = (payload.get("email") or payload.get("preferred_username")
+                     or payload.get("upn") or "")
 
     if payment_type == "one_time":
         if plan not in ONE_TIME_PLANS:
@@ -2112,26 +2132,45 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Invalid signature", status_code=400)
 
     event_type = event.get("type", "")
-    logging.info(f"Stripe event: {event_type}")
+    event_id   = event.get("id", "")
+    logging.info(f"Stripe event: {event_type} ({event_id})")
+    if not event_id:
+        # No id means we cannot dedup this event; refuse rather than risk a double-grant.
+        logging.error(f"Stripe event has no id; skipping to stay idempotent: type={event_type}")
+        return func.HttpResponse("OK", status_code=200)
 
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
         payment_type = session.get("metadata", {}).get("payment_type")
         if payment_type == "one_time":
-            _handle_onetime_payment(session)
+            _handle_onetime_payment(session, event_id)
         elif payment_type == "monthly":
-            _handle_monthly_checkout(session)
+            _handle_monthly_checkout(session, event_id)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
-        _handle_invoice_paid(event["data"]["object"])
+        _handle_invoice_paid(event["data"]["object"], event_id)
 
     elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
-        _handle_subscription_ended(event["data"]["object"])
+        _handle_subscription_ended(event["data"]["object"], event_id)
 
     return func.HttpResponse("OK", status_code=200)
 
 
-def _handle_onetime_payment(session: dict):
+def _claim_event(cur, event_id: str) -> bool:
+    """Idempotency guard for Stripe webhooks. Records event_id and returns True if THIS call
+    claimed it (proceed with the grant), False if it was already processed (skip). Runs on
+    the CALLER's cursor so the claim commits in the SAME transaction as the grant — if the
+    grant rolls back, the claim rolls back too and a genuine Stripe retry can reprocess. The
+    event_id PRIMARY KEY (migration 010) is the concurrency backstop."""
+    cur.execute(
+        "INSERT INTO processed_stripe_events (event_id) "
+        "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM processed_stripe_events WHERE event_id = ?)",
+        event_id, event_id,
+    )
+    return cur.rowcount == 1
+
+
+def _handle_onetime_payment(session: dict, event_id: str):
     user_id = session.get("metadata", {}).get("user_id")
     plan    = session.get("metadata", {}).get("plan")
     if not user_id or plan not in ONE_TIME_PLANS:
@@ -2142,6 +2181,11 @@ def _handle_onetime_payment(session: dict):
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # Idempotency: a retried delivery of this event must not add the credits again.
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping one_time grant.")
+            return
         cur.execute(
             """UPDATE users SET
                 subscription_plan = ?,
@@ -2151,13 +2195,25 @@ def _handle_onetime_payment(session: dict):
             WHERE user_id = ?""",
             plan, plan_key_for(plan, "one_time"), credits, user_id,
         )
-        conn.commit()
+        applied = cur.rowcount
+        if applied == 0:
+            # The user row doesn't exist yet (registration hadn't completed when they paid).
+            # Roll back so the event is NOT recorded as processed — a later replay can still
+            # apply the grant once the row exists. Log LOUDLY for manual reconciliation.
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (one_time): user_id={user_id} plan={plan} "
+                f"credits={credits} matched 0 user rows — user not registered. "
+                f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
+            )
+            return
+        conn.commit()  # claim + grant commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
     finally:
         conn.close()
 
 
-def _handle_monthly_checkout(session: dict):
+def _handle_monthly_checkout(session: dict, event_id: str):
     user_id  = session.get("metadata", {}).get("user_id")
     plan     = session.get("metadata", {}).get("plan")
     customer = session.get("customer")
@@ -2171,6 +2227,11 @@ def _handle_monthly_checkout(session: dict):
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # Idempotency: a retried delivery must not re-activate / re-grant credits.
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping monthly activation.")
+            return
         cur.execute(
             """UPDATE users SET
                 subscription_plan       = ?,
@@ -2185,19 +2246,37 @@ def _handle_monthly_checkout(session: dict):
             WHERE user_id = ?""",
             plan, plan_key_for(plan, "monthly"), customer, sub_id, credits, credits, user_id,
         )
-        conn.commit()
+        applied = cur.rowcount
+        if applied == 0:
+            # Same silent-loss guard as the one-time path: a subscription paid for a user
+            # row that doesn't exist would no-op. Roll back (don't record the event) so a
+            # replay can still activate once the row exists; surface for reconciliation.
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (monthly): user_id={user_id} plan={plan} "
+                f"credits={credits} sub={sub_id} matched 0 user rows — user not registered. "
+                f"MANUAL RECONCILIATION REQUIRED."
+            )
+            return
+        conn.commit()  # claim + activation commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
     finally:
         conn.close()
 
 
-def _handle_invoice_paid(invoice: dict):
+def _handle_invoice_paid(invoice: dict, event_id: str):
     sub_id = invoice.get("subscription")
     if not sub_id:
         return
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # Idempotency: a retried invoice.paid must not reset (and thus re-grant) credits
+        # twice — that would hand back credits the subscriber had already spent this cycle.
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping credit reset.")
+            return
         cur.execute(
             """UPDATE users SET
                 credits_remaining       = credits_monthly_limit,
@@ -2205,21 +2284,33 @@ def _handle_invoice_paid(invoice: dict):
             WHERE stripe_subscription_id = ?""",
             sub_id,
         )
-        conn.commit()
+        conn.commit()  # claim + reset commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
     finally:
         conn.close()
 
 
-def _handle_subscription_ended(sub: dict):
+def _handle_subscription_ended(sub: dict, event_id: str):
     sub_id = sub.get("id")
     status = sub.get("status")
-    if status in ("canceled", "unpaid", "past_due"):
+    # Only hard-downgrade on TERMINAL states. 'past_due' is deliberately EXCLUDED: it is a
+    # transient dunning state where Stripe is still retrying the card (for days). Downgrading
+    # on past_due nulls stripe_subscription_id, so the later successful invoice.paid can no
+    # longer find the user (it matches on stripe_subscription_id) and a paying customer whose
+    # card merely blipped is orphaned to 'free' forever. Let past_due ride; it resolves to
+    # 'active' (recovered) or 'canceled'/'unpaid' (truly over), both of which we handle.
+    if status in ("canceled", "unpaid"):
         conn = new_connection()
         try:
             cur = conn.cursor()
-            # Subscription is truly over (period-end) → the user keeps their data for
-            # RETENTION_DAYS more, then the hourly cleanup deletes the blobs.
+            # Idempotency: a retried delivery must not re-run the downgrade / reset the
+            # retention clock. (customer.subscription.updated can also fire repeatedly.)
+            if not _claim_event(cur, event_id):
+                conn.rollback()
+                logging.info(f"Stripe event {event_id} already processed; skipping downgrade.")
+                return
+            # Subscription is truly over → the user keeps their data for RETENTION_DAYS
+            # more, then the hourly cleanup deletes the blobs.
             cur.execute(
                 """UPDATE users SET
                     subscription_plan      = 'free',
@@ -2299,24 +2390,11 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
             f"results={n_results} jobs_expired={len(job_ids)}")
 
 
-# ── Monthly safety-net credit refill ─────────────────────
-@app.timer_trigger(schedule="0 0 1 * * *", arg_name="monthly_timer", run_on_startup=False)
-def monthly_credit_refill(monthly_timer: func.TimerRequest):
-    conn = new_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """UPDATE users SET
-                credits_remaining       = credits_monthly_limit,
-                subscription_renewed_at = GETUTCDATE()
-            WHERE subscription_type = 'monthly'
-            AND (
-                subscription_renewed_at IS NULL
-                OR subscription_renewed_at < DATEADD(MONTH, -1, GETUTCDATE())
-            )""",
-        )
-        updated = cur.rowcount
-        conn.commit()
-        logging.info(f"monthly_credit_refill: topped up {updated} subscriber(s)")
-    finally:
-        conn.close()
+# ── Monthly credit renewal ───────────────────────────────
+# NOTE: there is deliberately NO time-based refill timer. Renewal is driven SOLELY by
+# Stripe's `invoice.paid` webhook (see _handle_invoice_paid), which fires only when a
+# payment actually succeeds. The old timer here reset credits for any monthly row older
+# than ~1 month WITHOUT checking payment, so a subscriber whose card was failing (or who
+# was mid-dunning) got a free monthly refill. If a payment-confirmed fallback is ever
+# needed (e.g. to cover a missed webhook), it must reconcile against Stripe — query the
+# subscription's latest invoice status — not refill on elapsed time alone.
