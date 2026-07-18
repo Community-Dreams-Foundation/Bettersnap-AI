@@ -1,58 +1,65 @@
+import os
 import pyodbc
 
-_connection = None
+# Enable ODBC connection pooling process-wide (must be set before the first connect).
+# With pooling, pyodbc.connect() with the same connection string hands back a physical
+# connection from the driver-manager pool instead of doing a fresh TCP+TLS handshake — so
+# opening a connection per request (below) is cheap, and the per-request connections are
+# thread-isolated.
+pyodbc.pooling = True
+
+# Infra config from app settings, not hardcoded. Fallbacks preserve current deploys; set
+# SQL_SERVER / SQL_DATABASE / SQL_UID / SQL_PASSWORD_SECRET to move environments.
+_SERVER      = os.environ.get("SQL_SERVER",   "bettersnap-srv.database.windows.net")
+_DATABASE    = os.environ.get("SQL_DATABASE", "bettersnap-db")
+_UID         = os.environ.get("SQL_UID",      "CloudSAe874642e")
+_TIMEOUT     = os.environ.get("SQL_CONN_TIMEOUT", "60")
+_PWD_SECRET  = os.environ.get("SQL_PASSWORD_SECRET", "Db-Password")
 
 
 def _conn_str():
-    # Lazy import so importing this module (and new_connection) doesn't pull the
-    # Azure SDK — lets the concurrency integration tests run with only pyodbc +
-    # a test SQL Server, no Azure deps.
+    # Lazy import so importing this module doesn't pull the Azure SDK (the concurrency
+    # tests import shared.db with only pyodbc + a test SQL Server). The Key Vault read is
+    # cached in shared.keyvault, so this is a cheap in-process hit, not a network call.
     from .keyvault import get_secret
-    password = get_secret("Db-Password")
+    password = get_secret(_PWD_SECRET)
     return (
         "DRIVER={ODBC Driver 18 for SQL Server};"
-        "SERVER=bettersnap-srv.database.windows.net,1433;"
-        "DATABASE=bettersnap-db;"
-        "UID=CloudSAe874642e;"
+        f"SERVER={_SERVER},1433;"
+        f"DATABASE={_DATABASE};"
+        f"UID={_UID};"
         f"PWD={password};"
         "Encrypt=yes;"
         "TrustServerCertificate=no;"
-        "Connection Timeout=60;"
+        f"Connection Timeout={_TIMEOUT};"
     )
 
 
 def get_db():
-    """Cached connection for simple read endpoints AND single-statement writes
-    (register, accept_terms, update_profile, delete_job, admin requeue/fail).
+    """Autocommit connection for simple reads and single-statement writes (register,
+    accept_terms, update_profile, delete_job, admin requeue/fail, status endpoints).
 
-    autocommit=True is DELIBERATE and load-bearing: pyodbc defaults to
-    autocommit=False, which opens an implicit transaction on the first statement.
-    On this *cached, never-closed* connection, any handler that executed a write
-    (or even a SELECT) and then failed/timed out before conn.commit() left that
-    transaction OPEN — holding the row/table lock forever. Concurrent signups then
-    blocked on that lock and chained into a pile-up of stuck sessions that took
-    registration down product-wide (every new user's INSERT hung). With autocommit
-    each statement commits immediately, so no lock can outlive a request and the
-    leftover conn.commit() calls in these handlers become harmless no-ops.
+    Returns a FRESH connection per call, drawn from the ODBC pool — NOT a shared module
+    global. The old shared global was not safe under the Functions worker's concurrent
+    invocations: two threads driving one pyodbc connection corrupts the protocol. A
+    per-call connection is thread-isolated, and pooling means we don't pay a real TCP+TLS
+    handshake each time.
 
-    For MULTI-statement atomic work (daily-cap check+insert, GPU dispatch lease,
-    Stripe webhook grants) use new_connection() instead — those manage their own
-    transaction and close the connection in a finally (close → rollback), so they
-    cannot leak. This connection is still NOT safe for concurrent use across
-    threads; the atomic paths must not share it.
+    autocommit=True is DELIBERATE and load-bearing: pyodbc defaults to autocommit=False,
+    which opens an implicit transaction on the first statement and can hold a lock past the
+    request. With autocommit each statement self-commits, so no lock outlives a request and
+    the leftover conn.commit() calls in these handlers stay harmless no-ops. Callers need
+    not close it — it returns to the pool when it goes out of scope at the end of the
+    invocation.
+
+    For MULTI-statement atomic work (daily-cap check+insert, GPU dispatch lease, Stripe
+    webhook grants) use new_connection() instead — it manages its own transaction and
+    closes in a finally (close → rollback), so it cannot leak.
     """
-    global _connection
-    try:
-        if _connection is not None:
-            _connection.cursor().execute("SELECT 1")
-            return _connection
-    except Exception:
-        _connection = None
-
-    _connection = pyodbc.connect(_conn_str(), autocommit=True)
-    return _connection
+    return pyodbc.connect(_conn_str(), autocommit=True)
 
 
 def new_connection():
-    """Fresh, isolated connection for transactional work. Caller must close it."""
+    """Fresh, isolated (non-autocommit) connection for transactional work. Caller must
+    close it (close → rollback of anything uncommitted). Also draws from the ODBC pool."""
     return pyodbc.connect(_conn_str())
