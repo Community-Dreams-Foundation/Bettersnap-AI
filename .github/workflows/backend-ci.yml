@@ -30,6 +30,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      # The unit tests stub the heavy deps (azure, pyodbc, blob) but reach shared.stripe_client,
+      # which imports `requests`. Install just that light dep — no pyodbc/opencv/azure needed.
+      - name: Install minimal test deps
+        run: pip install requests
+
       # Syntax gate: compileall COMPILES (does not import) every module, so heavy runtime
       # deps (torch, pyodbc, azure) aren't needed to catch syntax errors across the app,
       # the inference code, and the trainer.
