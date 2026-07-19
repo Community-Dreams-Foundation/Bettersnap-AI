@@ -1,4 +1,4 @@
-<#
+﻿<#
   deploy.ps1 — BetterSnap AI inference deploy (everything EXCEPT triggering a job).
 
   Canonical image tag: v33 — SDXL txt2img + per-user LoRA generation (Aragon-style), baked ohwx trigger.
@@ -12,7 +12,8 @@
 
   Steps:
     0. Preflight — confirm az login + required CLIs
-    1. Apply DB migrations 001 + 002 (idempotent; pulls DB password from Key Vault)
+    1. Apply ALL pending DB migrations via the versioned runner (idempotent; tracks
+       dbo.schema_migrations; discovers 001..NNN automatically — never a hardcoded list)
     2. Build + push inference:v23 to ACR
     3. Point the job at inference:v23 AND set its A100 resources (cpu + memory)
     4. Publish the Functions backend (dispatch + refund + result-url)
@@ -68,26 +69,30 @@ foreach ($cli in @("az")) {
   if (-not (Get-Command $cli -ErrorAction SilentlyContinue)) { Write-Error "$cli not found"; exit 1 }
 }
 
-# ── 1. DB migrations (idempotent) ───────────────────────────────────────────
+# ── 1. DB migrations (versioned, idempotent) ────────────────────────────────
+# Applies EVERY pending migrations/NNN_*.sql via scripts/run_migrations.py, which tracks
+# applied files in dbo.schema_migrations and only runs what is new. This REPLACED a
+# hardcoded 001/002/003 sqlcmd loop that silently skipped 004+ — the exact reason the
+# schema could drift behind the code ("004-010 never applied by the deploy"). The runner
+# discovers migrations automatically, so a new migrations/014_*.sql is picked up with no
+# edit to this script. Runs FIRST, so no code ever ships before the columns it reads.
+# Auth: the runner reads the DB password from Key Vault via DefaultAzureCredential, i.e.
+# the same `az login` confirmed in preflight (no password handling in this script).
 if (-not $SkipMigrations) {
-  Step 1 "Apply DB migrations 001 + 002"
-  if (-not (Get-Command sqlcmd -ErrorAction SilentlyContinue)) {
-    Write-Warning "sqlcmd not found. Either install it (https://aka.ms/sqlcmd) or"
-    Write-Warning "apply migrations/001_gpu_dispatch_lease.sql and 002_jobs_dispatch_idempotency.sql"
-    Write-Warning "via the Azure portal query editor, then re-run with -SkipMigrations."
-    Confirm-Continue "Continue WITHOUT applying migrations? (dispatch will fail-closed if they're not applied)"
-  } else {
-    $dbpwd = az keyvault secret show --vault-name $KeyVault --name "Db-Password" --query "value" -o tsv
-    if (-not $dbpwd) { Write-Error "Could not read Db-Password from Key Vault $KeyVault"; exit 1 }
-    foreach ($m in @("migrations/001_gpu_dispatch_lease.sql", "migrations/002_jobs_dispatch_idempotency.sql", "migrations/003_user_plans.sql")) {
-      $path = Join-Path $RepoRoot "Bettersnap-aI_Backend/$m"
-      Write-Host "Applying $m ..."
-      sqlcmd -S $SqlServer -d $SqlDatabase -U $SqlUser -P $dbpwd -b -i $path
-    }
-    Write-Host "Verifying lease singleton row ..."
-    sqlcmd -S $SqlServer -d $SqlDatabase -U $SqlUser -P $dbpwd -b `
-      -Q "SELECT lease_name, owner_id, expires_at FROM dbo.GpuDispatchLease;"
+  Step 1 "Apply pending DB migrations (versioned runner)"
+  if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Error "python not found — required for scripts/run_migrations.py. Install Python 3, or"
+    Write-Error "apply pending migrations out-of-band and re-run with -SkipMigrations."
+    exit 1
   }
+  Push-Location (Join-Path $RepoRoot "Bettersnap-aI_Backend")
+  try {
+    Write-Host "Pending migrations:"
+    python scripts/run_migrations.py --dry-run
+    if ($LASTEXITCODE -ne 0) { Write-Error "Could not reach the DB to check migrations ($LASTEXITCODE)."; exit 1 }
+    python scripts/run_migrations.py
+    if ($LASTEXITCODE -ne 0) { Write-Error "run_migrations.py failed ($LASTEXITCODE) — schema not up to date, refusing to deploy code."; exit 1 }
+  } finally { Pop-Location }
 } else {
   Step 1 "Migrations SKIPPED (-SkipMigrations)"
 }
@@ -123,6 +128,6 @@ Write-Host "To run the ONE manual test (yourself, when ready):" -ForegroundColor
 Write-Host "  1) Reset the row to 'queued' (NOT 'failed', or the new guard no-ops it):" -ForegroundColor Yellow
 Write-Host "     UPDATE jobs SET status='queued', completed_at=NULL, external_execution_id=NULL" -ForegroundColor DarkGray
 Write-Host "     WHERE job_id='C91E1355-D66A-4A68-90FC-8B36160143F7';" -ForegroundColor DarkGray
-Write-Host "  2) az containerapp job start -n $JobName -g $ResourceGroup \`" -ForegroundColor DarkGray
+Write-Host "  2) az containerapp job start -n $JobName -g $ResourceGroup \" -ForegroundColor DarkGray
 Write-Host "       --env-vars JOB_ID=C91E1355-D66A-4A68-90FC-8B36160143F7 USER_ID=B1274FF7-8F9F-48E6-81A4-E5BDCBC993B0" -ForegroundColor DarkGray
 Write-Host "  Then bring the total_memory + INFERENCE VRAM PEAK numbers back to review." -ForegroundColor Yellow
