@@ -95,7 +95,10 @@ _mod("azure.storage.blob",
 _mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"))
 _mod("shared.db", get_db=mock.Mock(), new_connection=mock.Mock())
 _mod("shared.queue_client",
-     enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock())
+     enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock(),
+     # The transactional outbox (shared.outbox, imported REAL via job_reservation) pulls
+     # _send + the queue-name constants from here, and function_app imports the constants too.
+     _send=mock.Mock(), INFERENCE_QUEUE="inference-jobs", TRAINING_QUEUE="lora-training-jobs")
 _mod("shared.blob",
      upload_blob=mock.Mock(), download_blob=mock.Mock(return_value=b""),
      get_blob_client=mock.Mock())
@@ -191,6 +194,10 @@ class FakeCursor:
             self._fetch = (self.cfg.get("global_count", 0),)
         elif "insert into jobs" in s:
             self._fetch = (self.cfg.get("new_job_id", 999),)
+        # Transactional outbox row (written in reserve_job_slot / start_training /
+        # _finish_training's txn) — OUTPUT INSERTED.outbox_id, so fetchone must return an id.
+        elif "insert into outbox" in s:
+            self._fetch = (self.cfg.get("new_outbox_id", 12345),)
         elif "select user_id from lora_trainings" in s:
             self._fetch = (self.cfg.get("training_user", "user-1"),)
         else:
@@ -409,6 +416,8 @@ class DailyCapTests(unittest.TestCase):
         self._patch_db.start()
         sys.modules["shared.auth"].get_user_id.return_value = "user-1"
         sys.modules["shared.queue_client"].enqueue_job.reset_mock()
+        sys.modules["shared.queue_client"]._send.reset_mock()
+        sys.modules["shared.queue_client"]._send.side_effect = None
 
     def tearDown(self):
         self._patch.stop()
@@ -452,25 +461,28 @@ class DailyCapTests(unittest.TestCase):
     def test_happy_submit_enqueues_and_202(self):
         self._cfg.update(user_count=0, global_count=0, new_job_id=777)
         sys.modules["shared.queue_client"].enqueue_job.reset_mock()
+        sys.modules["shared.queue_client"]._send.reset_mock()
+        sys.modules["shared.queue_client"]._send.side_effect = None
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 202)
-        sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+        sys.modules["shared.queue_client"]._send.assert_called_once()
 
-    def test_enqueue_failure_refunds_and_503(self):
-        # If the queue send fails AFTER reserve_job_slot committed the charge + 'queued' row,
-        # the job must be refunded + failed (not left a charged orphan) and the user told to
-        # retry — otherwise the reaper never touches a 'queued' row and the charge is lost.
+    def test_send_failure_keeps_job_and_returns_202(self):
+        # Transactional outbox: the queue message was written ATOMICALLY with the job + credit
+        # charge in reserve_job_slot, so a fast-path send failure is NOT fatal. The job is
+        # neither failed nor refunded — the outbox_dispatcher delivers it later — and the API
+        # still returns 202 (the work is safely persisted, not an orphan).
         self._cfg.update(user_count=0, global_count=0, new_job_id=555)
         qc = sys.modules["shared.queue_client"]
-        qc.enqueue_job.reset_mock()
-        qc.enqueue_job.side_effect = RuntimeError("queue down")
+        qc._send.reset_mock()
+        qc._send.side_effect = RuntimeError("queue down")
         try:
             with mock.patch.object(function_app, "_mark_failed") as mf:
                 resp = function_app.submit_job(self._req())
-            self.assertEqual(resp.status_code, 503)
-            mf.assert_called_once_with("555")   # guarded fail + FULL refund of the charged job
+            self.assertEqual(resp.status_code, 202)   # success — job persisted, not orphaned
+            mf.assert_not_called()                     # NOT refunded; the dispatcher retries
         finally:
-            qc.enqueue_job.side_effect = None
+            qc._send.side_effect = None
 
 
 class IdentityLoraGateTests(unittest.TestCase):
@@ -490,6 +502,8 @@ class IdentityLoraGateTests(unittest.TestCase):
         self._p1.start(); self._p2.start(); self._p3.start()
         sys.modules["shared.auth"].get_user_id.return_value = "user-1"
         sys.modules["shared.queue_client"].enqueue_job.reset_mock()
+        sys.modules["shared.queue_client"]._send.reset_mock()
+        sys.modules["shared.queue_client"]._send.side_effect = None
 
     def tearDown(self):
         self._p1.stop(); self._p2.stop(); self._p3.stop()
@@ -514,7 +528,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         sqls = [s.lower() for s, _ in self._cfg.get("executed", [])]
         self.assertFalse(any("insert into jobs" in s for s in sqls))     # no job row
         self.assertFalse(any("credits_remaining -" in s for s in sqls))  # no charge
-        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+        sys.modules["shared.queue_client"]._send.assert_not_called()
 
     # A failed LoRA is equally unusable -> same rejection, not an infinite park.
     def test_failed_lora_rejected(self):
@@ -530,7 +544,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertIn("waiting_lora", resp.body)
         inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
         self.assertEqual(inserts[0][1], "waiting_lora")                  # parked status
-        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+        sys.modules["shared.queue_client"]._send.assert_not_called()
 
     def test_ready_lora_dispatches_normally(self):
         self._cfg["lora_status"] = "ready"
@@ -538,7 +552,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 202)
         inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
         self.assertEqual(inserts[0][1], "queued")
-        sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+        sys.modules["shared.queue_client"]._send.assert_called_once()
 
     # Training SUCCEEDS -> parked jobs are released IMMEDIATELY (no visibility delay,
     # so no waiting on a backoff timer while the adapter sits there ready).
@@ -546,7 +560,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         self._cfg["parked_jobs"] = [("job-a", "{}"), ("job-b", "{}")]
         function_app._finish_training("t-1", "user-1", ok=True)
         qc = sys.modules["shared.queue_client"]
-        self.assertEqual(qc.enqueue_job.call_count, 2)
+        self.assertEqual(qc._send.call_count, 2)
         sqls = [s.lower() for s, _ in self._cfg["executed"]]
         self.assertTrue(any("update jobs set status = 'queued'" in s for s in sqls))
 
@@ -557,7 +571,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         self._cfg["job_params"] = json.dumps({"credit_cost": 30})
         with mock.patch.object(function_app, "_identity_adapter_exists", return_value=False):
             function_app._finish_training("t-1", "user-1", ok=False, error="boom")
-        sys.modules["shared.queue_client"].enqueue_job.assert_not_called()
+        sys.modules["shared.queue_client"]._send.assert_not_called()
         executed = self._cfg["executed"]
         self.assertTrue(any("status = 'failed'" in s.lower() for s, _ in executed))
         refunds = [p for s, p in executed if "credits_remaining + ?" in s]
@@ -579,7 +593,7 @@ class IdentityLoraGateTests(unittest.TestCase):
         # ... but the USER keeps a working model, and their job runs instead of dying.
         user_sets = [p for s, p in executed if "update users set lora_status" in s.lower()]
         self.assertEqual(user_sets[0][0], "ready")
-        sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
+        sys.modules["shared.queue_client"]._send.assert_called_once()
 
     # A retried training message must never start a SECOND A100 for the same run.
     def test_training_dispatch_is_idempotent(self):

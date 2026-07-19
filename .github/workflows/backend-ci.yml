@@ -57,4 +57,4 @@ jobs:
       # the inference prompt-planning + adapter-loading stage (the run_inference regression).
       - name: Backend unit tests
         working-directory: Bettersnap-aI_Backend
-        run: python -m unittest tests.test_dispatch_logic tests.test_prompt_planning -v
+        run: python -m unittest tests.test_dispatch_logic tests.test_prompt_planning tests.test_outbox -v

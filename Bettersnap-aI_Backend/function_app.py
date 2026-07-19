@@ -51,7 +51,8 @@ from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 from shared.auth import validate_token, get_user_id
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
-from shared.queue_client import enqueue_job
+from shared.queue_client import enqueue_job, INFERENCE_QUEUE, TRAINING_QUEUE
+from shared.outbox import outbox_add, outbox_try_send_now
 from shared.blob import upload_blob, download_blob, get_blob_client
 from shared.keyvault import get_secret
 from shared.plans import (
@@ -487,7 +488,6 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     from shared.crops import crop_head_and_shoulders, NoFaceError, MultipleFacesError
-    from shared.queue_client import enqueue_training_job
 
     try:
         body = req.get_json()
@@ -656,11 +656,16 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         else:
             cur2.execute(
                 "UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
+        # Transactional outbox (finding #4): the training enqueue commits WITH the row +
+        # lora_status + retrain charge, so a queue outage after commit can't strand the user
+        # in 'training' with no message. Fast-path the send below; outbox_dispatcher backstops.
+        train_msg = {"training_id": str(training_id), "user_id": str(user_id)}
+        outbox_tid = outbox_add(cur2, TRAINING_QUEUE, train_msg)
         conn2.commit()
     finally:
         conn2.close()
 
-    enqueue_training_job({"training_id": str(training_id), "user_id": str(user_id)})
+    outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg)
     logging.info(
         f"training queued: training_id={training_id} user={user_id} "
         f"photos={len(files)} class_word={cword}"
@@ -900,23 +905,14 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
                                    "Your photos will start automatically when it's ready."}),
             mimetype="application/json", status_code=202)
 
-    # reserve_job_slot ALREADY committed the credit charge + the 'queued' job row. If the
-    # queue send fails now, the job would be a charged orphan — stuck 'queued' but never picked
-    # up (the reaper only touches 'processing'/'dispatching'), and never refunded. Undo it:
-    # _mark_failed does the guarded fail + FULL credit refund (rowcount-tied, can't double-refund),
-    # so the user is made whole and can retry for free.
-    try:
-        enqueue_job({"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params})
-    except Exception as e:
-        logging.error(
-            f"enqueue failed for job_id={job_id}; failing + refunding to avoid a "
-            f"charged-but-unqueued orphan: {e}"
-        )
-        _mark_failed(str(job_id))
-        return func.HttpResponse(
-            json.dumps({"error": "Couldn't queue your generation — you were not charged. Please try again."}),
-            mimetype="application/json", status_code=503,
-        )
+    # Transactional outbox (finding #4): reserve_job_slot already wrote the queue message
+    # into the outbox IN THE SAME TRANSACTION as the job row + credit charge, so the send can
+    # no longer be lost. Fast-path it now; if the queue is briefly down the outbox_dispatcher
+    # delivers it — the job is neither failed nor refunded, it just starts a little later.
+    outbox_try_send_now(
+        result.outbox_id, INFERENCE_QUEUE,
+        {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
+    )
 
     return func.HttpResponse(
         json.dumps({"job_id": str(job_id), "status": "queued"}),
@@ -1724,8 +1720,6 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
     On failure: lora_status='failed', and the parked jobs are failed + refunded rather
     than left waiting for an adapter that will never arrive.
     """
-    from shared.queue_client import enqueue_job
-
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -1770,11 +1764,18 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
             user_id,
         )
         parked = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        released = []   # (outbox_id, message) for the fast-path send after commit
         if usable and parked:
             cur.execute(
                 "UPDATE jobs SET status = 'queued' WHERE user_id = ? AND status = 'waiting_lora'",
                 user_id,
             )
+            # Transactional outbox (finding #4): each waiting_lora -> queued release gets its
+            # queue message written IN THIS transaction, so a queue outage after commit can't
+            # leave a parked job stuck 'queued' with no message (the reaper won't recover it).
+            for job_id, job_params in parked:
+                msg = {"job_id": job_id, "user_id": str(user_id), "job_params": job_params}
+                released.append((outbox_add(cur, INFERENCE_QUEUE, msg), msg))
         conn.commit()
     finally:
         conn.close()
@@ -1786,10 +1787,11 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
     )
 
     if usable:
-        # Release: enqueue with no visibility delay so the GPU picks them up at once.
-        for job_id, job_params in parked:
-            enqueue_job({"job_id": job_id, "user_id": str(user_id), "job_params": job_params})
-            logging.info(f"released parked job_id={job_id} for user={user_id}")
+        # Fast-path each release (visibility 0, so the GPU picks them up at once); whatever
+        # doesn't send now, the outbox_dispatcher delivers on its next tick.
+        for outbox_id, msg in released:
+            outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
+            logging.info(f"released parked job_id={msg['job_id']} for user={user_id}")
     else:
         # Never leave a user waiting on an adapter that will never exist.
         # _mark_failed refunds their credits (guarded, once).
@@ -1864,6 +1866,21 @@ def reaper(timer: func.TimerRequest):
     for job_id in stuck:
         logging.warning(f"REAPER: failing stuck job_id={job_id}")
         _mark_failed(job_id)
+
+
+# ── Outbox dispatcher ─────────────────────────────────────────────────────────
+# The retrying half of the transactional outbox (finding #4). submit_job, start_training,
+# and training-completion each write a queue message into the outbox ATOMICALLY with their
+# state change, then fast-path the send. Anything the fast-path could NOT deliver (queue
+# briefly down, or the process died before/after the send) is picked up here and sent, then
+# marked delivered — so a committed job/training can never be left with no queue message.
+# At-least-once delivery, which the queue consumers already tolerate (dispatch guards on
+# external_execution_id + status). Runs every minute; on the fixed-tier DB the scan (a
+# filtered index over only the undelivered rows) is negligible.
+@app.timer_trigger(schedule="0 */1 * * * *", arg_name="timer", run_on_startup=False)
+def outbox_dispatcher(timer: func.TimerRequest):
+    from shared.outbox import outbox_dispatch_pending
+    outbox_dispatch_pending()
 
 
 # ── Training poison handler ───────────────────────────────────────────────────

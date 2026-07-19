@@ -7,13 +7,19 @@ held for the transaction, so concurrent submits across ALL scaled-out instances
 serialize here — no two can both pass the same cap (TOCTOU-safe).
 """
 from .db import new_connection
+from .outbox import outbox_add
+from .queue_client import INFERENCE_QUEUE
 
 
 class ReserveResult:
-    def __init__(self, ok: bool, job_id=None, reason: str = None):
+    def __init__(self, ok: bool, job_id=None, reason: str = None, outbox_id=None):
         self.ok = ok
         self.job_id = job_id
         self.reason = reason   # one of: busy | credits | user_cap | global_cap
+        # For a 'queued' job: the outbox row written ATOMICALLY with the job + credit
+        # charge, so the caller can fast-path the send (and the dispatcher can retry it).
+        # None for 'waiting_lora' rows, which are deliberately not enqueued.
+        self.outbox_id = outbox_id
 
 
 def reserve_job_slot(user_id, input_blob_path, job_params,
@@ -79,7 +85,19 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
             credit_cost, user_id,
         )
-        conn.commit()   # releases the app lock
-        return ReserveResult(True, job_id=job_id)
+
+        # Transactional outbox: for a 'queued' job, write the queue message into the outbox
+        # IN THIS SAME TRANSACTION as the row + credit charge, so the send can no longer be
+        # lost after commit (finding #4). 'waiting_lora' rows are deliberately NOT enqueued
+        # — the training watcher releases them — so they get no outbox row here.
+        outbox_id = None
+        if initial_status == "queued":
+            outbox_id = outbox_add(
+                cur, INFERENCE_QUEUE,
+                {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
+            )
+
+        conn.commit()   # releases the app lock; job + credit charge + outbox row commit together
+        return ReserveResult(True, job_id=job_id, outbox_id=outbox_id)
     finally:
         conn.close()
