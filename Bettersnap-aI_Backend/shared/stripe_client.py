@@ -113,6 +113,24 @@ def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: st
     }, email))
 
 
+def create_topup_checkout(user_id: str, email: str, pack: str, success_url: str, cancel_url: str) -> dict:
+    """Credit top-up for an ACTIVE monthly subscriber — buy more images generated from the
+    EXISTING model (no new training, no plan change). Reuses the one-time pack sizes + Stripe
+    prices, so no new Stripe setup is needed; the webhook grants those images at the account's
+    monthly credit rate. (A dedicated, cheaper top-up price can be swapped in later.)"""
+    price_id = _price_id("onetime", pack)
+    return _post("checkout/sessions", _maybe_email({
+        "mode": "payment",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata[user_id]": user_id,
+        "metadata[plan]": pack,
+        "metadata[payment_type]": "topup",
+    }, email))
+
+
 def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("monthly", plan)
     return _post("checkout/sessions", _maybe_email({

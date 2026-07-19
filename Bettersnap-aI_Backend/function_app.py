@@ -68,7 +68,7 @@ from shared.plans import (
 from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
-    create_onetime_checkout, create_monthly_checkout,
+    create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
 
@@ -2196,6 +2196,62 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+# ── Subscriptions: Add credits (top-up for an active monthly plan) ──
+# The counterpart to the create_subscription gate (finding #6): while a monthly plan is
+# active, the user does NOT buy another plan — they add credits, generated from their
+# EXISTING model (no retrain). Only an active monthly account may top up.
+@app.route(route="subscriptions/credits/topup", methods=["POST"])
+def topup_credits(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    pack        = body.get("pack") or body.get("plan", "")
+    success_url = body.get("success_url", "https://bettersnap.ai/subscription/success")
+    cancel_url  = body.get("cancel_url",  "https://bettersnap.ai/subscription/cancel")
+    email       = (payload.get("email") or payload.get("preferred_username")
+                   or payload.get("upn") or "")
+
+    if pack not in ONE_TIME_PLANS:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid credit pack. Choose: basic, pro, expert"}),
+            mimetype="application/json", status_code=400)
+
+    # Gate: top-ups are ONLY for an active monthly plan. A non-subscriber buys a plan, not
+    # loose credits — otherwise the credit-rate ambiguity #6 warned about creeps back in.
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT subscription_type, stripe_subscription_id FROM users WHERE user_id = ?",
+        user_id)
+    row = cur.fetchone()
+    if not (row and row[0] == "monthly" and row[1]):
+        return func.HttpResponse(
+            json.dumps({"error": "Credit top-ups are only available on an active monthly plan.",
+                        "billing_state": "no_active_monthly"}),
+            mimetype="application/json", status_code=409)
+
+    try:
+        session = create_topup_checkout(user_id, email, pack, success_url, cancel_url)
+    except Exception as e:
+        logging.error(f"Stripe top-up checkout failed: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502)
+
+    return func.HttpResponse(
+        json.dumps({"checkout_url": session["url"], "session_id": session["id"]}),
+        mimetype="application/json", status_code=200)
+
+
 # ── Subscriptions: Cancel ─────────────────────────────────
 @app.route(route="subscriptions/cancel", methods=["POST"])
 def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
@@ -2330,6 +2386,8 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
             _handle_onetime_payment(session, event_id)
         elif payment_type == "monthly":
             _handle_monthly_checkout(session, event_id)
+        elif payment_type == "topup":
+            _handle_topup(session, event_id)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         _handle_invoice_paid(event["data"]["object"], event_id)
@@ -2447,6 +2505,47 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             return
         conn.commit()  # claim + activation commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+    finally:
+        conn.close()
+
+
+def _handle_topup(session: dict, event_id: str):
+    """Grant a credit top-up to an ACTIVE monthly account (finding #6). Adds `images` worth of
+    generation at the account's monthly credit rate (credits_per_image). Idempotent via
+    _claim_event; refuses to apply to a non-monthly account so a top-up can never land on a
+    one-time/idle user and reintroduce the credit-rate ambiguity."""
+    user_id = session.get("metadata", {}).get("user_id")
+    pack    = session.get("metadata", {}).get("plan")
+    if not user_id or pack not in ONE_TIME_PLANS:
+        logging.error(f"topup missing/invalid metadata: {session}")
+        return
+    images = ONE_TIME_PLANS[pack]["images"]
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping topup.")
+            return
+        # Only an active monthly account can receive a top-up; read its plan to get the credit
+        # rate so we add the right number of credits for `images` images.
+        cur.execute(
+            "SELECT plan_name FROM users WHERE user_id = ? AND subscription_type = 'monthly'",
+            user_id)
+        prow = cur.fetchone()
+        if not prow:
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
+                f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
+            return
+        rate = max(1, get_plan(prow[0]).credits_per_image)
+        grant = images * rate
+        cur.execute(
+            "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
+            grant, user_id)
+        conn.commit()  # claim + grant commit atomically
+        logging.info(f"Top-up: user={user_id} pack={pack} +{grant} credits ({images} images)")
     finally:
         conn.close()
 

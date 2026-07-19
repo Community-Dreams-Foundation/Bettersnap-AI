@@ -688,6 +688,21 @@ class BillingGateTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 409)
         self.assertIn("generation_in_flight", resp.body)
 
+    def test_topup_requires_active_monthly(self):
+        # A non-subscriber cannot buy loose credits — they buy a plan.
+        self._cfg.update(subscription_type=None, stripe_subscription_id=None)
+        resp = function_app.topup_credits(self._req(plan="basic"))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("no_active_monthly", resp.body)
+
+    def test_topup_allowed_for_active_monthly(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        with mock.patch.object(function_app, "create_topup_checkout",
+                               return_value={"url": "http://pay", "id": "cs_1"}):
+            resp = function_app.topup_credits(self._req(plan="basic"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("checkout_url", resp.body)
+
 
 class ReaperTests(unittest.TestCase):
     """finding #5 part A: the reaper must measure the processing/dispatching deadline from
