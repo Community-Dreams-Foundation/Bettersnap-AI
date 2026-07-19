@@ -506,7 +506,7 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT lora_status, credits_remaining, retrain_count FROM users WHERE user_id = ?",
+        "SELECT lora_status, credits_remaining, retrain_count, plan_name FROM users WHERE user_id = ?",
         user_id,
     )
     row = cur.fetchone()
@@ -514,6 +514,9 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
     credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
+    # Product this training belongs to (finding #6 foundation) — drives per-product retention
+    # + LoRA lifecycle. get_plan maps plan_name -> plan_type ('one_time' | 'monthly').
+    train_source = get_plan(row[3]).plan_type
 
     if lora_status == "training":
         return func.HttpResponse(
@@ -648,10 +651,10 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         conn2.autocommit = False
         cur2 = conn2.cursor()
         cur2.execute("""
-            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json)
+            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json, source_type)
             OUTPUT INSERTED.training_id
-            VALUES (?, 'queued', ?, ?, ?)
-        """, user_id, len(files), cword, json.dumps(files))
+            VALUES (?, 'queued', ?, ?, ?, ?)
+        """, user_id, len(files), cword, json.dumps(files), train_source)
         training_id = cur2.fetchone()[0]
         if is_retrain:
             cur2.execute(
@@ -861,6 +864,10 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
         credit_cost=cost,
         initial_status="waiting_lora" if parked else "queued",
+        # Tag the job with the product it belongs to (finding #6 foundation): drives the
+        # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
+        # 'one_time' | 'monthly'.
+        source_type=plan.plan_type,
     )
     if not result.ok:
         if result.reason == "credits":

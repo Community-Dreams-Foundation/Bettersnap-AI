@@ -470,6 +470,11 @@ class DailyCapTests(unittest.TestCase):
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 202)
         sys.modules["shared.queue_client"]._send.assert_called_once()
+        # #6 foundation: the job row is tagged with the product (plan_type) it belongs to.
+        job_inserts = [(s, p) for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertTrue(job_inserts, "no jobs INSERT recorded")
+        self.assertIn("source_type", job_inserts[0][0].lower())
+        self.assertIsNotNone(job_inserts[0][1][-1])
 
     def test_send_failure_keeps_job_and_returns_202(self):
         # Transactional outbox: the queue message was written ATOMICALLY with the job + credit

@@ -24,7 +24,8 @@ class ReserveResult:
 
 def reserve_job_slot(user_id, input_blob_path, job_params,
                      per_user_cap, global_cap, lock_timeout_ms=5000,
-                     credit_cost=1, initial_status="queued") -> ReserveResult:
+                     credit_cost=1, initial_status="queued",
+                     source_type=None) -> ReserveResult:
     """credit_cost = total credits this job consumes = image_count *
     plan.credits_per_image (resolved by the caller). One-time plans use
     credits_per_image=1 so credit_cost == number of images. The decrement and the
@@ -75,10 +76,10 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             return ReserveResult(False, reason="global_cap")
 
         cur.execute("""
-            INSERT INTO jobs (user_id, status, input_blob_path, job_params)
+            INSERT INTO jobs (user_id, status, input_blob_path, job_params, source_type)
             OUTPUT INSERTED.job_id
-            VALUES (?, ?, ?, ?)
-        """, user_id, initial_status, input_blob_path, job_params)
+            VALUES (?, ?, ?, ?, ?)
+        """, user_id, initial_status, input_blob_path, job_params, source_type)
         job_id = cur.fetchone()[0]
 
         cur.execute(
