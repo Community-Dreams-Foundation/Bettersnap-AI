@@ -166,10 +166,12 @@ class FakeCursor:
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
-        # Plan + identity-LoRA gate lookup in submit_job.
+        # Plan + identity-LoRA gate lookup in submit_job. submit_job now selects a THIRD
+        # column, credits_remaining (prow[2]), so the row must be a 3-tuple.
         elif "select plan_name, lora_status" in s:
             self._fetch = (self.cfg.get("plan_name", "basic"),
-                           self.cfg.get("lora_status", "ready"))
+                           self.cfg.get("lora_status", "ready"),
+                           self.cfg.get("credits", 20))
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
         elif "select job_params, user_id from jobs" in s:
             self._fetch = (self.cfg.get("job_params",

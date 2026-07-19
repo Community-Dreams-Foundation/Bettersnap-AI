@@ -1,0 +1,42 @@
+name: Backend CI
+
+# Quality gate for the Python Functions app + inference code, on backend changes.
+# The unit tests stub the Azure + DB layer (see Bettersnap-aI_Backend/tests/), so this job
+# needs ONLY Python — no pyodbc / opencv / azure install. The GPU container-image build
+# (bakes SDXL, needs a CUDA base) and the migration runner (needs DB + Key Vault creds)
+# require Azure credentials and belong in a separate deploy workflow, not every PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Bettersnap-aI_Backend/**'
+      - 'main.py'
+      - 'training/**'
+      - '.github/workflows/backend-ci.yml'
+  pull_request:
+    paths:
+      - 'Bettersnap-aI_Backend/**'
+      - 'main.py'
+      - 'training/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Syntax gate: compileall COMPILES (does not import) every module, so heavy runtime
+      # deps (torch, pyodbc, azure) aren't needed to catch syntax errors across the app,
+      # the inference code, and the trainer.
+      - name: Compile all Python (syntax gate)
+        run: python -m compileall -q Bettersnap-aI_Backend main.py training
+
+      # Unit tests stub Azure + DB, so they run on stdlib alone.
+      - name: Backend unit tests
+        working-directory: Bettersnap-aI_Backend
+        run: python -m unittest tests.test_dispatch_logic -v
