@@ -2081,8 +2081,15 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "type": row[1],
             "credits_remaining": row[2],
             "credits_monthly_limit": row[3],
+            # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
+            # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
+            # UI works with no coordinated frontend release.
+            "monthly_quota": row[3],
             "subscription_renewed_at": str(row[4]) if row[4] else None,
             "next_renewal": next_renewal,
+            # ALIAS: Dashboard.tsx / Onboarding.tsx read `renewal_date` — same drift, which is
+            # why "renews on {date}" never appeared.
+            "renewal_date": next_renewal,
             # Dunning: non-null means the latest monthly renewal charge FAILED and Stripe is
             # retrying — the UI should prompt "update your card". Cleared on the next success.
             "payment_failed": bool(row[5]),

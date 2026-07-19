@@ -195,6 +195,12 @@ class FakeCursor:
         elif "select subscription_type, stripe_subscription_id" in s:
             self._fetch = (self.cfg.get("subscription_type"),
                            self.cfg.get("stripe_subscription_id"))
+        # subscription_status: plan/type/credits/quota/renewed/failed/cancel_at
+        elif "select subscription_plan, subscription_type" in s:
+            self._fetch = self.cfg.get(
+                "sub_status_row", ("monthly_pro", "monthly", 120, 200, None, None, None))
+        elif "select purchase_type, plan from pending_purchases" in s:
+            self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
         elif "count(*) from jobs where created_at" in s:
@@ -699,6 +705,18 @@ class BillingGateTests(unittest.TestCase):
         resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
         self.assertEqual(resp.status_code, 202)
         self.assertIn("generation_in_flight", resp.body)
+
+    def test_status_emits_frontend_field_aliases(self):
+        # The frontend reads `monthly_quota` and `renewal_date`; the backend's canonical names
+        # are `credits_monthly_limit` and `next_renewal`. Emitting BOTH is what stops the UI
+        # rendering a blank quota ("X of  credits") and a missing renewal date.
+        self._cfg["sub_status_row"] = ("monthly_pro", "monthly", 120, 200, None, None, None)
+        resp = function_app.subscription_status(self._req())
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["monthly_quota"], 200)                        # what the UI shows
+        self.assertEqual(body["monthly_quota"], body["credits_monthly_limit"])
+        self.assertEqual(body["renewal_date"], body["next_renewal"])        # alias present
 
     def test_topup_requires_active_monthly(self):
         # A non-subscriber cannot buy loose credits — they buy a plan.
