@@ -4,24 +4,37 @@ import time
 import json
 import requests
 from shared.keyvault import get_secret
+from shared.plans import PLANS
 
 STRIPE_API_BASE = "https://api.stripe.com/v1"
 
 # 1 job = 20 credits = 4 image variations
 CREDITS_PER_JOB = 20
 
-# One-time = image packs. No credit concept for the user: internally 1 credit == 1 image,
-# so "credits" granted == images. (credits == images below.)
+# Plan economics are DERIVED from the single source of truth (shared/plans.py) so the billing
+# numbers can never drift from what submit_job enforces. One-time = image packs (1 credit == 1
+# image, so credits == images). Monthly = credit-based (credits_per_image = 5). The ONLY other
+# source is the Stripe dashboard price — reconcile that with reconcile_prices().
+def _cents(p) -> int:
+    return int(round(p.price_usd * 100))
+
 ONE_TIME_PLANS = {
-    "basic":  {"credits": 30, "images": 30, "original_cents": 3500, "discounted_cents": 3500},
-    "pro":    {"credits": 50, "images": 50, "original_cents": 4500, "discounted_cents": 4500},
-    "expert": {"credits": 70, "images": 70, "original_cents": 6500, "discounted_cents": 6500},
+    tier: {
+        "credits":          PLANS[tier].image_count * PLANS[tier].credits_per_image,
+        "images":           PLANS[tier].image_count,
+        "original_cents":   _cents(PLANS[tier]),
+        "discounted_cents": _cents(PLANS[tier]),
+    }
+    for tier in ("basic", "pro", "expert")
 }
 
 MONTHLY_PLANS = {
-    "basic":  {"credits": 100, "images": 20, "price_cents": 2500},
-    "pro":    {"credits": 200, "images": 40, "price_cents": 4500},
-    "expert": {"credits": 300, "images": 60, "price_cents": 6500},
+    tier: {
+        "credits":     PLANS[f"monthly_{tier}"].monthly_images * PLANS[f"monthly_{tier}"].credits_per_image,
+        "images":      PLANS[f"monthly_{tier}"].monthly_images,
+        "price_cents": _cents(PLANS[f"monthly_{tier}"]),
+    }
+    for tier in ("basic", "pro", "expert")
 }
 
 
@@ -45,6 +58,34 @@ def _post(path: str, data: dict) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _get(path: str) -> dict:
+    resp = requests.get(f"{STRIPE_API_BASE}/{path}", auth=(_secret_key(), ""), timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def reconcile_prices() -> list:
+    """Verify the DERIVED cents (from plans.py) match the ACTUAL Stripe price amounts — the
+    third source of truth. Returns a list of mismatches (empty = all aligned). Run as an ops
+    check / in CI so a Stripe-dashboard edit that diverges from plans.py is caught early."""
+    out = []
+    for kind, table, cents_key in (
+        ("onetime", ONE_TIME_PLANS, "discounted_cents"),
+        ("monthly", MONTHLY_PLANS, "price_cents"),
+    ):
+        for tier, info in table.items():
+            expected = info[cents_key]
+            try:
+                actual = _get(f"prices/{_price_id(kind, tier)}").get("unit_amount")
+            except Exception as e:
+                out.append({"plan": f"{kind}-{tier}", "error": str(e)})
+                continue
+            if actual != expected:
+                out.append({"plan": f"{kind}-{tier}",
+                            "plans_py_cents": expected, "stripe_cents": actual})
+    return out
 
 
 def _maybe_email(params: dict, email: str) -> dict:
@@ -89,8 +130,17 @@ def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: st
 
 
 def cancel_subscription(stripe_subscription_id: str) -> dict:
+    # Schedule cancellation at period end (not immediate). The returned subscription carries
+    # current_period_end — the exact date access ends — which the caller records for the UI.
     return _post(f"subscriptions/{stripe_subscription_id}", {
         "cancel_at_period_end": "true",
+    })
+
+
+def reactivate_subscription(stripe_subscription_id: str) -> dict:
+    """Undo a pending period-end cancellation — the subscription keeps renewing."""
+    return _post(f"subscriptions/{stripe_subscription_id}", {
+        "cancel_at_period_end": "false",
     })
 
 

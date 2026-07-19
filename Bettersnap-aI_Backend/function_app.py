@@ -62,7 +62,7 @@ from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout,
-    cancel_subscription, verify_webhook,
+    cancel_subscription, reactivate_subscription, verify_webhook,
 )
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -814,8 +814,13 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     if plan.plan_type == "monthly":
         requested = int(body.get("image_count") or plan.min_session_images)
         max_by_credits = credits_remaining // plan.credits_per_image
-        image_count = max(plan.min_session_images,
-                          min(requested, plan.monthly_images, max_by_credits))
+        # Honor the min-session floor normally, but NEVER floor above what the user's remaining
+        # credits can pay for — otherwise a user with less than one full session's worth of
+        # credits could never spend them (every submit asked for the floor and 402'd, stranding
+        # the credits). Keep at least 1 so a genuinely broke user still gets an honest 402.
+        upper = min(requested, plan.monthly_images, max_by_credits)
+        floor = min(plan.min_session_images, max_by_credits)
+        image_count = max(1, floor, upper)
     else:
         image_count = plan.image_count
     cost = credit_cost(plan, image_count)
@@ -1964,6 +1969,16 @@ def list_plans(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ── Subscriptions: Status ─────────────────────────────────
+def _add_one_month(dt):
+    """Add one calendar month, clamping the day for shorter months (Jan 31 -> Feb 28/29).
+    Matches Stripe's monthly billing cadence far better than a fixed +30 days."""
+    import calendar
+    m = dt.month + 1
+    y = dt.year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
+
+
 @app.route(route="subscriptions/status", methods=["GET"])
 def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -1976,18 +1991,20 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     cursor = conn.cursor()
     cursor.execute(
         "SELECT subscription_plan, subscription_type, credits_remaining, "
-        "credits_monthly_limit, subscription_renewed_at FROM users WHERE user_id = ?",
+        "credits_monthly_limit, subscription_renewed_at, payment_failed_at, "
+        "subscription_cancel_at FROM users WHERE user_id = ?",
         user_id,
     )
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
-    # Compute the NEXT renewal (last renewal + ~1 month) so the frontend can show
-    # "renews {date}" without date math. Only meaningful for an active monthly plan.
+    # Compute the NEXT renewal so the frontend can show "renews {date}". Stripe bills on a
+    # MONTHLY cadence (same day-of-month each cycle), so add one calendar month — NOT 30 days,
+    # which drifts ~5 days/year off the real billing date. Only meaningful for active monthly.
     next_renewal = None
     if row[1] == "monthly" and row[4]:
-        next_renewal = str(row[4] + timedelta(days=30))
+        next_renewal = str(_add_one_month(row[4]))
 
     return func.HttpResponse(
         json.dumps({
@@ -2003,6 +2020,14 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "credits_monthly_limit": row[3],
             "subscription_renewed_at": str(row[4]) if row[4] else None,
             "next_renewal": next_renewal,
+            # Dunning: non-null means the latest monthly renewal charge FAILED and Stripe is
+            # retrying — the UI should prompt "update your card". Cleared on the next success.
+            "payment_failed": bool(row[5]),
+            "payment_failed_at": str(row[5]) if row[5] else None,
+            # Cancellation: non-null means a period-end cancel is scheduled — the UI shows
+            # "cancels on {cancel_at}" and offers Reactivate (POST /subscriptions/reactivate).
+            "cancel_pending": bool(row[6]),
+            "cancel_at": str(row[6]) if row[6] else None,
         }),
         mimetype="application/json",
         status_code=200,
@@ -2103,7 +2128,7 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        cancel_subscription(stripe_sub_id)
+        result = cancel_subscription(stripe_sub_id)
     except Exception as e:
         logging.error(f"Stripe cancel failed for user {user_id}: {e}")
         return func.HttpResponse(
@@ -2111,8 +2136,72 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json", status_code=502,
         )
 
+    # Record the scheduled cancellation (exact date from Stripe's current_period_end) so the
+    # UI can show "cancels on {date}" while the plan is still active, and so it can be undone.
+    cancel_at = None
+    ts = result.get("current_period_end")
+    if ts:
+        cancel_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
+        cursor.execute(
+            "UPDATE users SET subscription_cancel_at = ? WHERE user_id = ?",
+            cancel_at, user_id,
+        )
+
     return func.HttpResponse(
-        json.dumps({"message": "Subscription will cancel at end of billing period"}),
+        json.dumps({
+            "message": "Subscription will cancel at end of billing period",
+            "cancel_at": str(cancel_at) if cancel_at else None,
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+# ── Subscriptions: Reactivate (undo a pending cancellation) ──
+@app.route(route="subscriptions/reactivate", methods=["POST"])
+def reactivate_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stripe_subscription_id, subscription_type, subscription_cancel_at "
+        "FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("User not found", status_code=404)
+
+    stripe_sub_id, sub_type, cancel_at = row[0], row[1], row[2]
+    if sub_type != "monthly" or not stripe_sub_id:
+        return func.HttpResponse(
+            json.dumps({"error": "No monthly subscription to reactivate"}),
+            mimetype="application/json", status_code=400,
+        )
+    if not cancel_at:
+        return func.HttpResponse(
+            json.dumps({"error": "Subscription is not scheduled to cancel"}),
+            mimetype="application/json", status_code=400,
+        )
+
+    try:
+        reactivate_subscription(stripe_sub_id)
+    except Exception as e:
+        logging.error(f"Stripe reactivate failed for user {user_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502,
+        )
+
+    cursor.execute(
+        "UPDATE users SET subscription_cancel_at = NULL WHERE user_id = ?", user_id)
+    return func.HttpResponse(
+        json.dumps({"message": "Subscription reactivated — it will keep renewing"}),
         mimetype="application/json",
         status_code=200,
     )
@@ -2149,6 +2238,9 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         _handle_invoice_paid(event["data"]["object"], event_id)
+
+    elif event_type == "invoice.payment_failed":
+        _handle_payment_failed(event["data"]["object"], event_id)
 
     elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
         _handle_subscription_ended(event["data"]["object"], event_id)
@@ -2280,12 +2372,39 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
         cur.execute(
             """UPDATE users SET
                 credits_remaining       = credits_monthly_limit,
-                subscription_renewed_at = GETUTCDATE()
+                subscription_renewed_at = GETUTCDATE(),
+                payment_failed_at       = NULL
             WHERE stripe_subscription_id = ?""",
             sub_id,
         )
         conn.commit()  # claim + reset commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
+    finally:
+        conn.close()
+
+
+def _handle_payment_failed(invoice: dict, event_id: str):
+    """A monthly renewal charge FAILED. Flag the account (payment_failed_at) so the UI can
+    prompt the user to update their card — but do NOT cut access here: Stripe keeps retrying
+    (dunning) for days, and the terminal canceled/unpaid is handled by
+    _handle_subscription_ended. The flag is cleared automatically by the next successful
+    invoice.paid (recovery)."""
+    sub_id = invoice.get("subscription")
+    if not sub_id:
+        return
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping payment-failed flag.")
+            return
+        cur.execute(
+            "UPDATE users SET payment_failed_at = GETUTCDATE() WHERE stripe_subscription_id = ?",
+            sub_id,
+        )
+        conn.commit()
+        logging.warning(f"Monthly payment FAILED for subscription={sub_id}; flagged for dunning.")
     finally:
         conn.close()
 
@@ -2318,6 +2437,8 @@ def _handle_subscription_ended(sub: dict, event_id: str):
                     plan_name              = 'trial',
                     stripe_subscription_id = NULL,
                     credits_monthly_limit  = 20,
+                    subscription_cancel_at = NULL,
+                    payment_failed_at      = NULL,
                     retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())
                 WHERE stripe_subscription_id = ?""",
                 RETENTION_DAYS, sub_id,
