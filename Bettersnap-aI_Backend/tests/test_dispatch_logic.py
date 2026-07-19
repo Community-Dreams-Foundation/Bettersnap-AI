@@ -77,9 +77,13 @@ class _QueueMessage:
 
 # azure.* stubs
 _mod("azure")
+# TimerRequest is needed by the timer-trigger function annotations. Python 3.11 (the deploy
+# target / CI) evaluates those annotations at import; 3.14 defers them (PEP 649), which is why
+# a missing stub attr only surfaced on 3.11. Provide every func.* type function_app annotates.
 _mod("azure.functions",
      FunctionApp=_FakeFunctionApp, AuthLevel=_AuthLevel,
-     HttpResponse=_HttpResponse, HttpRequest=_HttpRequest, QueueMessage=_QueueMessage)
+     HttpResponse=_HttpResponse, HttpRequest=_HttpRequest, QueueMessage=_QueueMessage,
+     TimerRequest=type("TimerRequest", (), {}))
 _mod("azure.storage")
 _mod("azure.storage.blob",
      generate_blob_sas=mock.Mock(return_value="sas"),
