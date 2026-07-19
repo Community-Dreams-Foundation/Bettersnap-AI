@@ -298,6 +298,10 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.assert_called_once()
         gl.mark_dispatched.assert_called_once()
         gl.release_dispatch_lease.assert_called_once()
+        # #5A: the queued->dispatching claim stamps dispatched_at, so the reaper can measure
+        # the processing deadline from GPU-run start instead of submit time.
+        self.assertTrue(any("dispatched_at = getutcdate()" in s.lower()
+                            for s, _ in self._cfg["executed"]))
 
     # 4) over-cap -> defers, does not start
     def test_over_cap_defers(self):
@@ -632,6 +636,28 @@ class PlanAffordabilityTests(unittest.TestCase):
     def test_default_plan_exists(self):
         from shared import plans
         self.assertIn(plans.DEFAULT_PLAN_KEY, plans.PLANS)
+
+
+class ReaperTests(unittest.TestCase):
+    """finding #5 part A: the reaper must measure the processing/dispatching deadline from
+    dispatched_at (when the GPU run started), NOT created_at (submit) — so a healthy job that
+    merely waited in the queue is never reaped."""
+
+    def test_reaper_measures_from_dispatched_at_not_created_at(self):
+        cfg = {}  # FakeCursor returns no rows -> nothing reaped; we assert the SQL shape
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+        sqls = [s.lower() for s, _ in cfg["executed"]]
+        proc = [s for s in sqls if "status = 'processing'" in s]
+        disp = [s for s in sqls if "status = 'dispatching'" in s]
+        self.assertTrue(proc, "reaper did not scan 'processing'")
+        self.assertTrue(disp, "reaper did not scan 'dispatching'")
+        # Both scans must age from COALESCE(dispatched_at, created_at)...
+        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in proc + disp))
+        # ...and must NOT age from the bare submit-time column.
+        self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
+                         "reaper still measures from created_at (submit time)")
 
 
 if __name__ == "__main__":

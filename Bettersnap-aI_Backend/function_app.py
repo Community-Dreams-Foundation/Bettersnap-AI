@@ -20,10 +20,16 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # Kill-switch pause uses a long, fixed delay (NOT the backoff) so an intentional
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
-# Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds.
-# 'processing' threshold must be >> inference wall-time. Measured: 172s startup +
-# ~7.9s/image, so even a 65-image Expert job is ~12 min.
-REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "45"))
+# Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds,
+# measured from dispatched_at (COALESCE created_at) — NOT submit time — so queue wait
+# doesn't count against the deadline (finding #5, part A).
+# The 'processing' threshold must exceed the LONGEST a healthy run can legitimately take.
+# The GPU job's own replicaTimeout is 7200s = 120 min (job.yaml), so the GPU itself kills
+# anything past that; a row still 'processing' beyond ~120 min from dispatch is therefore
+# genuinely dead (OOM/SIGKILL left it), not slow. Default 130 keeps the reaper strictly
+# less aggressive than the GPU's hard cap, so it can NEVER false-fail a healthy run. (Was
+# 45, which — measured from submit — could reap a large job that merely waited in queue.)
+REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "130"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
 # ── Identity-LoRA training ────────────────────────────────────────────────
@@ -1207,7 +1213,7 @@ def admin_stuck_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     cursor.execute(
         "SELECT job_id, user_id, status, external_execution_id, created_at "
         "FROM jobs WHERE status IN ('dispatching', 'processing') "
-        "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+        "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
         -minutes,
     )
     jobs = [
@@ -1367,7 +1373,11 @@ def process_inference_job(msg: func.QueueMessage):
             # 5) Claim the job atomically: only the writer that flips queued ->
             #    dispatching proceeds (guards against any double-claim).
             cur.execute(
-                "UPDATE jobs SET status = 'dispatching' WHERE job_id = ? AND status = 'queued'",
+                # Stamp dispatched_at HERE (the queued -> dispatching claim): it marks when the
+                # GPU run begins, so the reaper can measure the processing deadline from it and
+                # not penalise a job for queue wait (finding #5, part A).
+                "UPDATE jobs SET status = 'dispatching', dispatched_at = GETUTCDATE() "
+                "WHERE job_id = ? AND status = 'queued'",
                 job_id,
             )
             claimed = cur.rowcount == 1
@@ -1835,10 +1845,12 @@ def handle_poison_job(msg: func.QueueMessage):
 
 
 # ── Timer-trigger reaper ──────────────────────────────────────────────────────
-# Runs every 10 minutes. Finds jobs stuck in 'processing' past the inference
-# wall-time ceiling (REAPER_STUCK_MINUTES, default 45 min — well above the
-# SDXL 4-variation worst-case ≈ 20 min). Also reaps 'dispatching' rows the
-# dispatcher crashed mid-claim (REAPER_DISPATCHING_MINUTES, default 15 min).
+# Runs every 10 minutes. Finds jobs stuck in 'processing' past the wall-time ceiling
+# (REAPER_STUCK_MINUTES, default 130 min), measured from dispatched_at (COALESCE
+# created_at) so queue wait doesn't count — 130 sits just above the GPU job's own
+# 120-min replicaTimeout, so a still-'processing' row past it is genuinely dead, never a
+# slow-but-healthy run (finding #5). Also reaps 'dispatching' rows the dispatcher crashed
+# mid-claim (REAPER_DISPATCHING_MINUTES, default 15 min).
 # Both paths call _mark_failed: guarded transition + one-time credit refund.
 # An OOM SIGKILL (exit 137) leaves the row in 'processing' because the process
 # is killed before it can write — this reaper is the ONLY thing that clears it.
@@ -1847,16 +1859,19 @@ def reaper(timer: func.TimerRequest):
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # Measure from dispatched_at (when the GPU run started), COALESCE to created_at for
+        # rows written before migration 015 — so queue wait doesn't count against the
+        # deadline and a healthy job that merely waited isn't reaped (finding #5, part A).
         cur.execute(
             "SELECT job_id FROM jobs WHERE status = 'processing' "
-            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_STUCK_MINUTES,
         )
         stuck = [str(r[0]) for r in cur.fetchall()]
 
         cur.execute(
             "SELECT job_id FROM jobs WHERE status = 'dispatching' "
-            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_DISPATCHING_MINUTES,
         )
         stuck += [str(r[0]) for r in cur.fetchall()]
