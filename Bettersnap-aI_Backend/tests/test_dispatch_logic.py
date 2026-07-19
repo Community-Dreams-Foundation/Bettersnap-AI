@@ -649,6 +649,12 @@ class PlanAffordabilityTests(unittest.TestCase):
         from shared import plans
         self.assertIn(plans.DEFAULT_PLAN_KEY, plans.PLANS)
 
+    def test_monthly_session_minimum_is_5(self):
+        # Step 5/#6: a monthly generation session is at least 5 images.
+        from shared import plans
+        for key in ("monthly_basic", "monthly_pro", "monthly_expert"):
+            self.assertEqual(plans.PLANS[key].min_session_images, 5)
+
 
 class BillingGateTests(unittest.TestCase):
     """finding #6: ONE active product at a time — a PLAN purchase that collides with an active

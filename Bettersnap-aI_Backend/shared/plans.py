@@ -88,17 +88,17 @@ PLANS = {
     "monthly_basic": Plan(
         key="monthly_basic", name="Basic (Monthly)", price_usd=25, image_count=20,
         max_attires=2, max_backgrounds=2, category_rule="single_type",
-        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=20,
+        plan_type="monthly", credits_per_image=5, min_session_images=5, monthly_images=20,
     ),
     "monthly_pro": Plan(
         key="monthly_pro", name="Pro (Monthly)", price_usd=45, image_count=40,
         max_attires=3, max_backgrounds=3, category_rule="mixable",
-        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=40,
+        plan_type="monthly", credits_per_image=5, min_session_images=5, monthly_images=40,
     ),
     "monthly_expert": Plan(
         key="monthly_expert", name="Expert (Monthly)", price_usd=65, image_count=60,
         max_attires=5, max_backgrounds=5, category_rule="mixable",
-        plan_type="monthly", credits_per_image=5, min_session_images=4, monthly_images=60,
+        plan_type="monthly", credits_per_image=5, min_session_images=5, monthly_images=60,
     ),
 }
 
