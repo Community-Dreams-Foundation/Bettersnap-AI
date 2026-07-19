@@ -5,7 +5,8 @@ MODE=train  -> run the per-user LoRA trainer  (/workspace/run_training.py)
 otherwise   -> run inference / generation      (/app/main.py)
 
 Each script assumes it runs from its own directory (main.py does `import catalog`
-from /app; run_training.py writes under /workspace), so we chdir before exec. os.execvp
+from /app; run_training.py is imported/exec'd from /workspace but writes its data and
+LoRA output under /tmp, which is writable at runtime), so we chdir before exec. os.execvp
 replaces this process, preserving the child's exit code for ACA.
 """
 import os

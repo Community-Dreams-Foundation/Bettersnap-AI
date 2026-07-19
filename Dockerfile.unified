@@ -85,6 +85,18 @@ RUN mkdir -p /models/realesrgan && \
     curl -fL -o /models/realesrgan/RealESRGAN_x4plus.pth \
       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 
+# ── IP-Adapter Plus-Face (SDXL, CLIP ViT-H) ──────────────────────────────────────
+# COMMERCIAL-SAFE face conditioning: uses a CLIP image encoder (Apache lineage), NOT
+# InsightFace/ArcFace — so unlike InstantID/FaceID it carries no non-commercial license.
+# Strengthens per-user likeness by conditioning on the user's OWN face crop at gen time.
+RUN huggingface-cli download h94/IP-Adapter \
+        sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors \
+        --local-dir /models/ip-adapter && \
+    huggingface-cli download h94/IP-Adapter \
+        --include "models/image_encoder/*" \
+        --local-dir /models/ip-adapter && \
+    rm -rf /root/.cache/huggingface
+
 # ── Inference app (/app) ─────────────────────────────────────────────────────────
 COPY rrdbnet.py .
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py

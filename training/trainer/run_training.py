@@ -71,10 +71,15 @@ BASE_MODEL    = os.environ.get("BASE_MODEL", "/models/sdxl-base")
 VAE_MODEL     = os.environ.get("VAE_MODEL", "/models/sdxl-vae")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", "fp16")
 
-WORK  = "/workspace"
-DATA  = "/workspace/instance_data"
-CLASS = "/workspace/class_data"
-OUT   = "/workspace/lora_out"
+# WORK holds the training scripts baked into the image (read-only is fine). The instance
+# data, class images and LoRA output must go to a WRITABLE dir — in the unified train+infer
+# image /workspace is NOT writable at runtime (it's a COPY target, not a WORKDIR), so the
+# data/output dirs live under /tmp. Overridable via TRAIN_RUNDIR.
+WORK   = "/workspace"
+RUNDIR = os.environ.get("TRAIN_RUNDIR", "/tmp/bettersnap_train")
+DATA   = f"{RUNDIR}/instance_data"
+CLASS  = f"{RUNDIR}/class_data"
+OUT    = f"{RUNDIR}/lora_out"
 for d in (DATA, CLASS, OUT):
     os.makedirs(d, exist_ok=True)
 log.info(f"CONFIG user={USER_ID} n_files={len(FILES)} rank={RANK} steps={STEPS} "

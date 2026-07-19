@@ -1,6 +1,7 @@
 *
 !Dockerfile
 !Dockerfile.unified
+!Dockerfile.app
 !entrypoint.py
 !main.py
 !requirements.txt

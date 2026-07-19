@@ -122,6 +122,9 @@ def get_db_connection(max_attempts: int = 5, base_delay: float = 3.0):
 # ── Global pipeline (SDXL txt2img) + Real-ESRGAN upscaler ─
 pipe     = None
 upscaler = None   # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause) — 2K post-process
+ip_adapter_ok = False   # IP-Adapter Plus-Face loaded successfully?
+img2img_pipe = None     # SDXL img2img (shares pipe's UNet/LoRA/IP-Adapter) for face refine
+_face_cascade = None    # cv2 Haar cascade for locating the face to refine
 
 # ─────────────────────────────────────────────────────────
 # PRODUCT-LEVEL MENU + PROMPT CONFIG (general — identical for every user)
@@ -181,6 +184,27 @@ SEEDS = [42, 1337, 9999, 77777, 271828, 161803, 314159, 112358]
 #  • LoRA identity weight ~1.0: let the user's own trained identity dominate.
 DEFAULT_CFG           = float(os.environ.get("GUIDANCE_SCALE", "6.0"))
 DEFAULT_LORA_WEIGHT   = float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0"))
+# IP-Adapter Plus-Face conditioning strength (0 disables). 0.5-0.7 adds identity from the
+# user's own face crop without fighting the prompt/attire. Env-tunable for A/B testing.
+IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.6"))
+# Face-inpaint ("ADetailer") pass: after the base image, re-render JUST the face crop at
+# 1024 (with LoRA + IP-Adapter) so eyes/skin get real detail instead of upscaler-guessed
+# mush. STRENGTH controls how much is rewritten (0.35-0.5); too high drifts the face.
+FACE_REFINE_ENABLE    = os.environ.get("FACE_REFINE", "1").strip() != "0"
+FACE_REFINE_STRENGTH  = float(os.environ.get("FACE_REFINE_STRENGTH", "0.45"))
+# WHOLE-IMAGE realism pass: a light img2img over the FULL upscaled (2048) image. The plastic
+# hair + painterly look the user flagged comes mostly from Real-ESRGAN over-smoothing the
+# ENTIRE frame (not just the face) — a face-only refine can't reach the hair top or fabric.
+# Running img2img AFTER the upscale is the only ordering where re-injected texture survives
+# (ESRGAN already ran and can't re-smooth it). Low strength keeps identity/composition; it
+# just rebuilds fine detail (hair strands, skin pores, fabric weave). Shares pipe's UNet so
+# the identity LoRA + IP-Adapter stay active. Env-tunable so strength is A/B'd without a rebuild.
+REALISM_PASS_ENABLE   = os.environ.get("REALISM_PASS", "1").strip() != "0"
+REALISM_PASS_STRENGTH = float(os.environ.get("REALISM_STRENGTH", "0.18"))
+# Film grain: real camera sensors add luminance noise; a perfectly clean frame reads as "AI".
+# A subtle grain at the very end (post-refine, pre-watermark) is the cheapest realism win.
+# GRAIN_AMOUNT is the noise sigma in 0-255 space (~4-8 is subtle). 0 disables.
+FILM_GRAIN_AMOUNT     = float(os.environ.get("GRAIN_AMOUNT", "5.0"))
 DEFAULT_STEPS         = int(os.environ.get("NUM_INFERENCE_STEPS", "30"))
 DEFAULT_WIDTH         = int(os.environ.get("GEN_WIDTH", "1024"))
 DEFAULT_HEIGHT        = int(os.environ.get("GEN_HEIGHT", "1024"))
@@ -262,7 +286,7 @@ def age_to_phrase(age_range: str) -> str:
 # ─────────────────────────────────────────────────────────
 
 def load_base_model():
-    global pipe, upscaler
+    global pipe, upscaler, ip_adapter_ok, img2img_pipe, _face_cascade
     if pipe is not None:
         return
 
@@ -290,6 +314,39 @@ def load_base_model():
             use_safetensors=True,
         )
         pipe = pipe.to("cuda")
+
+        # IP-Adapter Plus-Face (CLIP ViT-H, commercial-safe): stronger per-user identity by
+        # conditioning on the user's OWN face crop (applied per job in run_inference). Works
+        # alongside the identity LoRA (LoRA edits existing attention; IP-Adapter adds image
+        # cross-attention). Graceful: any failure falls back to LoRA-only generation.
+        ip_adapter_ok = False
+        if IP_ADAPTER_SCALE > 0:
+            try:
+                pipe.load_ip_adapter(
+                    "/models/ip-adapter",
+                    subfolder="sdxl_models",
+                    weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+                    image_encoder_folder="models/image_encoder",
+                )
+                ip_adapter_ok = True
+                write_debug("IP-Adapter Plus-Face loaded (CLIP ViT-H)")
+            except Exception as e:
+                write_debug(f"IP-Adapter load FAILED (LoRA-only): {e}")
+
+        # Face-inpaint pipe: an SDXL img2img that SHARES pipe's components (same UNet, so the
+        # identity LoRA + IP-Adapter processors carry over automatically — no re-load, no
+        # dilution). Plus a Haar face detector. Both graceful: on failure we skip the refine.
+        if FACE_REFINE_ENABLE:
+            try:
+                import cv2
+                from diffusers import StableDiffusionXLImg2ImgPipeline
+                img2img_pipe = StableDiffusionXLImg2ImgPipeline(**pipe.components)
+                _face_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+                write_debug("Face-inpaint img2img pipe + detector ready")
+            except Exception as e:
+                img2img_pipe = None
+                write_debug(f"Face-inpaint setup FAILED (skipping refine): {e}")
 
         # Real-ESRGAN x4 upscaler (RRDBNet, BSD-3-Clause — COMMERCIAL-SAFE) for the
         # 2K post-process. Weight baked at /models/realesrgan (params_ema key). Kept
@@ -555,13 +612,26 @@ def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
                     f"(transitioned={transitioned}, credits_refunded={refund if transitioned else 0})"
                 )
             elif status == "completed":
+                # GUARDED like the 'failed' path above: only complete a job that is still
+                # in-flight. Without this, a job the reaper already marked 'failed' (and
+                # REFUNDED) could be overwritten to 'completed' when the GPU finishes late —
+                # the user would keep BOTH the refund AND the delivered images. If the row is
+                # already terminal, this is a no-op (rowcount 0) and we leave it 'failed'.
                 cursor.execute("""
                     UPDATE jobs
                     SET status = ?, output_blob_path = ?, completed_at = GETUTCDATE()
-                    WHERE job_id = ?
+                    WHERE job_id = ? AND status NOT IN ('failed', 'completed')
                 """, status, output_json, job_id)
+                transitioned = cursor.rowcount == 1
                 conn.commit()
-                log.info(f"✅ Job {job_id} status updated to 'completed'")
+                if transitioned:
+                    log.info(f"✅ Job {job_id} status updated to 'completed'")
+                else:
+                    log.warning(
+                        f"Job {job_id} completion IGNORED — row already terminal (likely reaped "
+                        f"to 'failed' and refunded). Not overwriting, to avoid a double credit "
+                        f"(refund + delivered images)."
+                    )
             else:
                 # non-terminal (e.g. 'processing') — do NOT stamp completed_at
                 cursor.execute("""
@@ -634,6 +704,153 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
         log.info(f"✅ Completion email (dashboard) sent to {to_email} for job_id={job_id}")
     except Exception as e:
         log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
+
+
+def _get_ref_faces(user_id: str, n: int = 3) -> list:
+    """Download up to `n` of the user's face crops (from the `inputs` container) to use as
+    IP-Adapter Plus-Face reference images. These are the SAME crops the LoRA trained on, so
+    the two identity signals agree. Returns a list of PIL RGB images (possibly empty)."""
+    import io
+    from PIL import Image
+    refs = []
+    for i in range(n):
+        blob_name = f"{user_id}/input/crop_upperbody/img{i}.jpg"
+        try:
+            data = blob_service.get_blob_client(container="inputs", blob=blob_name).download_blob().readall()
+            refs.append(Image.open(io.BytesIO(data)).convert("RGB"))
+        except Exception as e:
+            write_debug(f"IP-Adapter ref img{i} unavailable: {e}")
+    return refs
+
+
+def _refine_face(image, ref_face, face_prompt):
+    """ADetailer-style face fix: locate the largest face, re-render JUST that crop at 1024
+    (LoRA + IP-Adapter still active via the shared UNet), and blend it back with a feathered
+    mask. This is what turns upscaler-mushy eyes/skin into sharp, exact detail. Graceful:
+    returns the ORIGINAL image on any miss so it can never break a generation."""
+    if img2img_pipe is None or _face_cascade is None:
+        return image
+    try:
+        import cv2, numpy as np
+        from PIL import Image as _Image, ImageFilter
+        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+        faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
+                                                minSize=(96, 96))
+        if len(faces) == 0:
+            write_debug("face-refine: no face detected, using base image")
+            return image
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        # Asymmetric padding: reach further UP to capture the HAIR above the face box (Haar
+        # only boxes eyes-to-chin), so the re-render produces real hair strands, not the
+        # upscaler's plastic mush. Wider sides/bottom keep the blend seam off the face.
+        pad_x   = int(0.40 * w)
+        pad_top = int(0.85 * h)
+        pad_bot = int(0.45 * h)
+        x0 = max(0, x - pad_x)
+        y0 = max(0, y - pad_top)
+        x1 = min(image.width,  x + w + pad_x)
+        y1 = min(image.height, y + h + pad_bot)
+        crop = image.crop((x0, y0, x1, y1))
+        cw, ch = crop.size
+        crop_1024 = crop.resize((1024, 1024), _Image.LANCZOS)
+        kwargs = dict(
+            prompt=face_prompt,
+            # Push hard AGAINST the "AI plastic" look the user flagged on face + hair.
+            negative_prompt=(os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
+                             + ", plastic skin, airbrushed, smooth waxy skin, cgi, 3d render, "
+                               "doll, overprocessed, blurry hair"),
+            image=crop_1024,
+            strength=FACE_REFINE_STRENGTH,
+            num_inference_steps=DEFAULT_STEPS,
+            guidance_scale=DEFAULT_CFG,
+        )
+        if ref_face is not None and ip_adapter_ok:
+            kwargs["ip_adapter_image"] = ref_face
+        try:
+            _r = img2img_pipe(**kwargs).images[0]
+        except Exception as e_ip:
+            # If IP-Adapter on the img2img path is unhappy, still do a LoRA-only face refine
+            # (which alone fixes eye/skin detail) rather than skipping the whole thing.
+            if "ip_adapter_image" in kwargs:
+                write_debug(f"face-refine: img2img+IP failed ({e_ip}); retrying LoRA-only")
+                kwargs.pop("ip_adapter_image")
+                _r = img2img_pipe(**kwargs).images[0]
+            else:
+                raise
+        refined = _r.resize((cw, ch), _Image.LANCZOS)
+        # Feathered blend so the paste seam is invisible.
+        b = max(1, int(0.12 * min(cw, ch)))
+        m = np.zeros((ch, cw), dtype=np.uint8)
+        m[b:ch - b, b:cw - b] = 255
+        mask = _Image.fromarray(m).filter(ImageFilter.GaussianBlur(max(1, b // 2)))
+        out = image.copy()
+        out.paste(refined, (x0, y0), mask)
+        write_debug(f"face-refine OK: crop ({x0},{y0})-({x1},{y1}) "
+                    f"strength={FACE_REFINE_STRENGTH} ip={'yes' if (ref_face is not None and ip_adapter_ok) else 'no'}")
+        return out
+    except Exception as e:
+        write_debug(f"face-refine FAILED (using base image): {e}")
+        return image
+
+
+def _realism_pass(image, ref_face, prompt):
+    """Light WHOLE-IMAGE img2img over the upscaled frame to de-plasticize hair/skin/fabric
+    that Real-ESRGAN over-smoothed. Runs at the 2048 resolution (A100 80GB has ample VRAM;
+    the base pass peaked ~11GB). Low strength => identity, pose, attire, and background are
+    preserved; only fine texture is rebuilt. Identity LoRA + IP-Adapter ride along on the
+    shared UNet. Graceful: returns the input image on any miss so it can't break a job."""
+    if img2img_pipe is None or REALISM_PASS_STRENGTH <= 0:
+        return image
+    try:
+        kwargs = dict(
+            prompt=prompt,
+            negative_prompt=(os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
+                             + ", plastic skin, airbrushed, smooth waxy skin, cgi, 3d render, "
+                               "digital painting, illustration, overprocessed, blurry hair, "
+                               "smooth hair"),
+            image=image,
+            strength=REALISM_PASS_STRENGTH,
+            num_inference_steps=DEFAULT_STEPS,
+            guidance_scale=DEFAULT_CFG,
+        )
+        if ref_face is not None and ip_adapter_ok:
+            kwargs["ip_adapter_image"] = ref_face
+        try:
+            out = img2img_pipe(**kwargs).images[0]
+        except Exception as e_ip:
+            if "ip_adapter_image" in kwargs:
+                write_debug(f"realism-pass: img2img+IP failed ({e_ip}); retrying LoRA-only")
+                kwargs.pop("ip_adapter_image")
+                out = img2img_pipe(**kwargs).images[0]
+            else:
+                raise
+        # img2img may return the native training size (1024); restore the 2K frame.
+        if out.size != image.size:
+            from PIL import Image as _Image
+            out = out.resize(image.size, _Image.LANCZOS)
+        write_debug(f"realism-pass OK: {image.size} strength={REALISM_PASS_STRENGTH} "
+                    f"ip={'yes' if (ref_face is not None and ip_adapter_ok) else 'no'}")
+        return out
+    except Exception as e:
+        write_debug(f"realism-pass FAILED (using upscaled image): {e}")
+        return image
+
+
+def _add_film_grain(image):
+    """Add subtle monochrome sensor grain so the frame reads as a photo, not a clean render.
+    Luminance-only noise (added equally to R/G/B) avoids color speckle. No-op if disabled."""
+    if FILM_GRAIN_AMOUNT <= 0:
+        return image
+    try:
+        import numpy as _np
+        from PIL import Image as _Image
+        arr = _np.asarray(image.convert("RGB"), dtype=_np.float32)
+        noise = _np.random.normal(0.0, FILM_GRAIN_AMOUNT, arr.shape[:2])[..., None]
+        out = _np.clip(arr + noise, 0, 255).astype(_np.uint8)
+        return _Image.fromarray(out)
+    except Exception as e:
+        write_debug(f"film-grain FAILED (skipping): {e}")
+        return image
 
 
 # ─────────────────────────────────────────────────────────
@@ -754,6 +971,20 @@ def run_inference(job: dict) -> list:
     _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
              "skin texture, shot on a DSLR with an 85mm portrait lens.")
 
+    # ── IP-Adapter Plus-Face: condition on the user's OWN face crops (commercial-safe) ──
+    # Applied to every image in this job (the reference face is constant per user). Scale
+    # is env-tunable; on any miss we fall back to LoRA-only so generation never breaks.
+    use_ip_adapter = False
+    ref_faces = []
+    if ip_adapter_ok and IP_ADAPTER_SCALE > 0:
+        ref_faces = _get_ref_faces(user_id)
+        if ref_faces:
+            pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+            use_ip_adapter = True
+            write_debug(f"IP-Adapter ACTIVE: {len(ref_faces)} ref faces, scale={IP_ADAPTER_SCALE}")
+        else:
+            write_debug("IP-Adapter: no ref faces found -> LoRA-only")
+
     result_blob_paths = []
     for i in range(image_count):
         seed = 1000 + i                                   # distinct per image
@@ -785,7 +1016,7 @@ def run_inference(job: dict) -> list:
             write_debug(
                 f"Output {i+1}: txt2img pipe() [{combo_label}] cfg={DEFAULT_CFG} seed={seed}"
             )
-            output = pipe(
+            _pipe_kwargs = dict(
                 prompt=prompt,
                 negative_prompt=_negative,
                 guidance_scale=DEFAULT_CFG,
@@ -793,7 +1024,12 @@ def run_inference(job: dict) -> list:
                 width=DEFAULT_WIDTH,
                 height=DEFAULT_HEIGHT,
                 generator=torch.Generator("cuda").manual_seed(seed),
-            ).images[0]
+            )
+            if use_ip_adapter:
+                # Single reference face (the clearest crop) — safest API path; multi-image
+                # averaging is a later enhancement.
+                _pipe_kwargs["ip_adapter_image"] = ref_faces[0]
+            output = pipe(**_pipe_kwargs).images[0]
 
             # Real inference VRAM peak on the first output — surfaces any OOM headroom.
             if i == 0:
@@ -808,12 +1044,37 @@ def run_inference(job: dict) -> list:
                 except Exception as e:
                     write_debug(f"inference VRAM probe failed: {e}")
 
-            # 2K post-process (Real-ESRGAN x4 → fit to UPSCALE_TARGET), then
-            # watermark at the final resolution (the bar scales with image height).
+            # 2K post-process FIRST (Real-ESRGAN x4 → fit to UPSCALE_TARGET).
             _pre = output.size
             output    = upscale_image(output)
             if i == 0:
                 write_debug(f"Upscaled {_pre} -> {output.size} (target={UPSCALE_TARGET})")
+
+            # ── Whole-image realism pass AFTER upscale: de-plasticize the WHOLE frame (hair
+            # top, skin, fabric) that ESRGAN over-smoothed. Runs before the face-refine so the
+            # face gets the final, sharpest word. Low strength => identity/pose preserved.
+            _ref = ref_faces[0] if (use_ip_adapter and ref_faces) else None
+            if REALISM_PASS_ENABLE and img2img_pipe is not None:
+                _realism_prompt = (
+                    f"candid photograph of {subj}, natural realistic skin texture with visible "
+                    f"pores, individual hair strands, fine fabric texture, {_tail}"
+                )
+                output = _realism_pass(output, _ref, _realism_prompt)
+
+            # ── Face-inpaint AFTER upscale: on the 2048 image the face crop is ~1000px (vs
+            # ~500 pre-upscale) so the eyes get REAL detail, and the ESRGAN — which already
+            # ran — can no longer re-smooth the refined face (the bug that made v43 only
+            # marginally better). Graceful: falls back to the un-refined image on any miss.
+            if FACE_REFINE_ENABLE and img2img_pipe is not None:
+                _face_prompt = (
+                    f"close-up portrait photograph of {subj}, face in sharp focus, highly "
+                    f"detailed eyes, natural realistic skin texture with visible pores and fine "
+                    f"detail, individual hair strands, {_tail}"
+                )
+                output = _refine_face(output, _ref, _face_prompt)
+
+            # Subtle film grain so the final frame reads as a photo, not a clean render.
+            output    = _add_film_grain(output)
             output    = add_watermark(output)
             blob_path = upload_image_to_blob(output, job_id, i)
             result_blob_paths.append(blob_path)
