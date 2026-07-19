@@ -900,7 +900,23 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
                                    "Your photos will start automatically when it's ready."}),
             mimetype="application/json", status_code=202)
 
-    enqueue_job({"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params})
+    # reserve_job_slot ALREADY committed the credit charge + the 'queued' job row. If the
+    # queue send fails now, the job would be a charged orphan — stuck 'queued' but never picked
+    # up (the reaper only touches 'processing'/'dispatching'), and never refunded. Undo it:
+    # _mark_failed does the guarded fail + FULL credit refund (rowcount-tied, can't double-refund),
+    # so the user is made whole and can retry for free.
+    try:
+        enqueue_job({"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params})
+    except Exception as e:
+        logging.error(
+            f"enqueue failed for job_id={job_id}; failing + refunding to avoid a "
+            f"charged-but-unqueued orphan: {e}"
+        )
+        _mark_failed(str(job_id))
+        return func.HttpResponse(
+            json.dumps({"error": "Couldn't queue your generation — you were not charged. Please try again."}),
+            mimetype="application/json", status_code=503,
+        )
 
     return func.HttpResponse(
         json.dumps({"job_id": str(job_id), "status": "queued"}),

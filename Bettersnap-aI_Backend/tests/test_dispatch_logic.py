@@ -456,6 +456,22 @@ class DailyCapTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 202)
         sys.modules["shared.queue_client"].enqueue_job.assert_called_once()
 
+    def test_enqueue_failure_refunds_and_503(self):
+        # If the queue send fails AFTER reserve_job_slot committed the charge + 'queued' row,
+        # the job must be refunded + failed (not left a charged orphan) and the user told to
+        # retry — otherwise the reaper never touches a 'queued' row and the charge is lost.
+        self._cfg.update(user_count=0, global_count=0, new_job_id=555)
+        qc = sys.modules["shared.queue_client"]
+        qc.enqueue_job.reset_mock()
+        qc.enqueue_job.side_effect = RuntimeError("queue down")
+        try:
+            with mock.patch.object(function_app, "_mark_failed") as mf:
+                resp = function_app.submit_job(self._req())
+            self.assertEqual(resp.status_code, 503)
+            mf.assert_called_once_with("555")   # guarded fail + FULL refund of the charged job
+        finally:
+            qc.enqueue_job.side_effect = None
+
 
 class IdentityLoraGateTests(unittest.TestCase):
     """The gate that stops a user without a trained adapter being handed a STRANGER'S
