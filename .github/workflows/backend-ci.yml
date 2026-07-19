@@ -31,9 +31,10 @@ jobs:
           python-version: '3.11'
 
       # The unit tests stub the heavy deps (azure, pyodbc, blob) but reach shared.stripe_client,
-      # which imports `requests`. Install just that light dep — no pyodbc/opencv/azure needed.
+      # which imports `requests`. pyflakes powers the undefined-name gate below. Both are light —
+      # no pyodbc/opencv/azure/torch needed.
       - name: Install minimal test deps
-        run: pip install requests
+        run: pip install requests pyflakes
 
       # Syntax gate: compileall COMPILES (does not import) every module, so heavy runtime
       # deps (torch, pyodbc, azure) aren't needed to catch syntax errors across the app,
@@ -41,7 +42,19 @@ jobs:
       - name: Compile all Python (syntax gate)
         run: python -m compileall -q Bettersnap-aI_Backend main.py training
 
-      # Unit tests stub Azure + DB, so they run on stdlib alone.
+      # Undefined-name gate: compileall catches SyntaxError but NOT undefined names.
+      # run_inference once called `load_category_lora(category)` with `category` undefined,
+      # which crashed EVERY generation (NameError) — and it sailed through the syntax gate.
+      # pyflakes parses (does not import) so torch/opencv/azure aren't needed; we fail only
+      # on 'undefined name' so unrelated style noise never breaks the build.
+      - name: Undefined-name gate (pyflakes)
+        run: |
+          out=$(python -m pyflakes main.py Bettersnap-aI_Backend training 2>&1 | grep "undefined name" || true)
+          if [ -n "$out" ]; then echo "$out"; echo "::error::undefined name(s) found — see above"; exit 1; fi
+          echo "No undefined names."
+
+      # Unit tests stub Azure + DB, so they run on stdlib alone. test_prompt_planning covers
+      # the inference prompt-planning + adapter-loading stage (the run_inference regression).
       - name: Backend unit tests
         working-directory: Bettersnap-aI_Backend
-        run: python -m unittest tests.test_dispatch_logic -v
+        run: python -m unittest tests.test_dispatch_logic tests.test_prompt_planning -v

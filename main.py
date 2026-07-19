@@ -684,8 +684,11 @@ def run_inference(job: dict) -> list:
     # set_adapters (compatible with cpu offload). active/weights built from what
     # actually loaded, so a missing category adapter can't name an unloaded one.
     active, weights = [], []
-    if load_category_lora(category):
-        active.append("category_lora"); weights.append(0.8)
+    # NOTE: category-style LoRAs are NOT deployed (no category/<x>/adapter_model.safetensors
+    # blobs exist), and selections now span MULTIPLE categories (attire_refs/background_refs),
+    # so there is no single `category` to load — the old `load_category_lora(category)` call
+    # referenced an undefined name and crashed every generation. Identity LoRA below is the
+    # only adapter carrying identity; attire/background are driven by the prompt.
     identity_ok = load_identity_lora(user_id)
     if identity_ok:
         active.append("identity_lora"); weights.append(DEFAULT_LORA_WEIGHT)
