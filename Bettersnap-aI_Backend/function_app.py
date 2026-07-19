@@ -2114,6 +2114,46 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     email         = (payload.get("email") or payload.get("preferred_username")
                      or payload.get("upn") or "")
 
+    # ── Purchase gate (finding #6): ONE active product at a time ─────────────────
+    # Stops the state corruption where a one-time purchase clobbers an active monthly sub
+    # (leaving it uncancellable) or a second monthly orphans the first. Reject a PLAN purchase
+    # that collides with the user's current product, with a clear next step. Adding credits to
+    # an active monthly is a SEPARATE endpoint (not gated here). NOTE: a later step turns the
+    # 'monthly_active' reject into a QUEUE (activate the plan when the current one ends).
+    gconn = get_db()
+    gcur = gconn.cursor()
+    gcur.execute(
+        "SELECT subscription_type, stripe_subscription_id FROM users WHERE user_id = ?",
+        user_id,
+    )
+    grow = gcur.fetchone()
+    active_monthly = bool(grow and grow[0] == "monthly" and grow[1])
+    gcur.execute(
+        "SELECT COUNT(*) FROM jobs WHERE user_id = ? "
+        "AND status IN ('queued', 'waiting_lora', 'dispatching', 'processing')",
+        user_id,
+    )
+    generation_in_flight = int(gcur.fetchone()[0]) > 0
+
+    if active_monthly:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "You already have an active monthly plan. Use 'Add credits' to "
+                         "generate more images, or cancel your plan before switching.",
+                "billing_state": "monthly_active",
+            }),
+            mimetype="application/json", status_code=409,
+        )
+    if generation_in_flight:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Your current generation is still running. Please wait for it to "
+                         "finish before starting another plan.",
+                "billing_state": "generation_in_flight",
+            }),
+            mimetype="application/json", status_code=409,
+        )
+
     if payment_type == "one_time":
         if plan not in ONE_TIME_PLANS:
             return func.HttpResponse(

@@ -188,6 +188,13 @@ class FakeCursor:
             self._fetchall = self.cfg.get("parked_jobs", [])
         elif "select credits_remaining" in s:
             self._fetch = (self.cfg.get("credits", 20),)
+        # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
+        # user-count branch, which the same "count(*) from jobs where user_id" would swallow.
+        elif "count(*) from jobs where user_id" in s and "status in" in s:
+            self._fetch = (self.cfg.get("jobs_in_flight", 0),)
+        elif "select subscription_type, stripe_subscription_id" in s:
+            self._fetch = (self.cfg.get("subscription_type"),
+                           self.cfg.get("stripe_subscription_id"))
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
         elif "count(*) from jobs where created_at" in s:
@@ -641,6 +648,45 @@ class PlanAffordabilityTests(unittest.TestCase):
     def test_default_plan_exists(self):
         from shared import plans
         self.assertIn(plans.DEFAULT_PLAN_KEY, plans.PLANS)
+
+
+class BillingGateTests(unittest.TestCase):
+    """finding #6: ONE active product at a time — a PLAN purchase that collides with an active
+    monthly subscription or an in-flight generation is rejected (409) with a clear next step."""
+
+    def setUp(self):
+        sys.modules["shared.auth"].validate_token.return_value = {"oid": "user-1"}
+        self._cfg = {}
+        self._p = mock.patch.object(function_app, "get_db",
+                                    side_effect=lambda: FakeConn(self._cfg))
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _req(self, plan="basic", ptype="monthly"):
+        r = _HttpRequest()
+        r.headers = {"Authorization": "Bearer t"}
+        r.get_json = lambda: {"plan": plan, "type": ptype}
+        return r
+
+    def test_active_monthly_blocks_new_monthly_plan(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        resp = function_app.create_subscription(self._req(plan="pro", ptype="monthly"))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("monthly_active", resp.body)
+
+    def test_active_monthly_blocks_one_time_too(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("monthly_active", resp.body)
+
+    def test_generation_in_flight_blocks_new_plan(self):
+        self._cfg.update(subscription_type=None, stripe_subscription_id=None, jobs_in_flight=1)
+        resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("generation_in_flight", resp.body)
 
 
 class ReaperTests(unittest.TestCase):
