@@ -8,15 +8,18 @@ from azure.mgmt.appcontainers.models import (
 SUBSCRIPTION_ID = "cf197124-2e9a-48d5-af4b-de22fbbd683e"
 RESOURCE_GROUP = "bettersnap-ai-rg"
 JOB_NAME = "bettersnapai-if"
+# RETIRED. Kept only so the constant still resolves for any legacy importer. Training
+# and inference now run on the SINGLE job `bettersnapai-if`, distinguished per-execution
+# by the MODE env (train|infer) — the unified image runs both. `bettersnapai-lora-trainer`
+# is decommissioned; do NOT dispatch to it.
 TRAINER_JOB_NAME = "bettersnapai-lora-trainer"
 
-# EVERY job that consumes the A100 workload profile. Both jobs run on the SAME
-# profile (bettersnapaiWPn, Consumption-GPU-NC24-A100, 24 CPU / 220Gi), so the
-# active-job cap must span BOTH or it is not a cap at all: an inference run and a
-# training run would each hold an A100 and MAX_ACTIVE_GPU_JOBS=1 would silently
-# become 2. This was latent-only while the trainer was manual-trigger-only; the
-# moment training is dispatched from code it is real money.
-GPU_JOB_NAMES = (JOB_NAME, TRAINER_JOB_NAME)
+# EVERY job that consumes the A100 workload profile. There is now exactly ONE such job
+# (bettersnapai-if on profile bettersnapaiWPn, Consumption-GPU-NC24-A100, 24 CPU/220Gi):
+# a training execution and an inference execution both land on it, so counting its live
+# executions IS the cap. (Listing a retired job's executions would raise, so the trainer
+# name is intentionally NOT here.)
+GPU_JOB_NAMES = (JOB_NAME,)
 
 # Execution states that mean an A100 replica is (or may be) consuming GPU.
 # Anything NOT terminal counts as active — conservative on purpose: when a
@@ -75,9 +78,13 @@ def trigger_container_job(job_id: str, user_id: str):
     job = client.jobs.get(RESOURCE_GROUP, JOB_NAME)
     base = job.template.containers[0]
 
-    env = [e for e in (base.env or []) if e.name not in ("JOB_ID", "USER_ID")]
+    # Strip JOB_ID/USER_ID (per-run) and MODE, then set them. MODE=infer is set
+    # EXPLICITLY: this one job also runs training (MODE=train), so we must never let an
+    # inference run inherit a stale/baked MODE and boot the container into the trainer.
+    env = [e for e in (base.env or []) if e.name not in ("JOB_ID", "USER_ID", "MODE")]
     env.append(EnvironmentVar(name="JOB_ID", value=job_id))
     env.append(EnvironmentVar(name="USER_ID", value=user_id))
+    env.append(EnvironmentVar(name="MODE", value="infer"))
 
     # CRITICAL: rebuild resources EXPLICITLY. Passing base.resources (the
     # ContainerResources object read back from jobs.get()) does NOT round-trip through

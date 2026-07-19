@@ -1,7 +1,10 @@
 """Start the per-user identity-LoRA training job on the A100.
 
-Mirrors queue_trigger.trigger_container_job (same ACA quirks, same recovery), but
-targets `bettersnapai-lora-trainer` and overrides the per-user env at START time.
+Mirrors queue_trigger.trigger_container_job (same ACA quirks, same recovery), and
+targets the SAME single job `bettersnapai-if` (JOB_NAME) — the unified train+infer image
+runs both. This dispatcher sets MODE=train at START time so the container boots the
+trainer; the inference dispatcher sets MODE=infer. (The old dedicated
+`bettersnapai-lora-trainer` job is retired.) The per-user env is overridden at start too.
 
 WHY THE ENV OVERRIDE IS THE WHOLE POINT
 ---------------------------------------
@@ -29,7 +32,7 @@ from azure.mgmt.appcontainers.models import (
 
 from . import catalog
 from .queue_trigger import (
-    SUBSCRIPTION_ID, RESOURCE_GROUP, TRAINER_JOB_NAME, _newest_execution_name,
+    SUBSCRIPTION_ID, RESOURCE_GROUP, JOB_NAME, _newest_execution_name,
 )
 
 # Env keys this dispatcher OWNS. Always removed from the job template, then re-set
@@ -41,6 +44,7 @@ _OWNED_ENV = {
     "CLASS_PROMPT",
     "CLASS_WORD",
     "INPUT_BLOB_PATH",   # stripped, never re-set — FILES_JSON is the input contract
+    "MODE",              # shared job with inference — MUST re-set to "train" every run
 }
 
 
@@ -76,7 +80,7 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
     credential = DefaultAzureCredential()
     client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
 
-    job = client.jobs.get(RESOURCE_GROUP, TRAINER_JOB_NAME)
+    job = client.jobs.get(RESOURCE_GROUP, JOB_NAME)
     base = job.template.containers[0]
 
     # Strip every user-identifying key from the template, then set ours. Non-owned keys
@@ -84,6 +88,7 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
     # TEXT_ENCODER_LR, NUM_CLASS_IMAGES, PRIOR_LOSS_WEIGHT, LORA_CONTAINER, ...) are the
     # tuned recipe and are carried through untouched.
     env = [e for e in (base.env or []) if e.name not in _OWNED_ENV]
+    env.append(EnvironmentVar(name="MODE", value="train"))   # boot the trainer, not inference
     env.append(EnvironmentVar(name="USER_ID", value=str(user_id)))
     env.append(EnvironmentVar(name="FILES_JSON", value=json.dumps(files)))
     env.append(EnvironmentVar(name="CLASS_WORD", value=class_word))
@@ -122,7 +127,7 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
 
     poller = client.jobs.begin_start(
         resource_group_name=RESOURCE_GROUP,
-        job_name=TRAINER_JOB_NAME,
+        job_name=JOB_NAME,
         template=template,
     )
     try:
@@ -134,7 +139,7 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
         )
         execution_id = None
     if not execution_id:
-        execution_id = _newest_execution_name(client, TRAINER_JOB_NAME)
+        execution_id = _newest_execution_name(client, JOB_NAME)
 
     logging.info(f"Started training job for user={user_id}, execution_id={execution_id}")
     return execution_id
@@ -146,7 +151,7 @@ def get_execution_status(execution_id: str) -> str:
     decide when users.lora_status flips."""
     credential = DefaultAzureCredential()
     client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
-    for ex in client.jobs_executions.list(RESOURCE_GROUP, TRAINER_JOB_NAME):
+    for ex in client.jobs_executions.list(RESOURCE_GROUP, JOB_NAME):
         if getattr(ex, "name", None) == execution_id:
             return (getattr(ex, "status", "") or "").lower()
     return ""
