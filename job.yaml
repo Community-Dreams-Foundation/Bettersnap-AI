@@ -19,12 +19,18 @@ properties:
     # replica retry almost always just fails again — pure GPU burn. Let the
     # user resubmit instead. (Was 3 → up to 3x wasted A100 runs per poison job.)
     replicaRetryLimit: 0
-    # Hard wall-clock cap per replica (max seconds a replica may run).
-    # KEPT AT 1800 deliberately: do NOT lower until logs prove p95/p99 of
-    # successful runs is safely under the new value — cutting this too low turns
-    # slow-but-valid jobs into false failures. Realistic run is ~5-min load +
-    # 4-image inference; once we have real runtime stats, revisit (e.g. 1200).
-    replicaTimeout: 1800
+    # Hard wall-clock cap per replica (max seconds a replica may run). This is a
+    # CEILING that force-kills a hung/looping job — NOT a reservation: a job that
+    # finishes exits immediately and billing stops, so raising this does NOT raise
+    # the cost of a normal run (it only widens the worst-case cap on a STUCK job).
+    # SET TO 7200 (2h) to match the deployed job. One-time plans generate up to
+    # 30/50/70 images (Basic/Pro/Expert) — a full Expert run is ~5-min model load +
+    # ~40-min sequential gen+upscale, so the old 1800 (30-min) cap could SIGKILL a
+    # valid Expert job mid-run (leaving the row 'processing' until the reaper refunds).
+    # Do NOT lower until logs prove p95/p99 of successful 70-image runs is safely
+    # under the new value — cutting too low false-fails slow-but-valid jobs; ~3600
+    # (1h) is the likely tightening once real runtime stats exist.
+    replicaTimeout: 7200
     # One job execution = exactly one A100 replica; never fan out to several.
     manualTriggerConfig:
       parallelism: 1
@@ -35,7 +41,7 @@ properties:
   template:
     containers:
       - name: bettersnapai-if
-        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v35
+        image: bettersnapregistry-gta3hah3g3bpgrcn.azurecr.io/inference:v43
         resources:
           cpu: 24
           memory: 220Gi
