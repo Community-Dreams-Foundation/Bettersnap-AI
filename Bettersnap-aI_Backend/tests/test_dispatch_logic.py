@@ -659,10 +659,12 @@ class BillingGateTests(unittest.TestCase):
         self._cfg = {}
         self._p = mock.patch.object(function_app, "get_db",
                                     side_effect=lambda: FakeConn(self._cfg))
-        self._p.start()
+        self._p2 = mock.patch.object(function_app, "new_connection",
+                                     side_effect=lambda: FakeConn(self._cfg))
+        self._p.start(); self._p2.start()
 
     def tearDown(self):
-        self._p.stop()
+        self._p.stop(); self._p2.stop()
 
     def _req(self, plan="basic", ptype="monthly"):
         r = _HttpRequest()
@@ -670,22 +672,26 @@ class BillingGateTests(unittest.TestCase):
         r.get_json = lambda: {"plan": plan, "type": ptype}
         return r
 
-    def test_active_monthly_blocks_new_monthly_plan(self):
+    def test_active_monthly_queues_new_monthly_plan(self):
         self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
         resp = function_app.create_subscription(self._req(plan="pro", ptype="monthly"))
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 202)          # queued, not rejected
+        self.assertIn("queued", resp.body)
         self.assertIn("monthly_active", resp.body)
+        # the intent is stored in pending_purchases
+        self.assertTrue(any("insert into pending_purchases" in s.lower()
+                            for s, _ in self._cfg["executed"]))
 
-    def test_active_monthly_blocks_one_time_too(self):
+    def test_active_monthly_queues_one_time_too(self):
         self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
         resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
-        self.assertEqual(resp.status_code, 409)
-        self.assertIn("monthly_active", resp.body)
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn("queued", resp.body)
 
-    def test_generation_in_flight_blocks_new_plan(self):
+    def test_generation_in_flight_queues_new_plan(self):
         self._cfg.update(subscription_type=None, stripe_subscription_id=None, jobs_in_flight=1)
         resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 202)
         self.assertIn("generation_in_flight", resp.body)
 
     def test_topup_requires_active_monthly(self):

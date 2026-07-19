@@ -2054,6 +2054,14 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Queued (pay-at-activation) plan purchase, if any (finding #6): the frontend shows it and
+    # lets the user complete checkout once their current product ends. null when nothing queued.
+    cursor.execute(
+        "SELECT purchase_type, plan FROM pending_purchases WHERE user_id = ? AND status = 'pending'",
+        user_id)
+    prow = cursor.fetchone()
+    queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
+
     # Compute the NEXT renewal so the frontend can show "renews {date}". Stripe bills on a
     # MONTHLY cadence (same day-of-month each cycle), so add one calendar month — NOT 30 days,
     # which drifts ~5 days/year off the real billing date. Only meaningful for active monthly.
@@ -2083,10 +2091,38 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             # "cancels on {cancel_at}" and offers Reactivate (POST /subscriptions/reactivate).
             "cancel_pending": bool(row[6]),
             "cancel_at": str(row[6]) if row[6] else None,
+            # Queued (pay-at-activation) plan purchase, if any — complete it when the current
+            # product ends. null when nothing is queued.
+            "queued_purchase": queued_purchase,
         }),
         mimetype="application/json",
         status_code=200,
     )
+
+
+def _queue_pending_purchase(user_id: str, purchase_type: str, plan: str):
+    """Record a queued plan purchase (finding #6, pay-at-activation): the user completes
+    checkout when their current product ends. One PENDING row per user — a new queue
+    supersedes the prior one."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM pending_purchases WHERE user_id = ? AND status = 'pending'", user_id)
+        cur.execute(
+            "INSERT INTO pending_purchases (user_id, purchase_type, plan) VALUES (?, ?, ?)",
+            user_id, purchase_type, plan)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clear_pending_purchase(cur, user_id: str):
+    """Mark a user's queued purchase 'done' once they actually complete a purchase. Uses the
+    CALLER'S cursor so it commits with the grant/activation. Safe no-op if none is pending."""
+    cur.execute(
+        "UPDATE pending_purchases SET status = 'done' WHERE user_id = ? AND status = 'pending'",
+        user_id)
 
 
 # ── Subscriptions: Create Checkout ────────────────────────
@@ -2135,24 +2171,32 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     )
     generation_in_flight = int(gcur.fetchone()[0]) > 0
 
-    if active_monthly:
+    # Validate the requested plan/type up front — needed before we can QUEUE or checkout.
+    valid_combo = ((payment_type == "one_time" and plan in ONE_TIME_PLANS) or
+                   (payment_type == "monthly" and plan in MONTHLY_PLANS))
+    if not valid_combo:
         return func.HttpResponse(
-            json.dumps({
-                "error": "You already have an active monthly plan. Use 'Add credits' to "
-                         "generate more images, or cancel your plan before switching.",
-                "billing_state": "monthly_active",
-            }),
-            mimetype="application/json", status_code=409,
-        )
-    if generation_in_flight:
+            json.dumps({"error": "type must be 'one_time' or 'monthly', and plan one of "
+                                 "basic, pro, expert."}),
+            mimetype="application/json", status_code=400)
+
+    if active_monthly or generation_in_flight:
+        # QUEUE it (pay-at-activation): record the intent now; the user completes checkout when
+        # their current product ends and they're idle again — we do NOT charge at queue time.
+        # One pending row per user (a new queue supersedes the prior one).
+        _queue_pending_purchase(user_id, payment_type, plan)
+        if active_monthly:
+            state, msg = "monthly_active", (
+                "You already have an active monthly plan — we've queued this to start when your "
+                "plan ends. Meanwhile, use 'Add credits' for more images now.")
+        else:
+            state, msg = "generation_in_flight", (
+                "Your current generation is still running — we've queued this to start when it "
+                "finishes.")
         return func.HttpResponse(
-            json.dumps({
-                "error": "Your current generation is still running. Please wait for it to "
-                         "finish before starting another plan.",
-                "billing_state": "generation_in_flight",
-            }),
-            mimetype="application/json", status_code=409,
-        )
+            json.dumps({"status": "queued", "billing_state": state,
+                        "queued": {"type": payment_type, "plan": plan}, "message": msg}),
+            mimetype="application/json", status_code=202)
 
     if payment_type == "one_time":
         if plan not in ONE_TIME_PLANS:
@@ -2452,6 +2496,7 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
             )
             return
+        _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + grant commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
     finally:
@@ -2503,6 +2548,7 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 f"MANUAL RECONCILIATION REQUIRED."
             )
             return
+        _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + activation commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
     finally:
