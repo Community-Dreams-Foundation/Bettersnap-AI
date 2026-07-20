@@ -188,6 +188,19 @@ class FakeCursor:
             self._fetchall = self.cfg.get("parked_jobs", [])
         elif "select credits_remaining" in s:
             self._fetch = (self.cfg.get("credits", 20),)
+        # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
+        # user-count branch, which the same "count(*) from jobs where user_id" would swallow.
+        elif "count(*) from jobs where user_id" in s and "status in" in s:
+            self._fetch = (self.cfg.get("jobs_in_flight", 0),)
+        elif "select subscription_type, stripe_subscription_id" in s:
+            self._fetch = (self.cfg.get("subscription_type"),
+                           self.cfg.get("stripe_subscription_id"))
+        # subscription_status: plan/type/credits/quota/renewed/failed/cancel_at
+        elif "select subscription_plan, subscription_type" in s:
+            self._fetch = self.cfg.get(
+                "sub_status_row", ("monthly_pro", "monthly", 120, 200, None, None, None))
+        elif "select purchase_type, plan_key from pending_purchases" in s:
+            self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
         elif "count(*) from jobs where created_at" in s:
@@ -298,6 +311,10 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.assert_called_once()
         gl.mark_dispatched.assert_called_once()
         gl.release_dispatch_lease.assert_called_once()
+        # #5A: the queued->dispatching claim stamps dispatched_at, so the reaper can measure
+        # the processing deadline from GPU-run start instead of submit time.
+        self.assertTrue(any("dispatched_at = getutcdate()" in s.lower()
+                            for s, _ in self._cfg["executed"]))
 
     # 4) over-cap -> defers, does not start
     def test_over_cap_defers(self):
@@ -466,6 +483,11 @@ class DailyCapTests(unittest.TestCase):
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 202)
         sys.modules["shared.queue_client"]._send.assert_called_once()
+        # #6 foundation: the job row is tagged with the product (plan_type) it belongs to.
+        job_inserts = [(s, p) for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertTrue(job_inserts, "no jobs INSERT recorded")
+        self.assertIn("source_type", job_inserts[0][0].lower())
+        self.assertIsNotNone(job_inserts[0][1][-1])
 
     def test_send_failure_keeps_job_and_returns_202(self):
         # Transactional outbox: the queue message was written ATOMICALLY with the job + credit
@@ -632,6 +654,145 @@ class PlanAffordabilityTests(unittest.TestCase):
     def test_default_plan_exists(self):
         from shared import plans
         self.assertIn(plans.DEFAULT_PLAN_KEY, plans.PLANS)
+
+    def test_monthly_session_minimum_is_5(self):
+        # Step 5/#6: a monthly generation session is at least 5 images.
+        from shared import plans
+        for key in ("monthly_basic", "monthly_pro", "monthly_expert"):
+            self.assertEqual(plans.PLANS[key].min_session_images, 5)
+
+
+class BillingGateTests(unittest.TestCase):
+    """finding #6: ONE active product at a time — a PLAN purchase that collides with an active
+    monthly subscription or an in-flight generation is rejected (409) with a clear next step."""
+
+    def setUp(self):
+        sys.modules["shared.auth"].validate_token.return_value = {"oid": "user-1"}
+        self._cfg = {}
+        self._p = mock.patch.object(function_app, "get_db",
+                                    side_effect=lambda: FakeConn(self._cfg))
+        self._p2 = mock.patch.object(function_app, "new_connection",
+                                     side_effect=lambda: FakeConn(self._cfg))
+        self._p.start(); self._p2.start()
+
+    def tearDown(self):
+        self._p.stop(); self._p2.stop()
+
+    def _req(self, plan="basic", ptype="monthly"):
+        r = _HttpRequest()
+        r.headers = {"Authorization": "Bearer t"}
+        r.get_json = lambda: {"plan": plan, "type": ptype}
+        return r
+
+    def test_active_monthly_queues_new_monthly_plan(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        resp = function_app.create_subscription(self._req(plan="pro", ptype="monthly"))
+        self.assertEqual(resp.status_code, 202)          # queued, not rejected
+        self.assertIn("queued", resp.body)
+        self.assertIn("monthly_active", resp.body)
+        # the intent is stored in pending_purchases
+        self.assertTrue(any("insert into pending_purchases" in s.lower()
+                            for s, _ in self._cfg["executed"]))
+
+    def test_active_monthly_queues_one_time_too(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn("queued", resp.body)
+
+    def test_generation_in_flight_queues_new_plan(self):
+        self._cfg.update(subscription_type=None, stripe_subscription_id=None, jobs_in_flight=1)
+        resp = function_app.create_subscription(self._req(plan="basic", ptype="one_time"))
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn("generation_in_flight", resp.body)
+
+    def test_status_emits_frontend_field_aliases(self):
+        # The frontend reads `monthly_quota` and `renewal_date`; the backend's canonical names
+        # are `credits_monthly_limit` and `next_renewal`. Emitting BOTH is what stops the UI
+        # rendering a blank quota ("X of  credits") and a missing renewal date.
+        self._cfg["sub_status_row"] = ("monthly_pro", "monthly", 120, 200, None, None, None)
+        resp = function_app.subscription_status(self._req())
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["monthly_quota"], 200)                        # what the UI shows
+        self.assertEqual(body["monthly_quota"], body["credits_monthly_limit"])
+        self.assertEqual(body["renewal_date"], body["next_renewal"])        # alias present
+
+    def test_topup_requires_active_monthly(self):
+        # A non-subscriber cannot buy loose credits — they buy a plan.
+        self._cfg.update(subscription_type=None, stripe_subscription_id=None)
+        resp = function_app.topup_credits(self._req(plan="basic"))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("no_active_monthly", resp.body)
+
+    def test_topup_allowed_for_active_monthly(self):
+        self._cfg.update(subscription_type="monthly", stripe_subscription_id="sub_1")
+        with mock.patch.object(function_app, "create_topup_checkout",
+                               return_value={"url": "http://pay", "id": "cs_1"}):
+            resp = function_app.topup_credits(self._req(plan="basic"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("checkout_url", resp.body)
+
+
+class RetentionBlobCaseTests(unittest.TestCase):
+    """Blob prefixes are CASE-SENSITIVE. Ids come from SQL uppercase but the pipeline writes
+    lowercase paths, so matching only the SQL casing deleted NOTHING — retention reported
+    success while every photo and adapter stayed in storage. _delete_blobs must try both."""
+
+    def _fake_container(self, names):
+        listed = []
+
+        class FakeContainer:
+            def list_blobs(self, name_starts_with=None):
+                listed.append(name_starts_with)
+                return [types.SimpleNamespace(name=n)
+                        for n in names if n.startswith(name_starts_with or "")]
+
+            def delete_blob(self, name):
+                pass
+
+        class FakeSvc:
+            def get_container_client(self, _):
+                return FakeContainer()
+
+        return FakeSvc(), listed
+
+    def test_uppercase_prefix_still_deletes_lowercase_blobs(self):
+        # Blobs written lowercase; caller passes the UPPERCASE id straight from SQL.
+        svc, listed = self._fake_container(["908a8f2a-dead-beef/input/img0.jpg"])
+        with mock.patch.object(function_app, "get_blob_client", return_value=svc):
+            n = function_app._delete_blobs("inputs", "908A8F2A-DEAD-BEEF/")
+        self.assertEqual(n, 1, "uppercase prefix must still reach the lowercase blobs")
+        self.assertIn("908a8f2a-dead-beef/", listed)   # lowercase variant was attempted
+
+    def test_already_lowercase_prefix_is_not_listed_twice(self):
+        svc, listed = self._fake_container(["abc/input/img0.jpg"])
+        with mock.patch.object(function_app, "get_blob_client", return_value=svc):
+            n = function_app._delete_blobs("inputs", "abc/")
+        self.assertEqual(n, 1)
+        self.assertEqual(len(listed), 1, "no duplicate listing when the prefix is already lower")
+
+
+class ReaperTests(unittest.TestCase):
+    """finding #5 part A: the reaper must measure the processing/dispatching deadline from
+    dispatched_at (when the GPU run started), NOT created_at (submit) — so a healthy job that
+    merely waited in the queue is never reaped."""
+
+    def test_reaper_measures_from_dispatched_at_not_created_at(self):
+        cfg = {}  # FakeCursor returns no rows -> nothing reaped; we assert the SQL shape
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+        sqls = [s.lower() for s, _ in cfg["executed"]]
+        proc = [s for s in sqls if "status = 'processing'" in s]
+        disp = [s for s in sqls if "status = 'dispatching'" in s]
+        self.assertTrue(proc, "reaper did not scan 'processing'")
+        self.assertTrue(disp, "reaper did not scan 'dispatching'")
+        # Both scans must age from COALESCE(dispatched_at, created_at)...
+        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in proc + disp))
+        # ...and must NOT age from the bare submit-time column.
+        self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
+                         "reaper still measures from created_at (submit time)")
 
 
 if __name__ == "__main__":

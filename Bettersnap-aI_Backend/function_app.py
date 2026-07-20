@@ -20,10 +20,16 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # Kill-switch pause uses a long, fixed delay (NOT the backoff) so an intentional
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
-# Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds.
-# 'processing' threshold must be >> inference wall-time. Measured: 172s startup +
-# ~7.9s/image, so even a 65-image Expert job is ~12 min.
-REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "45"))
+# Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds,
+# measured from dispatched_at (COALESCE created_at) — NOT submit time — so queue wait
+# doesn't count against the deadline (finding #5, part A).
+# The 'processing' threshold must exceed the LONGEST a healthy run can legitimately take.
+# The GPU job's own replicaTimeout is 7200s = 120 min (job.yaml), so the GPU itself kills
+# anything past that; a row still 'processing' beyond ~120 min from dispatch is therefore
+# genuinely dead (OOM/SIGKILL left it), not slow. Default 130 keeps the reaper strictly
+# less aggressive than the GPU's hard cap, so it can NEVER false-fail a healthy run. (Was
+# 45, which — measured from submit — could reap a large job that merely waited in queue.)
+REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "130"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
 # ── Identity-LoRA training ────────────────────────────────────────────────
@@ -62,7 +68,7 @@ from shared.plans import (
 from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
-    create_onetime_checkout, create_monthly_checkout,
+    create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
 
@@ -500,7 +506,7 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT lora_status, credits_remaining, retrain_count FROM users WHERE user_id = ?",
+        "SELECT lora_status, credits_remaining, retrain_count, plan_name FROM users WHERE user_id = ?",
         user_id,
     )
     row = cur.fetchone()
@@ -508,6 +514,9 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
     credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
+    # Product this training belongs to (finding #6 foundation) — drives per-product retention
+    # + LoRA lifecycle. get_plan maps plan_name -> plan_type ('one_time' | 'monthly').
+    train_source = get_plan(row[3]).plan_type
 
     if lora_status == "training":
         return func.HttpResponse(
@@ -642,10 +651,10 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         conn2.autocommit = False
         cur2 = conn2.cursor()
         cur2.execute("""
-            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json)
+            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json, source_type)
             OUTPUT INSERTED.training_id
-            VALUES (?, 'queued', ?, ?, ?)
-        """, user_id, len(files), cword, json.dumps(files))
+            VALUES (?, 'queued', ?, ?, ?, ?)
+        """, user_id, len(files), cword, json.dumps(files), train_source)
         training_id = cur2.fetchone()[0]
         if is_retrain:
             cur2.execute(
@@ -855,6 +864,10 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
         credit_cost=cost,
         initial_status="waiting_lora" if parked else "queued",
+        # Tag the job with the product it belongs to (finding #6 foundation): drives the
+        # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
+        # 'one_time' | 'monthly'.
+        source_type=plan.plan_type,
     )
     if not result.ok:
         if result.reason == "credits":
@@ -1207,7 +1220,7 @@ def admin_stuck_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     cursor.execute(
         "SELECT job_id, user_id, status, external_execution_id, created_at "
         "FROM jobs WHERE status IN ('dispatching', 'processing') "
-        "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+        "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
         -minutes,
     )
     jobs = [
@@ -1367,7 +1380,11 @@ def process_inference_job(msg: func.QueueMessage):
             # 5) Claim the job atomically: only the writer that flips queued ->
             #    dispatching proceeds (guards against any double-claim).
             cur.execute(
-                "UPDATE jobs SET status = 'dispatching' WHERE job_id = ? AND status = 'queued'",
+                # Stamp dispatched_at HERE (the queued -> dispatching claim): it marks when the
+                # GPU run begins, so the reaper can measure the processing deadline from it and
+                # not penalise a job for queue wait (finding #5, part A).
+                "UPDATE jobs SET status = 'dispatching', dispatched_at = GETUTCDATE() "
+                "WHERE job_id = ? AND status = 'queued'",
                 job_id,
             )
             claimed = cur.rowcount == 1
@@ -1835,10 +1852,12 @@ def handle_poison_job(msg: func.QueueMessage):
 
 
 # ── Timer-trigger reaper ──────────────────────────────────────────────────────
-# Runs every 10 minutes. Finds jobs stuck in 'processing' past the inference
-# wall-time ceiling (REAPER_STUCK_MINUTES, default 45 min — well above the
-# SDXL 4-variation worst-case ≈ 20 min). Also reaps 'dispatching' rows the
-# dispatcher crashed mid-claim (REAPER_DISPATCHING_MINUTES, default 15 min).
+# Runs every 10 minutes. Finds jobs stuck in 'processing' past the wall-time ceiling
+# (REAPER_STUCK_MINUTES, default 130 min), measured from dispatched_at (COALESCE
+# created_at) so queue wait doesn't count — 130 sits just above the GPU job's own
+# 120-min replicaTimeout, so a still-'processing' row past it is genuinely dead, never a
+# slow-but-healthy run (finding #5). Also reaps 'dispatching' rows the dispatcher crashed
+# mid-claim (REAPER_DISPATCHING_MINUTES, default 15 min).
 # Both paths call _mark_failed: guarded transition + one-time credit refund.
 # An OOM SIGKILL (exit 137) leaves the row in 'processing' because the process
 # is killed before it can write — this reaper is the ONLY thing that clears it.
@@ -1847,16 +1866,19 @@ def reaper(timer: func.TimerRequest):
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # Measure from dispatched_at (when the GPU run started), COALESCE to created_at for
+        # rows written before migration 015 — so queue wait doesn't count against the
+        # deadline and a healthy job that merely waited isn't reaped (finding #5, part A).
         cur.execute(
             "SELECT job_id FROM jobs WHERE status = 'processing' "
-            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_STUCK_MINUTES,
         )
         stuck = [str(r[0]) for r in cur.fetchall()]
 
         cur.execute(
             "SELECT job_id FROM jobs WHERE status = 'dispatching' "
-            "AND created_at < DATEADD(MINUTE, ?, GETUTCDATE())",
+            "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_DISPATCHING_MINUTES,
         )
         stuck += [str(r[0]) for r in cur.fetchall()]
@@ -2032,6 +2054,15 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Queued (pay-at-activation) plan purchase, if any (finding #6): the frontend shows it and
+    # lets the user complete checkout once their current product ends. null when nothing queued.
+    cursor.execute(
+        "SELECT purchase_type, plan_key FROM pending_purchases "
+        "WHERE user_id = ? AND status = 'pending'",
+        user_id)
+    prow = cursor.fetchone()
+    queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
+
     # Compute the NEXT renewal so the frontend can show "renews {date}". Stripe bills on a
     # MONTHLY cadence (same day-of-month each cycle), so add one calendar month — NOT 30 days,
     # which drifts ~5 days/year off the real billing date. Only meaningful for active monthly.
@@ -2051,8 +2082,15 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "type": row[1],
             "credits_remaining": row[2],
             "credits_monthly_limit": row[3],
+            # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
+            # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
+            # UI works with no coordinated frontend release.
+            "monthly_quota": row[3],
             "subscription_renewed_at": str(row[4]) if row[4] else None,
             "next_renewal": next_renewal,
+            # ALIAS: Dashboard.tsx / Onboarding.tsx read `renewal_date` — same drift, which is
+            # why "renews on {date}" never appeared.
+            "renewal_date": next_renewal,
             # Dunning: non-null means the latest monthly renewal charge FAILED and Stripe is
             # retrying — the UI should prompt "update your card". Cleared on the next success.
             "payment_failed": bool(row[5]),
@@ -2061,10 +2099,39 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             # "cancels on {cancel_at}" and offers Reactivate (POST /subscriptions/reactivate).
             "cancel_pending": bool(row[6]),
             "cancel_at": str(row[6]) if row[6] else None,
+            # Queued (pay-at-activation) plan purchase, if any — complete it when the current
+            # product ends. null when nothing is queued.
+            "queued_purchase": queued_purchase,
         }),
         mimetype="application/json",
         status_code=200,
     )
+
+
+def _queue_pending_purchase(user_id: str, purchase_type: str, plan: str):
+    """Record a queued plan purchase (finding #6, pay-at-activation): the user completes
+    checkout when their current product ends. One PENDING row per user — a new queue
+    supersedes the prior one."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM pending_purchases WHERE user_id = ? AND status = 'pending'", user_id)
+        cur.execute(
+            # plan_key, not "plan" — `plan` is a reserved keyword in SQL Server.
+            "INSERT INTO pending_purchases (user_id, purchase_type, plan_key) VALUES (?, ?, ?)",
+            user_id, purchase_type, plan)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clear_pending_purchase(cur, user_id: str):
+    """Mark a user's queued purchase 'done' once they actually complete a purchase. Uses the
+    CALLER'S cursor so it commits with the grant/activation. Safe no-op if none is pending."""
+    cur.execute(
+        "UPDATE pending_purchases SET status = 'done' WHERE user_id = ? AND status = 'pending'",
+        user_id)
 
 
 # ── Subscriptions: Create Checkout ────────────────────────
@@ -2091,6 +2158,54 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     # nothing and Stripe collects the email on its hosted page (see _maybe_email).
     email         = (payload.get("email") or payload.get("preferred_username")
                      or payload.get("upn") or "")
+
+    # ── Purchase gate (finding #6): ONE active product at a time ─────────────────
+    # Stops the state corruption where a one-time purchase clobbers an active monthly sub
+    # (leaving it uncancellable) or a second monthly orphans the first. Reject a PLAN purchase
+    # that collides with the user's current product, with a clear next step. Adding credits to
+    # an active monthly is a SEPARATE endpoint (not gated here). NOTE: a later step turns the
+    # 'monthly_active' reject into a QUEUE (activate the plan when the current one ends).
+    gconn = get_db()
+    gcur = gconn.cursor()
+    gcur.execute(
+        "SELECT subscription_type, stripe_subscription_id FROM users WHERE user_id = ?",
+        user_id,
+    )
+    grow = gcur.fetchone()
+    active_monthly = bool(grow and grow[0] == "monthly" and grow[1])
+    gcur.execute(
+        "SELECT COUNT(*) FROM jobs WHERE user_id = ? "
+        "AND status IN ('queued', 'waiting_lora', 'dispatching', 'processing')",
+        user_id,
+    )
+    generation_in_flight = int(gcur.fetchone()[0]) > 0
+
+    # Validate the requested plan/type up front — needed before we can QUEUE or checkout.
+    valid_combo = ((payment_type == "one_time" and plan in ONE_TIME_PLANS) or
+                   (payment_type == "monthly" and plan in MONTHLY_PLANS))
+    if not valid_combo:
+        return func.HttpResponse(
+            json.dumps({"error": "type must be 'one_time' or 'monthly', and plan one of "
+                                 "basic, pro, expert."}),
+            mimetype="application/json", status_code=400)
+
+    if active_monthly or generation_in_flight:
+        # QUEUE it (pay-at-activation): record the intent now; the user completes checkout when
+        # their current product ends and they're idle again — we do NOT charge at queue time.
+        # One pending row per user (a new queue supersedes the prior one).
+        _queue_pending_purchase(user_id, payment_type, plan)
+        if active_monthly:
+            state, msg = "monthly_active", (
+                "You already have an active monthly plan — we've queued this to start when your "
+                "plan ends. Meanwhile, use 'Add credits' for more images now.")
+        else:
+            state, msg = "generation_in_flight", (
+                "Your current generation is still running — we've queued this to start when it "
+                "finishes.")
+        return func.HttpResponse(
+            json.dumps({"status": "queued", "billing_state": state,
+                        "queued": {"type": payment_type, "plan": plan}, "message": msg}),
+            mimetype="application/json", status_code=202)
 
     if payment_type == "one_time":
         if plan not in ONE_TIME_PLANS:
@@ -2132,6 +2247,62 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200,
     )
+
+
+# ── Subscriptions: Add credits (top-up for an active monthly plan) ──
+# The counterpart to the create_subscription gate (finding #6): while a monthly plan is
+# active, the user does NOT buy another plan — they add credits, generated from their
+# EXISTING model (no retrain). Only an active monthly account may top up.
+@app.route(route="subscriptions/credits/topup", methods=["POST"])
+def topup_credits(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    pack        = body.get("pack") or body.get("plan", "")
+    success_url = body.get("success_url", "https://bettersnap.ai/subscription/success")
+    cancel_url  = body.get("cancel_url",  "https://bettersnap.ai/subscription/cancel")
+    email       = (payload.get("email") or payload.get("preferred_username")
+                   or payload.get("upn") or "")
+
+    if pack not in ONE_TIME_PLANS:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid credit pack. Choose: basic, pro, expert"}),
+            mimetype="application/json", status_code=400)
+
+    # Gate: top-ups are ONLY for an active monthly plan. A non-subscriber buys a plan, not
+    # loose credits — otherwise the credit-rate ambiguity #6 warned about creeps back in.
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT subscription_type, stripe_subscription_id FROM users WHERE user_id = ?",
+        user_id)
+    row = cur.fetchone()
+    if not (row and row[0] == "monthly" and row[1]):
+        return func.HttpResponse(
+            json.dumps({"error": "Credit top-ups are only available on an active monthly plan.",
+                        "billing_state": "no_active_monthly"}),
+            mimetype="application/json", status_code=409)
+
+    try:
+        session = create_topup_checkout(user_id, email, pack, success_url, cancel_url)
+    except Exception as e:
+        logging.error(f"Stripe top-up checkout failed: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502)
+
+    return func.HttpResponse(
+        json.dumps({"checkout_url": session["url"], "session_id": session["id"]}),
+        mimetype="application/json", status_code=200)
 
 
 # ── Subscriptions: Cancel ─────────────────────────────────
@@ -2268,6 +2439,8 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
             _handle_onetime_payment(session, event_id)
         elif payment_type == "monthly":
             _handle_monthly_checkout(session, event_id)
+        elif payment_type == "topup":
+            _handle_topup(session, event_id)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         _handle_invoice_paid(event["data"]["object"], event_id)
@@ -2332,6 +2505,7 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
             )
             return
+        _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + grant commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
     finally:
@@ -2383,8 +2557,50 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 f"MANUAL RECONCILIATION REQUIRED."
             )
             return
+        _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + activation commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+    finally:
+        conn.close()
+
+
+def _handle_topup(session: dict, event_id: str):
+    """Grant a credit top-up to an ACTIVE monthly account (finding #6). Adds `images` worth of
+    generation at the account's monthly credit rate (credits_per_image). Idempotent via
+    _claim_event; refuses to apply to a non-monthly account so a top-up can never land on a
+    one-time/idle user and reintroduce the credit-rate ambiguity."""
+    user_id = session.get("metadata", {}).get("user_id")
+    pack    = session.get("metadata", {}).get("plan")
+    if not user_id or pack not in ONE_TIME_PLANS:
+        logging.error(f"topup missing/invalid metadata: {session}")
+        return
+    images = ONE_TIME_PLANS[pack]["images"]
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping topup.")
+            return
+        # Only an active monthly account can receive a top-up; read its plan to get the credit
+        # rate so we add the right number of credits for `images` images.
+        cur.execute(
+            "SELECT plan_name FROM users WHERE user_id = ? AND subscription_type = 'monthly'",
+            user_id)
+        prow = cur.fetchone()
+        if not prow:
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
+                f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
+            return
+        rate = max(1, get_plan(prow[0]).credits_per_image)
+        grant = images * rate
+        cur.execute(
+            "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
+            grant, user_id)
+        conn.commit()  # claim + grant commit atomically
+        logging.info(f"Top-up: user={user_id} pack={pack} +{grant} credits ({images} images)")
     finally:
         conn.close()
 
@@ -2484,13 +2700,25 @@ def _handle_subscription_ended(sub: dict, event_id: str):
 
 # ── Data retention cleanup ────────────────────────────────
 def _delete_blobs(container_name: str, prefix: str) -> int:
-    """Delete every blob under `prefix` in `container_name`. Best-effort; returns count."""
+    """Delete every blob under `prefix` in `container_name`. Best-effort; returns count.
+
+    CASE-SENSITIVITY — the bug this guards against: Azure blob prefixes are CASE-SENSITIVE.
+    Ids come out of SQL as UPPERCASE GUIDs ("908A8F2A-..."), but the pipeline WRITES paths
+    with the lowercase guid (inputs/908a8f2a-.../, lora-weights/identity/908a8f2a-.../).
+    Matching only the SQL casing therefore matched NOTHING: retention_cleanup logged a
+    successful run every hour while every uploaded photo and trained adapter stayed in
+    storage forever — a privacy problem (data never actually purged) and an unbounded
+    storage bill. Proven empirically: the uppercase prefix deleted 0 blobs, the lowercase
+    prefix deleted 17 for the same user. Try both casings so it works whichever the writer used.
+    """
     n = 0
+    variants = [prefix] if prefix == prefix.lower() else [prefix, prefix.lower()]
     try:
         container = get_blob_client().get_container_client(container_name)
-        for b in container.list_blobs(name_starts_with=prefix):
-            container.delete_blob(b.name)
-            n += 1
+        for p in variants:
+            for b in container.list_blobs(name_starts_with=p):
+                container.delete_blob(b.name)
+                n += 1
     except Exception as e:
         logging.warning(f"retention: blob cleanup failed for {container_name}/{prefix}: {e}")
     return n
