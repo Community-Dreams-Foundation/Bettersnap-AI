@@ -6,6 +6,8 @@
 !main.py
 !requirements.txt
 !rrdbnet.py
+!stage_runtime.py
+!prompt_control.py
 # Trainer scripts, for the unified image's COPY training/trainer/... (same nested-whitelist
 # walk as catalog.py below).
 !training
