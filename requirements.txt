@@ -14,6 +14,12 @@ accelerate==1.14.0
 peft>=0.11
 huggingface_hub>=0.34.0
 Pillow
+# main.py imports cv2 for face detection used by the optional refinement stages.
+# Without OpenCV, initialization raised ImportError and the affected stages silently
+# skipped in production. Use the headless wheel to avoid GUI/libGL dependencies and
+# pin the version for reproducible evaluation. NumPy remains pinned to 1.26.4 in
+# Dockerfile.unified; verify cv2 + NumPy compatibility in the built GPU image.
+opencv-python-headless==4.11.0.86
 requests
 azure-storage-queue
 azure-storage-blob
