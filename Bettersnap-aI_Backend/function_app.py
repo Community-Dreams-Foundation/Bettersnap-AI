@@ -37,6 +37,16 @@ REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "1
 # 1400 steps regardless of count — so more photos cost quality-nothing and time-nothing.
 MIN_TRAINING_PHOTOS = int(os.environ.get("MIN_TRAINING_PHOTOS", "8"))
 MAX_TRAINING_PHOTOS = int(os.environ.get("MAX_TRAINING_PHOTOS", "12"))
+# Upload validation (0.6). Extension alone proved nothing — /upload accepted any bytes
+# with a .jpg name and read the whole request into memory. Enforce a byte cap BEFORE
+# decode, then decode with Pillow to confirm it is a real image of the claimed type, cap
+# pixel dimensions, and guard against decompression bombs (a tiny file that expands to
+# billions of pixels). Limits are generous for phone photos and env-tunable.
+MAX_UPLOAD_BYTES  = int(os.environ.get("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))   # 15 MB
+MIN_UPLOAD_DIM    = int(os.environ.get("MIN_UPLOAD_DIM", "256"))                     # px
+MAX_UPLOAD_DIM    = int(os.environ.get("MAX_UPLOAD_DIM", "8192"))                    # px
+MAX_UPLOAD_PIXELS = int(os.environ.get("MAX_UPLOAD_PIXELS", str(40_000_000)))        # 40 MP
+_ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "MPO"}   # MPO = multi-frame JPEG from phones
 # Measured training wall-time is ~51 min (17.6 class-image gen + 28.1 train + startup).
 # The watcher fails a run that blows past this, releasing any jobs parked behind it.
 TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
@@ -405,8 +415,50 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     if ext not in ["jpg", "jpeg", "png"]:
         return func.HttpResponse("Invalid file type", status_code=400)
 
+    # ── 0.6 upload validation ────────────────────────────────────────────────
+    # Read ONCE, cap size before doing any decode work, then verify the bytes are a
+    # real image of an allowed type within sane dimensions. This is stronger than the
+    # extension/MIME check above (both client-controlled): a real decode cannot be spoofed.
+    import io as _io
+    from PIL import Image as _Image, UnidentifiedImageError as _UnidentifiedImageError
+
+    data = file.read()
+    if not data:
+        return func.HttpResponse("Empty file", status_code=400)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return func.HttpResponse(
+            json.dumps({"error": f"Photo too large ({len(data)//1024//1024} MB); "
+                                 f"max {MAX_UPLOAD_BYTES//1024//1024} MB."}),
+            mimetype="application/json", status_code=400)
+    try:
+        with _Image.open(_io.BytesIO(data)) as _im:
+            fmt = (_im.format or "").upper()
+            w, h = _im.size
+            _im.verify()   # catches truncated/corrupt payloads; consumes the object
+    except _UnidentifiedImageError:
+        return func.HttpResponse("File is not a readable image", status_code=400)
+    except _Image.DecompressionBombError:
+        return func.HttpResponse("Image rejected (decompression-bomb guard)", status_code=400)
+    except Exception:
+        return func.HttpResponse("File is not a readable image", status_code=400)
+
+    if fmt not in _ALLOWED_IMAGE_FORMATS:
+        return func.HttpResponse(
+            json.dumps({"error": f"Unsupported image format {fmt or 'unknown'}; "
+                                 f"use JPEG or PNG."}),
+            mimetype="application/json", status_code=400)
+    if w * h > MAX_UPLOAD_PIXELS or w > MAX_UPLOAD_DIM or h > MAX_UPLOAD_DIM:
+        return func.HttpResponse(
+            json.dumps({"error": f"Image too large ({w}x{h}); max {MAX_UPLOAD_DIM}px per side "
+                                 f"and {MAX_UPLOAD_PIXELS//1_000_000} MP."}),
+            mimetype="application/json", status_code=400)
+    if w < MIN_UPLOAD_DIM or h < MIN_UPLOAD_DIM:
+        return func.HttpResponse(
+            json.dumps({"error": f"Image too small ({w}x{h}); min {MIN_UPLOAD_DIM}px per side."}),
+            mimetype="application/json", status_code=400)
+
     blob_name = f"{user_id}/input/{file.filename}"
-    url = upload_blob("inputs", blob_name, file.read())
+    url = upload_blob("inputs", blob_name, data)
 
     # Canonical convention: input_blob_path is "<container>/<blob>" so the
     # inference container resolves it without assuming a container name.
@@ -493,7 +545,9 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    from shared.crops import crop_head_and_shoulders, NoFaceError, MultipleFacesError
+    from shared.crops import (crop_head_and_shoulders, NoFaceError,
+                              MultipleFacesError, FaceTooSmallError,
+                              EyesOccludedError)
 
     try:
         body = req.get_json()
@@ -609,19 +663,50 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         except MultipleFacesError:
             rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
                              "code": "MULTIPLE_FACES", "reason": "more than one face"})
+        except EyesOccludedError as e:
+            # Eyes carry more identity than any other feature. A set dominated by
+            # sunglasses trains an adapter with no eyes to reproduce.
+            rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
+                             "code": "EYES_OCCLUDED",
+                             "reason": "your eyes are covered in this photo",
+                             "eye_ratio": e.ratio})
+        except FaceTooSmallError as e:
+            # Detected fine, but too few pixels to crop without heavy upscaling — the
+            # adapter would learn interpolation mush as this user's skin. Tell them the
+            # actionable thing (get closer), not the pixel count.
+            rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
+                             "code": "FACE_TOO_SMALL",
+                             "reason": "you're too far away in this photo",
+                             "face_px": e.face_px, "required_px": e.required_px})
         except ValueError as e:
             rejected.append({"photo": os.path.basename(blob_name), "index": i + 1,
                              "code": "NOT_AN_IMAGE", "reason": str(e)})
 
     if rejected:
         names = ", ".join(str(r["index"]) for r in rejected)
+        plural = len(rejected) > 1
+        # Lead with the dominant reason so the user knows what to DO. "Too far away" is
+        # the common real-world case (measured: 6 of 9 photos in a real upload set) and
+        # needs different advice from "no face found" — telling someone their clearly-
+        # visible face "isn't clear" when they simply stood too far back is unactionable.
+        codes = {r["code"] for r in rejected}
+        if codes == {"FACE_TOO_SMALL"}:
+            msg = (f"In photo{'s' if plural else ''} {names} you're too far away — "
+                   f"please use closer shots where your face fills more of the frame.")
+        elif codes == {"EYES_OCCLUDED"}:
+            msg = (f"Photo{'s' if plural else ''} {names} "
+                   f"{'have' if plural else 'has'} your eyes covered — "
+                   f"please use photos without sunglasses.")
+        elif codes == {"MULTIPLE_FACES"}:
+            msg = (f"Photo{'s' if plural else ''} {names} "
+                   f"{'have' if plural else 'has'} more than one person — "
+                   f"please use solo photos.")
+        else:
+            msg = (f"Photo{'s' if plural else ''} {names} "
+                   f"{'don' if plural else 'doesn'}'t work for training — "
+                   f"please replace {'them' if plural else 'it'}.")
         return func.HttpResponse(
-            json.dumps({
-                "error": f"Photo {names} doesn't show your face clearly, please replace it."
-                         if len(rejected) == 1 else
-                         f"Photos {names} don't show your face clearly, please replace them.",
-                "rejected": rejected,
-            }),
+            json.dumps({"error": msg, "rejected": rejected}),
             mimetype="application/json", status_code=400)
 
     # ── Upload crops + build FILES_JSON programmatically ──────────────────────
