@@ -2,6 +2,7 @@ import os
 import io
 import json
 import time
+import hashlib
 import logging
 import traceback
 import faulthandler
@@ -35,6 +36,8 @@ import numpy as np
 # Real-ESRGAN generator (vendored, BSD-3-Clause — COMMERCIAL-SAFE). 2K upscale
 # post-process. do NOT swap to a non-commercial upscaler.
 from rrdbnet import RRDBNet
+from stage_runtime import run_stage
+from prompt_control import apply_composition_control
 from azure.keyvault.secrets import SecretClient
 
 from azure.storage.queue import QueueClient, TextBase64DecodePolicy
@@ -126,6 +129,22 @@ ip_adapter_ok = False   # IP-Adapter Plus-Face loaded successfully?
 img2img_pipe = None     # SDXL img2img (shares pipe's UNet/LoRA/IP-Adapter) for face refine
 _face_cascade = None    # cv2 Haar cascade for locating the face to refine
 
+# Per-stage init outcome for the run manifest: name -> {enabled, initialized, reason[, error]}.
+# Populated by load_base_model via stage_runtime.run_stage. SINGLE-JOB INVARIANT: the GPU
+# worker serves ONE job per container execution (one JOB_ID, no threads), so a module-global
+# is safe. If the worker is ever changed to serve concurrent jobs in one process, this must
+# become per-job state (pass a fresh dict into run_stage per job) — see stage_runtime.py.
+STAGE_STATUS = {}
+
+
+class IpAdapterReferenceUnavailable(RuntimeError):
+    """IP-Adapter is enabled but the user's reference face crops are unavailable at
+    generation time (retention deletes the input crops after N days). We FAIL the job
+    clearly rather than silently dropping to LoRA-only — that would change output quality
+    with no error and no signal to anyone. The __main__ handler catches this like any
+    other generation error and marks the job 'failed' (which refunds)."""
+    code = "IP_ADAPTER_REFERENCE_UNAVAILABLE"
+
 # ─────────────────────────────────────────────────────────
 # PRODUCT-LEVEL MENU + PROMPT CONFIG (general — identical for every user)
 # NOTHING here is per-user or per-demographic. `gender` selects which attire set
@@ -187,6 +206,16 @@ DEFAULT_LORA_WEIGHT   = float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0"))
 # IP-Adapter Plus-Face conditioning strength (0 disables). 0.5-0.7 adds identity from the
 # user's own face crop without fighting the prompt/attire. Env-tunable for A/B testing.
 IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.6"))
+# Which fetched reference crop feeds IP-Adapter (Phase-3 ablation). DEFAULT 0 = the first
+# crop = current behavior (strategy A), so the baseline / Phase-2 control is unchanged. The
+# harness (evaluation.reference_selection) picks a best-quality index for strategy B and it
+# is passed in via this env — the GPU worker does no detection of its own. Clamped to the
+# available crops at use time.
+IP_ADAPTER_REF_INDEX  = int(os.environ.get("IP_ADAPTER_REF_INDEX", "0"))
+# Phase-5 composition control: append explicit head-and-shoulders framing + composition
+# negatives to steer away from full-body/averted output. DEFAULT 0 so the Phase-2 baseline
+# (current prompts) is unchanged; the Phase-5 experiment sets it to 1.
+COMPOSITION_CONTROL   = os.environ.get("COMPOSITION_CONTROL", "0").strip() != "0"
 # Face-inpaint ("ADetailer") pass: after the base image, re-render JUST the face crop at
 # 1024 (with LoRA + IP-Adapter) so eyes/skin get real detail instead of upscaler-guessed
 # mush. STRENGTH controls how much is rewritten (0.35-0.5); too high drifts the face.
@@ -286,11 +315,18 @@ def age_to_phrase(age_range: str) -> str:
 # ─────────────────────────────────────────────────────────
 
 def load_base_model():
-    global pipe, upscaler, ip_adapter_ok, img2img_pipe, _face_cascade
+    # upscaler / img2img_pipe / _face_cascade are assigned inside the nested _init_*
+    # functions below, which declare their own `global`; only pipe and ip_adapter_ok are
+    # assigned directly in this scope.
+    global pipe, ip_adapter_ok
     if pipe is not None:
         return
 
     write_debug("START: load_base_model called")
+    # Fresh status each real load (the pipe!=None guard above means this runs once per
+    # process, but clearing keeps STAGE_STATUS honest if that guard ever changes).
+    STAGE_STATUS.clear()
+    ip_adapter_ok = False
 
     try:
         files = os.listdir("/models")
@@ -315,60 +351,79 @@ def load_base_model():
         )
         pipe = pipe.to("cuda")
 
-        # IP-Adapter Plus-Face (CLIP ViT-H, commercial-safe): stronger per-user identity by
-        # conditioning on the user's OWN face crop (applied per job in run_inference). Works
-        # alongside the identity LoRA (LoRA edits existing attention; IP-Adapter adds image
-        # cross-attention). Graceful: any failure falls back to LoRA-only generation.
-        ip_adapter_ok = False
-        if IP_ADAPTER_SCALE > 0:
-            try:
-                pipe.load_ip_adapter(
-                    "/models/ip-adapter",
-                    subfolder="sdxl_models",
-                    weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-                    image_encoder_folder="models/image_encoder",
-                )
-                ip_adapter_ok = True
-                write_debug("IP-Adapter Plus-Face loaded (CLIP ViT-H)")
-            except Exception as e:
-                write_debug(f"IP-Adapter load FAILED (LoRA-only): {e}")
+        # ── Optional pipeline stages (Phase-0 stage runner) ──────────────────────
+        # Each stage initializes independently and records {enabled, initialized,
+        # reason[, error]} in STAGE_STATUS for the run manifest. Policy: a DISABLED stage
+        # is skipped and recorded; an ENABLED stage that fails to initialize is FATAL —
+        # no more silently continuing with a required quality stage missing (the bug that
+        # made face-refine + realism never run in prod when cv2 was absent). EXCEPTION:
+        # 'upscale' degrades to 1024 and records reason=degraded_to_1024 rather than
+        # failing a ~30-min job over a resolution downgrade. See stage_runtime.py.
+        def _init_ip_adapter():
+            # IP-Adapter Plus-Face (CLIP ViT-H, commercial-safe): conditions on the user's
+            # own face crop (applied per job), alongside the identity LoRA.
+            global ip_adapter_ok
+            pipe.load_ip_adapter(
+                "/models/ip-adapter",
+                subfolder="sdxl_models",
+                weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+                image_encoder_folder="models/image_encoder",
+            )
+            ip_adapter_ok = True
+            write_debug("IP-Adapter Plus-Face loaded (CLIP ViT-H)")
 
-        # Face-inpaint pipe: an SDXL img2img that SHARES pipe's components (same UNet, so the
-        # identity LoRA + IP-Adapter processors carry over automatically — no re-load, no
-        # dilution). Plus a Haar face detector. Both graceful: on failure we skip the refine.
-        if FACE_REFINE_ENABLE:
-            try:
-                import cv2
+        def _init_upscaler():
+            # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause — COMMERCIAL-SAFE). Weight baked at
+            # /models/realesrgan (params_ema key). do NOT swap to a non-commercial upscaler.
+            global upscaler
+            up = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4,
+                         num_feat=64, num_block=23, num_grow_ch=32)
+            _sd = torch.load("/models/realesrgan/RealESRGAN_x4plus.pth", map_location="cpu")
+            _sd = _sd.get("params_ema", _sd.get("params", _sd))
+            up.load_state_dict(_sd, strict=True)
+            up = up.to("cuda").eval()
+            if UPSCALE_HALF:
+                up = up.half()
+            upscaler = up
+            write_debug(f"Real-ESRGAN upscaler loaded (target={UPSCALE_TARGET}, half={UPSCALE_HALF})")
+
+        def _init_shared_img2img():
+            # The ONE img2img pipe shared by realism + face-refine. Shares pipe.components
+            # (same UNet/LoRA/IP-Adapter — no second SDXL load). Lazy + idempotent, so
+            # realism no longer depends on face-refine being enabled.
+            global img2img_pipe
+            if img2img_pipe is None:
                 from diffusers import StableDiffusionXLImg2ImgPipeline
                 img2img_pipe = StableDiffusionXLImg2ImgPipeline(**pipe.components)
-                _face_cascade = cv2.CascadeClassifier(
-                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-                write_debug("Face-inpaint img2img pipe + detector ready")
-            except Exception as e:
-                img2img_pipe = None
-                write_debug(f"Face-inpaint setup FAILED (skipping refine): {e}")
 
-        # Real-ESRGAN x4 upscaler (RRDBNet, BSD-3-Clause — COMMERCIAL-SAFE) for the
-        # 2K post-process. Weight baked at /models/realesrgan (params_ema key). Kept
-        # resident on the A100 (its ~67MB weights + a single 1024→4096 pass fit
-        # easily in 80GB alongside the fp16 pipe). do NOT swap to a non-commercial
-        # upscaler. UPSCALE_TARGET=0 skips loading it.
-        if UPSCALE_TARGET > 0:
-            try:
-                upscaler = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4,
-                                   num_feat=64, num_block=23, num_grow_ch=32)
-                _sd = torch.load("/models/realesrgan/RealESRGAN_x4plus.pth",
-                                 map_location="cpu")
-                _sd = _sd.get("params_ema", _sd.get("params", _sd))
-                upscaler.load_state_dict(_sd, strict=True)
-                upscaler = upscaler.to("cuda").eval()
-                if UPSCALE_HALF:
-                    upscaler = upscaler.half()
-                write_debug(f"Real-ESRGAN upscaler loaded (target={UPSCALE_TARGET}, half={UPSCALE_HALF})")
-            except Exception as e:
-                # Non-fatal: fall back to raw 1024 rather than failing the whole job.
-                upscaler = None
-                write_debug(f"Upscaler load FAILED (shipping 1024): {e}")
+        def _init_face_refine():
+            # Requires BOTH the shared img2img pipe AND the Haar detector; either failing
+            # must leave the stage un-initialized (so run_stage records init_failed).
+            global _face_cascade
+            import cv2
+            _init_shared_img2img()
+            casc = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            if casc.empty():
+                raise RuntimeError("Haar face cascade failed to load (empty classifier)")
+            _face_cascade = casc
+            write_debug("Face-inpaint img2img pipe + detector ready")
+
+        def _init_realism():
+            # Realism's only init-time prerequisite is the shared img2img pipe (ref_face is
+            # per-image/optional; prompts + steps/CFG are module constants). Named so any
+            # future realism-only prereq lives here and is required BEFORE 'initialized'.
+            _init_shared_img2img()
+            write_debug("Realism img2img pipe ready")
+
+        def _stage(name, enabled, init_fn, **kw):
+            return run_stage(name, enabled, init_fn, STAGE_STATUS, log=write_debug, **kw)
+
+        _stage("ip_adapter",  IP_ADAPTER_SCALE > 0, _init_ip_adapter)
+        _stage("upscale",     UPSCALE_TARGET > 0,   _init_upscaler,
+               fatal=False, degraded_reason="degraded_to_1024")
+        _stage("face_refine", FACE_REFINE_ENABLE,   _init_face_refine)
+        _stage("realism",     REALISM_PASS_ENABLE,  _init_realism)
 
         try:
             props = torch.cuda.get_device_properties(0)
@@ -706,21 +761,30 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
         log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
 
 
-def _get_ref_faces(user_id: str, n: int = 3) -> list:
+def _get_ref_faces(user_id: str, n: int = 3):
     """Download up to `n` of the user's face crops (from the `inputs` container) to use as
     IP-Adapter Plus-Face reference images. These are the SAME crops the LoRA trained on, so
-    the two identity signals agree. Returns a list of PIL RGB images (possibly empty)."""
+    the two identity signals agree.
+
+    IMPORTANT: these crops live under the user's `inputs` prefix, which retention deletes —
+    so at generation time they may be gone. The caller decides what to do with an empty
+    result (see the IP_ADAPTER_REFERENCE_UNAVAILABLE path); this function only reports.
+
+    Returns (refs, ids): a list of PIL RGB images and the parallel list of blob basenames
+    that were actually fetched, so callers can log/record EXACTLY which references exist and
+    which one is used (the pipeline currently uses index 0 only)."""
     import io
     from PIL import Image
-    refs = []
+    refs, ids = [], []
     for i in range(n):
         blob_name = f"{user_id}/input/crop_upperbody/img{i}.jpg"
         try:
             data = blob_service.get_blob_client(container="inputs", blob=blob_name).download_blob().readall()
             refs.append(Image.open(io.BytesIO(data)).convert("RGB"))
+            ids.append(f"img{i}.jpg")
         except Exception as e:
             write_debug(f"IP-Adapter ref img{i} unavailable: {e}")
-    return refs
+    return refs, ids
 
 
 def _refine_face(image, ref_face, face_prompt):
@@ -857,6 +921,77 @@ def _add_film_grain(image):
 # Core inference
 # ─────────────────────────────────────────────────────────
 
+def _sha256_file(path):
+    """SHA-256 of a file, or None if unreadable. Used for the LoRA-adapter fingerprint
+    in the run manifest so a run can be tied to the EXACT adapter it used."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def write_run_manifest(job_id, user_id, extra):
+    """Emit a reproducibility manifest to outputs/manifests/<job_id>.json (0.5).
+
+    Records what is needed to reproduce or audit a run: the exact image/commit, model
+    versions + adapter checksum, per-stage init status (STAGE_STATUS), the IP-Adapter
+    references actually used, sampling config, seeds, GPU, durations, and the DELIVERED
+    resolution (read from the real output, not inferred). Fields that only build/deploy
+    knows (image digest, git SHA, lockfile hash) are read from env and recorded as 'unset'
+    when not wired, so a gap is visible rather than hidden. Best-effort: never fails a job."""
+    try:
+        try:
+            gpu = torch.cuda.get_device_properties(0).name
+        except Exception:
+            gpu = "unknown"
+        manifest = {
+            "schema": "bettersnap.run_manifest/v1",
+            "job_id": job_id,
+            "user_id_sha256": hashlib.sha256((user_id or "").encode()).hexdigest(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": os.environ.get("MODE", "infer"),
+            # reproducibility — injected by build/deploy; 'unset' until wired (follow-up)
+            "container_image": os.environ.get("CONTAINER_IMAGE", "unset"),
+            "container_image_digest": os.environ.get("CONTAINER_IMAGE_DIGEST", "unset"),
+            "git_commit_sha": os.environ.get("GIT_COMMIT_SHA", "unset"),
+            "lockfile_sha256": os.environ.get("LOCKFILE_SHA256", "unset"),
+            # models
+            "base_model": os.environ.get("BASE_MODEL", "/models/sdxl-base"),
+            "vae_model": os.environ.get("VAE_MODEL", "/models/sdxl-vae"),
+            "lora_adapter_sha256": _sha256_file(f"/tmp/lora_identity_{user_id}.safetensors"),
+            "lora_identity_weight": DEFAULT_LORA_WEIGHT,
+            "identity_trigger": IDENTITY_TRIGGER,
+            # ip-adapter (model + which refs were fetched vs used, from 0.3/0.4)
+            "ip_adapter": {"model": "ip-adapter-plus-face_sdxl_vit-h.safetensors",
+                           **extra.get("ref_meta", {})},
+            # sampling
+            "scheduler": extra.get("scheduler", "unknown"),
+            "guidance_scale": DEFAULT_CFG,
+            "num_inference_steps": DEFAULT_STEPS,
+            "gen_resolution": [DEFAULT_WIDTH, DEFAULT_HEIGHT],
+            "delivered_resolution": extra.get("delivered_size"),
+            "negative_prompt": extra.get("negative_prompt"),
+            "seeds": extra.get("seeds", []),
+            "image_count": extra.get("image_count"),
+            # stages (0.2) — enabled/initialized/reason per optional stage
+            "stages": dict(STAGE_STATUS),
+            # perf
+            "gpu": gpu,
+            "generation_seconds": extra.get("generation_seconds"),
+        }
+        body = json.dumps(manifest, indent=2, default=str).encode()
+        blob_service.get_blob_client(
+            container="outputs", blob=f"manifests/{job_id}.json").upload_blob(
+            body, overwrite=True)
+        write_debug(f"run manifest written: outputs/manifests/{job_id}.json")
+    except Exception as e:
+        write_debug(f"manifest write FAILED (non-fatal): {e}")
+
+
 def run_inference(job: dict) -> list:
     job_id     = job["job_id"]
     user_id    = job["user_id"]
@@ -971,21 +1106,58 @@ def run_inference(job: dict) -> list:
     _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
              "skin texture, shot on a DSLR with an 85mm portrait lens.")
 
+    # Phase-5: optionally steer composition toward head-and-shoulders framing (default off,
+    # so the baseline prompts are unchanged). Applied to BOTH the shared tail and negatives.
+    _tail, _negative = apply_composition_control(_tail, _negative, COMPOSITION_CONTROL)
+    if COMPOSITION_CONTROL:
+        write_debug("Composition control ON: framing phrase + composition negatives appended")
+
     # ── IP-Adapter Plus-Face: condition on the user's OWN face crops (commercial-safe) ──
     # Applied to every image in this job (the reference face is constant per user). Scale
     # is env-tunable; on any miss we fall back to LoRA-only so generation never breaks.
     use_ip_adapter = False
     ref_faces = []
+    ref_idx = 0    # which fetched crop feeds IP-Adapter (Phase-3); set below when active
+    ref_meta = {"fetched": [], "used": None, "scale": IP_ADAPTER_SCALE}   # for the manifest
     if ip_adapter_ok and IP_ADAPTER_SCALE > 0:
-        ref_faces = _get_ref_faces(user_id)
-        if ref_faces:
-            pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
-            use_ip_adapter = True
-            write_debug(f"IP-Adapter ACTIVE: {len(ref_faces)} ref faces, scale={IP_ADAPTER_SCALE}")
-        else:
-            write_debug("IP-Adapter: no ref faces found -> LoRA-only")
+        ref_faces, ref_ids = _get_ref_faces(user_id)
+        if not ref_faces:
+            # 0.3: IP-Adapter is enabled but its reference crops are gone (retention deletes
+            # the input prefix). FAIL CLEARLY — the old code silently became LoRA-only here,
+            # changing output quality with no signal. __main__ catches this and marks the job
+            # failed (refunds). NOTE: the DB has no error-reason column yet, so the reason is
+            # recorded to the debug blob + run manifest; adding jobs.error_reason (migration)
+            # is a tracked follow-up.
+            raise IpAdapterReferenceUnavailable(
+                f"IP-Adapter enabled (scale={IP_ADAPTER_SCALE}) but NO reference face crops "
+                f"exist for user_id={user_id} at inputs/{user_id}/input/crop_upperbody/ "
+                f"(retention may have deleted them). Refusing to silently fall back to "
+                f"LoRA-only. code={IpAdapterReferenceUnavailable.code}"
+            )
+        pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+        use_ip_adapter = True
+        # Phase-3: pick which fetched crop to use. Default 0 (strategy A). Clamp so an
+        # out-of-range index can never IndexError — fall back to the first crop.
+        ref_idx = IP_ADAPTER_REF_INDEX
+        if ref_idx < 0 or ref_idx >= len(ref_faces):
+            write_debug(f"IP_ADAPTER_REF_INDEX={ref_idx} out of range for "
+                        f"{len(ref_faces)} crops -> using 0")
+            ref_idx = 0
+        ref_meta["fetched"] = ref_ids
+        ref_meta["used"] = ref_ids[ref_idx]
+        ref_meta["used_index"] = ref_idx
+        ref_meta["strategy"] = "A_first" if ref_idx == 0 else "B_selected"
+        # 0.4 + Phase-3: HONEST log. We fetch up to 3 crops but pass exactly ONE to the
+        # pipeline. The old log said "3 ref faces", implying all 3 were used. Multi-image
+        # averaging remains a separate Phase-3 arm.
+        write_debug(
+            f"IP-Adapter ACTIVE: fetched {len(ref_faces)} crop(s) {ref_ids}; "
+            f"USING 1 (index {ref_idx} = {ref_ids[ref_idx]}); scale={IP_ADAPTER_SCALE}"
+        )
 
     result_blob_paths = []
+    _gen_t0 = time.time()          # generation wall-clock, for the run manifest (0.5)
+    _delivered_size = None         # actual delivered resolution, read from real output
     for i in range(image_count):
         seed = 1000 + i                                   # distinct per image
         if is_custom:
@@ -1028,7 +1200,7 @@ def run_inference(job: dict) -> list:
             if use_ip_adapter:
                 # Single reference face (the clearest crop) — safest API path; multi-image
                 # averaging is a later enhancement.
-                _pipe_kwargs["ip_adapter_image"] = ref_faces[0]
+                _pipe_kwargs["ip_adapter_image"] = ref_faces[ref_idx]
             output = pipe(**_pipe_kwargs).images[0]
 
             # Real inference VRAM peak on the first output — surfaces any OOM headroom.
@@ -1053,7 +1225,7 @@ def run_inference(job: dict) -> list:
             # ── Whole-image realism pass AFTER upscale: de-plasticize the WHOLE frame (hair
             # top, skin, fabric) that ESRGAN over-smoothed. Runs before the face-refine so the
             # face gets the final, sharpest word. Low strength => identity/pose preserved.
-            _ref = ref_faces[0] if (use_ip_adapter and ref_faces) else None
+            _ref = ref_faces[ref_idx] if (use_ip_adapter and ref_faces) else None
             if REALISM_PASS_ENABLE and img2img_pipe is not None:
                 _realism_prompt = (
                     f"candid photograph of {subj}, natural realistic skin texture with visible "
@@ -1076,6 +1248,7 @@ def run_inference(job: dict) -> list:
             # Subtle film grain so the final frame reads as a photo, not a clean render.
             output    = _add_film_grain(output)
             output    = add_watermark(output)
+            _delivered_size = list(output.size)          # actual, not inferred (0.5)
             blob_path = upload_image_to_blob(output, job_id, i)
             result_blob_paths.append(blob_path)
             log.info(f"✅ Output {i+1} complete ({output.size[0]}x{output.size[1]})")
@@ -1087,6 +1260,16 @@ def run_inference(job: dict) -> list:
             )
             raise
 
+    # 0.5: reproducibility manifest for this run (best-effort; never fails the job).
+    write_run_manifest(job_id, user_id, {
+        "ref_meta": ref_meta,
+        "scheduler": type(pipe.scheduler).__name__,
+        "negative_prompt": _negative,
+        "seeds": [1000 + i for i in range(image_count)],
+        "image_count": image_count,
+        "delivered_size": _delivered_size,
+        "generation_seconds": round(time.time() - _gen_t0, 1),
+    })
     return result_blob_paths
 
 

@@ -99,6 +99,8 @@ RUN huggingface-cli download h94/IP-Adapter \
 
 # ── Inference app (/app) ─────────────────────────────────────────────────────────
 COPY rrdbnet.py .
+COPY stage_runtime.py .
+COPY prompt_control.py .
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
 COPY main.py .
 

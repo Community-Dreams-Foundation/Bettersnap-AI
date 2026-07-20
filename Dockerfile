@@ -83,6 +83,8 @@ RUN mkdir -p /models/realesrgan && \
       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 
 COPY rrdbnet.py .
+COPY stage_runtime.py .
+COPY prompt_control.py .
 # Canonical category/attire/background catalog — SAME file the Functions app
 # imports as shared.catalog. COPYd to /app/catalog.py so main.py's `import catalog`
 # resolves and prompt phrases never drift between the two deploy units.
