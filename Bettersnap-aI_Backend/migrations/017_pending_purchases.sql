@@ -11,7 +11,9 @@ IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID('dbo.pending
         pending_id    BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
         user_id       UNIQUEIDENTIFIER NOT NULL,
         purchase_type NVARCHAR(20)  NOT NULL,   -- 'monthly' | 'one_time'
-        plan          NVARCHAR(40)  NOT NULL,   -- basic | pro | expert
+        -- NOTE: named plan_key, NOT "plan" — `plan` is a RESERVED KEYWORD in SQL Server and
+        -- an unquoted column of that name fails with "Incorrect syntax near the keyword 'plan'".
+        plan_key      NVARCHAR(40)  NOT NULL,   -- basic | pro | expert
         status        NVARCHAR(20)  NOT NULL DEFAULT 'pending',  -- pending | done | canceled
         created_at    DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
     );
@@ -25,6 +27,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 GO
 
 -- ── Verify ────────────────────────────────────────────────────────────────
---   SELECT user_id, purchase_type, plan, status FROM dbo.pending_purchases WHERE status='pending';
+--   SELECT user_id, purchase_type, plan_key, status FROM dbo.pending_purchases WHERE status='pending';
 -- ── Rollback ──────────────────────────────────────────────────────────────
 --   DROP TABLE dbo.pending_purchases;

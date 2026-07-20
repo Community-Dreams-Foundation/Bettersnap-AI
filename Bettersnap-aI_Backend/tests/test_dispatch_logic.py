@@ -199,7 +199,7 @@ class FakeCursor:
         elif "select subscription_plan, subscription_type" in s:
             self._fetch = self.cfg.get(
                 "sub_status_row", ("monthly_pro", "monthly", 120, 200, None, None, None))
-        elif "select purchase_type, plan from pending_purchases" in s:
+        elif "select purchase_type, plan_key from pending_purchases" in s:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
@@ -732,6 +732,45 @@ class BillingGateTests(unittest.TestCase):
             resp = function_app.topup_credits(self._req(plan="basic"))
         self.assertEqual(resp.status_code, 200)
         self.assertIn("checkout_url", resp.body)
+
+
+class RetentionBlobCaseTests(unittest.TestCase):
+    """Blob prefixes are CASE-SENSITIVE. Ids come from SQL uppercase but the pipeline writes
+    lowercase paths, so matching only the SQL casing deleted NOTHING — retention reported
+    success while every photo and adapter stayed in storage. _delete_blobs must try both."""
+
+    def _fake_container(self, names):
+        listed = []
+
+        class FakeContainer:
+            def list_blobs(self, name_starts_with=None):
+                listed.append(name_starts_with)
+                return [types.SimpleNamespace(name=n)
+                        for n in names if n.startswith(name_starts_with or "")]
+
+            def delete_blob(self, name):
+                pass
+
+        class FakeSvc:
+            def get_container_client(self, _):
+                return FakeContainer()
+
+        return FakeSvc(), listed
+
+    def test_uppercase_prefix_still_deletes_lowercase_blobs(self):
+        # Blobs written lowercase; caller passes the UPPERCASE id straight from SQL.
+        svc, listed = self._fake_container(["908a8f2a-dead-beef/input/img0.jpg"])
+        with mock.patch.object(function_app, "get_blob_client", return_value=svc):
+            n = function_app._delete_blobs("inputs", "908A8F2A-DEAD-BEEF/")
+        self.assertEqual(n, 1, "uppercase prefix must still reach the lowercase blobs")
+        self.assertIn("908a8f2a-dead-beef/", listed)   # lowercase variant was attempted
+
+    def test_already_lowercase_prefix_is_not_listed_twice(self):
+        svc, listed = self._fake_container(["abc/input/img0.jpg"])
+        with mock.patch.object(function_app, "get_blob_client", return_value=svc):
+            n = function_app._delete_blobs("inputs", "abc/")
+        self.assertEqual(n, 1)
+        self.assertEqual(len(listed), 1, "no duplicate listing when the prefix is already lower")
 
 
 class ReaperTests(unittest.TestCase):

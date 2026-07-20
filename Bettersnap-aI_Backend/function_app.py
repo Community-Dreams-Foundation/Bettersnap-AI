@@ -2057,7 +2057,8 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     # Queued (pay-at-activation) plan purchase, if any (finding #6): the frontend shows it and
     # lets the user complete checkout once their current product ends. null when nothing queued.
     cursor.execute(
-        "SELECT purchase_type, plan FROM pending_purchases WHERE user_id = ? AND status = 'pending'",
+        "SELECT purchase_type, plan_key FROM pending_purchases "
+        "WHERE user_id = ? AND status = 'pending'",
         user_id)
     prow = cursor.fetchone()
     queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
@@ -2117,7 +2118,8 @@ def _queue_pending_purchase(user_id: str, purchase_type: str, plan: str):
         cur.execute(
             "DELETE FROM pending_purchases WHERE user_id = ? AND status = 'pending'", user_id)
         cur.execute(
-            "INSERT INTO pending_purchases (user_id, purchase_type, plan) VALUES (?, ?, ?)",
+            # plan_key, not "plan" — `plan` is a reserved keyword in SQL Server.
+            "INSERT INTO pending_purchases (user_id, purchase_type, plan_key) VALUES (?, ?, ?)",
             user_id, purchase_type, plan)
         conn.commit()
     finally:
@@ -2698,13 +2700,25 @@ def _handle_subscription_ended(sub: dict, event_id: str):
 
 # ── Data retention cleanup ────────────────────────────────
 def _delete_blobs(container_name: str, prefix: str) -> int:
-    """Delete every blob under `prefix` in `container_name`. Best-effort; returns count."""
+    """Delete every blob under `prefix` in `container_name`. Best-effort; returns count.
+
+    CASE-SENSITIVITY — the bug this guards against: Azure blob prefixes are CASE-SENSITIVE.
+    Ids come out of SQL as UPPERCASE GUIDs ("908A8F2A-..."), but the pipeline WRITES paths
+    with the lowercase guid (inputs/908a8f2a-.../, lora-weights/identity/908a8f2a-.../).
+    Matching only the SQL casing therefore matched NOTHING: retention_cleanup logged a
+    successful run every hour while every uploaded photo and trained adapter stayed in
+    storage forever — a privacy problem (data never actually purged) and an unbounded
+    storage bill. Proven empirically: the uppercase prefix deleted 0 blobs, the lowercase
+    prefix deleted 17 for the same user. Try both casings so it works whichever the writer used.
+    """
     n = 0
+    variants = [prefix] if prefix == prefix.lower() else [prefix, prefix.lower()]
     try:
         container = get_blob_client().get_container_client(container_name)
-        for b in container.list_blobs(name_starts_with=prefix):
-            container.delete_blob(b.name)
-            n += 1
+        for p in variants:
+            for b in container.list_blobs(name_starts_with=p):
+                container.delete_blob(b.name)
+                n += 1
     except Exception as e:
         logging.warning(f"retention: blob cleanup failed for {container_name}/{prefix}: {e}")
     return n
