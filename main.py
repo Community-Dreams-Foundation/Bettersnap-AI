@@ -342,13 +342,19 @@ def load_base_model():
         )
         # Pure txt2img: identity comes from the per-user LoRA loaded per job, the
         # scene from the prompt. No source photo, no ControlNet at inference.
+        # Base checkpoint is env-configurable (default = baked SDXL 1.0). Lets an
+        # experimental image point at an alternate baked base (e.g. /models/realvis)
+        # WITHOUT changing default/production behavior. Also makes the actual load match
+        # what the run manifest records (which already read BASE_MODEL).
+        _base = os.environ.get("BASE_MODEL", "/models/sdxl-base")
         pipe = StableDiffusionXLPipeline.from_pretrained(
-            "/models/sdxl-base",
+            _base,
             vae=vae,
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
         )
+        write_debug(f"base model: {_base}")
         pipe = pipe.to("cuda")
 
         # ── Optional pipeline stages (Phase-0 stage runner) ──────────────────────
@@ -992,142 +998,65 @@ def write_run_manifest(job_id, user_id, extra):
         write_debug(f"manifest write FAILED (non-fatal): {e}")
 
 
+
+# ─────────────────────────────────────────────────────────
+# Phase 2 orchestrator (engine-based) — ARCHITECTURE.md §4/§7
+# ─────────────────────────────────────────────────────────
+
 def run_inference(job: dict) -> list:
+    """Phase 2 orchestrator — owns the workflow; engines are leaves (none calls another).
+
+    Behavior matches the pre-refactor implementation on the DETERMINISTIC subset (verified
+    pixel-identical, txt2img + upscale): the
+    per-image prompt/generation/enhancement/delivery code was MOVED into the engines, not
+    changed. Model setup (identity LoRA, adapters, IP-Adapter, reference faces) runs in the SAME
+    order as legacy, BEFORE any engine. Enhancement stays non-deterministic exactly as before."""
+    import sys
+    from domain import (GenerationPlan, Plan, PlanType, CategoryRule, GenerationJob,
+                        ScoredCandidate, Winner, Scores, Ref, RefKind)
+    from runtime import PipelineContext
+    from runtime.engines.prompt_sdxl import SdxlPromptEngine
+    from runtime.engines.generation_sdxl import SdxlGenerationEngine
+    from runtime.engines.enhancement_sdxl import SdxlEnhancementEngine
+    from runtime.engines.delivery_blob import BlobDeliveryEngine
+
+    cfg = sys.modules[__name__]
     job_id     = job["job_id"]
     user_id    = job["user_id"]
     job_params = json.loads(job.get("job_params", "{}"))
 
-    # ── Per-user attributes (from THIS user's job_params; NO assumed defaults) ──
-    # These come from the user's own onboarding data; the pipeline is identical for
-    # every user — only the values (and their LoRA) differ.
-    gkey       = normalize_gender(job_params.get("gender"))         # dead-read bug FIXED
-    age_phrase = age_to_phrase(job_params.get("age_range", ""))     # silent-drop bug FIXED
-    hair_color = (job_params.get("hair_color") or "").strip().lower()
-
-    # ── User's GLOBAL cross-category selections + plan-driven count ────────────
-    # attire_ids / background_ids are category-qualified refs ("business_suit.navy_
-    # suit_tie") the user picked in the UI — they may span professional AND personal
-    # categories (Pro/Expert). The catalog turns each ref into a gender-aware phrase.
-    # image_count comes from the user's PLAN (resolved in function_app.submit_job) —
-    # NOT a fixed constant. custom_prompt is set only for the custom_scene mode
-    # (user-typed scene), which we WRAP with identity + quality below. IMAGE_COUNT_
-    # OVERRIDE (env, off by default) caps the count for cheap wiring tests.
-    attire_refs      = job_params.get("attire_ids") or []
-    background_refs  = job_params.get("background_ids") or []
-    custom_prompt    = (job_params.get("custom_prompt") or "").strip()
-    image_count      = int(job_params.get("image_count") or DEFAULT_NUM_OUTPUTS)
+    attire_refs     = job_params.get("attire_ids") or []
+    background_refs = job_params.get("background_ids") or []
+    custom_prompt   = (job_params.get("custom_prompt") or "").strip()
+    image_count     = int(job_params.get("image_count") or DEFAULT_NUM_OUTPUTS)
     _test_cap = int(os.environ.get("IMAGE_COUNT_OVERRIDE", "0") or "0")
     if _test_cap > 0:
         image_count = min(image_count, _test_cap)
-    image_count      = max(1, min(image_count, 100))                # hard safety clamp
+    image_count = max(1, min(image_count, 100))
+    write_debug(f"[orchestrator] job={job_id} image_count={image_count} "
+                f"custom={'yes' if custom_prompt else 'no'}")
 
-    subject = SUBJECT_NOUN[gkey]
-    write_debug(
-        f"User attrs: gender={job_params.get('gender')!r}->{gkey} subject='{subject}' "
-        f"age_range={job_params.get('age_range')!r}->age_phrase={age_phrase!r} "
-        f"hair={hair_color!r} attire_refs={attire_refs} background_refs={background_refs} "
-        f"image_count={image_count} custom={'yes' if custom_prompt else 'no'} "
-        f"test_cap={_test_cap or 'off'}"
-    )
-
-    # ── Per-user identity LoRA — the ONLY thing carrying identity in txt2img ──
-    # Base SDXL is baked; the LoRA is the per-job fetch from
-    # lora-weights/identity/<user_id>/adapter_model.safetensors. Activated via
-    # set_adapters (compatible with cpu offload). active/weights built from what
-    # actually loaded, so a missing category adapter can't name an unloaded one.
+    # ── model setup — SAME ORDER as legacy (identity LoRA -> adapters -> IP) ──
     active, weights = [], []
-    # NOTE: category-style LoRAs are NOT deployed (no category/<x>/adapter_model.safetensors
-    # blobs exist), and selections now span MULTIPLE categories (attire_refs/background_refs),
-    # so there is no single `category` to load — the old `load_category_lora(category)` call
-    # referenced an undefined name and crashed every generation. Identity LoRA below is the
-    # only adapter carrying identity; attire/background are driven by the prompt.
     identity_ok = load_identity_lora(user_id)
     if identity_ok:
         active.append("identity_lora"); weights.append(DEFAULT_LORA_WEIGHT)
-
-    # HARD FAIL on a missing identity adapter. In txt2img the LoRA is the ONLY thing
-    # carrying the user's face — with no adapter, base SDXL renders a photogenic
-    # STRANGER and, before this check, happily uploaded it as the user's headshots.
-    # A loud failure (which refunds their credits via _mark_failed) is the only
-    # acceptable outcome; delivering someone else's face is not. /jobs/submit already
-    # gates on lora_status, so reaching here means the adapter blob is missing or
-    # unreadable — a real fault, not a user error.
     if not identity_ok:
         raise RuntimeError(
             f"identity LoRA missing for user_id={user_id} "
             f"(lora-weights/identity/{user_id}/adapter_model.safetensors) — refusing to "
             f"render base SDXL and pass off a generic face as this user's headshots"
         )
-
     pipe.set_adapters(active, adapter_weights=weights)
     write_debug(f"LoRA adapters ACTIVE: {active} weights={weights}")
 
-    try:
-        free_vram, total_vram = torch.cuda.mem_get_info(0)
-        write_debug(
-            f"Pre-inference free VRAM: {free_vram/1024**3:.1f} GB "
-            f"of {total_vram/1024**3:.1f} GB total"
-        )
-    except Exception as e:
-        write_debug(f"mem_get_info failed: {e}")
-
-    # ── Build this job's per-image plan ───────────────────────────────────────
-    # combos = cartesian product of the user's SELECTED attire refs × background
-    # refs, spanning ANY categories (Pro/Expert may mix professional + personal;
-    # the catalog drops unknown refs). The plan's image_count is distributed across
-    # combos by cycling (i % len), each image with a distinct seed so a repeated
-    # combo still varies. The custom_scene mode has NO menu — every image wraps the
-    # user's typed scene. The lead phrase + lighting are DERIVED PER-IMAGE from the
-    # BACKGROUND's category (a beach bg reads 'lifestyle portrait', golden lighting),
-    # even when the attire came from a different category.
-    is_custom = bool(custom_prompt)
-    combos = [] if is_custom else catalog.build_combos_global(attire_refs, background_refs)
-    if not is_custom and not combos:
-        raise ValueError(
-            f"No attire/background combos "
-            f"(attire_refs={attire_refs}, background_refs={background_refs})"
-        )
-    write_debug(
-        f"Plan: image_count={image_count} combos={len(combos)} custom={is_custom} "
-        f"trigger={IDENTITY_TRIGGER!r} CFG={DEFAULT_CFG} lora_w={DEFAULT_LORA_WEIGHT} "
-        f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT} steps={DEFAULT_STEPS}"
-    )
-
-    _negative = os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
-
-    # Subject clause built ONCE from the user's REAL attributes — no beauty/
-    # idealization language anywhere (that lightened + slimmed the face). Bake the
-    # DreamBooth trigger so the per-user LoRA FIRES: "ohwx <woman|man|person>";
-    # without it the adapter loads but is never invoked → generic strangers.
-    subj = f"{IDENTITY_TRIGGER} {subject}" if IDENTITY_TRIGGER else f"a {subject}"
-    if age_phrase:
-        subj += f" {age_phrase}"
-    subj += hair_phrase(hair_color)
-    _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
-             "skin texture, shot on a DSLR with an 85mm portrait lens.")
-
-    # Phase-5: optionally steer composition toward head-and-shoulders framing (default off,
-    # so the baseline prompts are unchanged). Applied to BOTH the shared tail and negatives.
-    _tail, _negative = apply_composition_control(_tail, _negative, COMPOSITION_CONTROL)
-    if COMPOSITION_CONTROL:
-        write_debug("Composition control ON: framing phrase + composition negatives appended")
-
-    # ── IP-Adapter Plus-Face: condition on the user's OWN face crops (commercial-safe) ──
-    # Applied to every image in this job (the reference face is constant per user). Scale
-    # is env-tunable; on any miss we fall back to LoRA-only so generation never breaks.
     use_ip_adapter = False
     ref_faces = []
-    ref_idx = 0    # which fetched crop feeds IP-Adapter (Phase-3); set below when active
-    ref_meta = {"fetched": [], "used": None, "scale": IP_ADAPTER_SCALE}   # for the manifest
+    ref_idx = 0
+    ref_meta = {"fetched": [], "used": None, "scale": IP_ADAPTER_SCALE}
     if ip_adapter_ok and IP_ADAPTER_SCALE > 0:
         ref_faces, ref_ids = _get_ref_faces(user_id)
         if not ref_faces:
-            # 0.3: IP-Adapter is enabled but its reference crops are gone (retention deletes
-            # the input prefix). FAIL CLEARLY — the old code silently became LoRA-only here,
-            # changing output quality with no signal. __main__ catches this and marks the job
-            # failed (refunds). NOTE: the DB has no error-reason column yet, so the reason is
-            # recorded to the debug blob + run manifest; adding jobs.error_reason (migration)
-            # is a tracked follow-up.
             raise IpAdapterReferenceUnavailable(
                 f"IP-Adapter enabled (scale={IP_ADAPTER_SCALE}) but NO reference face crops "
                 f"exist for user_id={user_id} at inputs/{user_id}/input/crop_upperbody/ "
@@ -1136,8 +1065,6 @@ def run_inference(job: dict) -> list:
             )
         pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
         use_ip_adapter = True
-        # Phase-3: pick which fetched crop to use. Default 0 (strategy A). Clamp so an
-        # out-of-range index can never IndexError — fall back to the first crop.
         ref_idx = IP_ADAPTER_REF_INDEX
         if ref_idx < 0 or ref_idx >= len(ref_faces):
             write_debug(f"IP_ADAPTER_REF_INDEX={ref_idx} out of range for "
@@ -1147,130 +1074,76 @@ def run_inference(job: dict) -> list:
         ref_meta["used"] = ref_ids[ref_idx]
         ref_meta["used_index"] = ref_idx
         ref_meta["strategy"] = "A_first" if ref_idx == 0 else "B_selected"
-        # 0.4 + Phase-3: HONEST log. We fetch up to 3 crops but pass exactly ONE to the
-        # pipeline. The old log said "3 ref faces", implying all 3 were used. Multi-image
-        # averaging remains a separate Phase-3 arm.
         write_debug(
             f"IP-Adapter ACTIVE: fetched {len(ref_faces)} crop(s) {ref_ids}; "
             f"USING 1 (index {ref_idx} = {ref_ids[ref_idx]}); scale={IP_ADAPTER_SCALE}"
         )
 
-    result_blob_paths = []
-    _gen_t0 = time.time()          # generation wall-clock, for the run manifest (0.5)
-    _delivered_size = None         # actual delivered resolution, read from real output
-    for i in range(image_count):
-        seed = 1000 + i                                   # distinct per image
-        if is_custom:
-            combo_label = "custom_scene"
-            lead = catalog.lead_phrase("custom_scene")
-            lighting = LIGHTING[i % len(LIGHTING)]
-            # Scene-only wrap: keep identity subj + quality tail + negatives around
-            # whatever the user typed (they supply only the scene/outfit).
-            prompt = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}"
-        else:
-            attire_ref, bg_ref = combos[i % len(combos)]
-            attire    = catalog.attire_phrase_ref(attire_ref, gkey)
-            bg_phrase = catalog.background_phrase_ref(bg_ref)
-            lead      = catalog.lead_for_background_ref(bg_ref)        # style follows bg
-            _lighting = catalog.lighting_for_background_ref(bg_ref, LIGHTING)
-            # Advance lighting once per FULL CYCLE of combos, not per image.
-            # Indexing both by `i` aliases them whenever len(combos) and len(_lighting)
-            # share a factor — and the common case (2 attires x 2 backgrounds = 4 combos,
-            # 4 default lighting options) is the worst one: combo k would get lighting k
-            # every single time, so all 8 images of a combo shared a byte-identical prompt
-            # and differed only by seed. Dividing decorrelates the two cycles, so each
-            # combo walks through every lighting setup.
-            lighting  = _lighting[(i // len(combos)) % len(_lighting)]
-            combo_label = f"{bg_ref} | {attire_ref}"
-            prompt = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}"
-        log.info(f"📣 Output {i+1}/{image_count} [{combo_label}]: {prompt}")
-        try:
-            write_debug(
-                f"Output {i+1}: txt2img pipe() [{combo_label}] cfg={DEFAULT_CFG} seed={seed}"
-            )
-            _pipe_kwargs = dict(
-                prompt=prompt,
-                negative_prompt=_negative,
-                guidance_scale=DEFAULT_CFG,
-                num_inference_steps=DEFAULT_STEPS,
-                width=DEFAULT_WIDTH,
-                height=DEFAULT_HEIGHT,
-                generator=torch.Generator("cuda").manual_seed(seed),
-            )
-            if use_ip_adapter:
-                # Single reference face (the clearest crop) — safest API path; multi-image
-                # averaging is a later enhancement.
-                _pipe_kwargs["ip_adapter_image"] = ref_faces[ref_idx]
-            output = pipe(**_pipe_kwargs).images[0]
+    # ── resolved plan + runtime context ──────────────────────────────────────
+    _plan = Plan(   # worker-side reconstruction; billing fields UNUSED here (control plane owns billing)
+        key=(job_params.get("plan_name") or "unknown"),
+        plan_type=PlanType.ONE_TIME, image_count=image_count, credits_per_image=1,
+        max_attires=99, max_backgrounds=99, category_rule=CategoryRule.MIXABLE,
+    )
+    plan = GenerationPlan(
+        user_id=user_id, job_id=job_id, plan=_plan,
+        billable_count=image_count, credit_cost=0, candidate_budget=image_count,
+        acceptance_threshold=0.0, retry_limit=0,
+        gender=(job_params.get("gender") or ""),
+        age_range=(job_params.get("age_range") or ""),
+        hair_color=(job_params.get("hair_color") or ""),
+        attire_refs=tuple(attire_refs), background_refs=tuple(background_refs),
+        custom_prompt=custom_prompt,
+    )
 
-            # Real inference VRAM peak on the first output — surfaces any OOM headroom.
-            if i == 0:
-                try:
-                    total = torch.cuda.get_device_properties(0).total_memory
-                    peak  = torch.cuda.max_memory_allocated(0)
-                    msg = (f"INFERENCE VRAM PEAK: max_memory_allocated={peak} "
-                           f"({peak / 1024**3:.1f} GB) of total_memory={total} "
-                           f"({total / 1024**3:.1f} GB)")
-                    log.info(f"🔎 {msg}")
-                    write_debug(msg)
-                except Exception as e:
-                    write_debug(f"inference VRAM probe failed: {e}")
+    ctx = PipelineContext(job_id, user_id)
+    ctx.models["pipe"] = pipe
+    ctx.models["upscaler"] = upscaler
+    ctx.models["img2img"] = img2img_pipe
+    ctx.models["face_cascade"] = _face_cascade
+    _ref = ref_faces[ref_idx] if (use_ip_adapter and ref_faces) else None
+    ctx.work["ip_adapter_ok"] = ip_adapter_ok
+    ctx.work["use_ip_adapter"] = use_ip_adapter
+    ctx.work["ip_adapter_image"] = _ref
+    ctx.work["ref_face"] = _ref
 
-            # 2K post-process FIRST (Real-ESRGAN x4 → fit to UPSCALE_TARGET).
-            _pre = output.size
-            output    = upscale_image(output)
-            if i == 0:
-                write_debug(f"Upscaled {_pre} -> {output.size} (target={UPSCALE_TARGET})")
+    # ── run: prompt -> generate -> [Phase-6 wrap] -> enhance -> deliver ───────
+    _gen_t0 = time.time()
+    prompt_engine = SdxlPromptEngine(ctx, cfg, write_debug)
+    gen_engine    = SdxlGenerationEngine(ctx, cfg, write_debug)
+    enh_engine    = SdxlEnhancementEngine(ctx, cfg, write_debug)
+    del_engine    = BlobDeliveryEngine(ctx, cfg, blob_service, STAGE_STATUS, write_debug)
 
-            # ── Whole-image realism pass AFTER upscale: de-plasticize the WHOLE frame (hair
-            # top, skin, fabric) that ESRGAN over-smoothed. Runs before the face-refine so the
-            # face gets the final, sharpest word. Low strength => identity/pose preserved.
-            _ref = ref_faces[ref_idx] if (use_ip_adapter and ref_faces) else None
-            if REALISM_PASS_ENABLE and img2img_pipe is not None:
-                _realism_prompt = (
-                    f"candid photograph of {subj}, natural realistic skin texture with visible "
-                    f"pores, individual hair strands, fine fabric texture, {_tail}"
-                )
-                output = _realism_pass(output, _ref, _realism_prompt)
+    prompts    = prompt_engine.build(plan)
+    adapter    = Ref(RefKind.ADAPTER, f"/tmp/lora_identity_{user_id}.safetensors")
+    candidates = gen_engine.generate(prompts, adapter)
 
-            # ── Face-inpaint AFTER upscale: on the 2048 image the face crop is ~1000px (vs
-            # ~500 pre-upscale) so the eyes get REAL detail, and the ESRGAN — which already
-            # ran — can no longer re-smooth the refined face (the bug that made v43 only
-            # marginally better). Graceful: falls back to the un-refined image on any miss.
-            if FACE_REFINE_ENABLE and img2img_pipe is not None:
-                _face_prompt = (
-                    f"close-up portrait photograph of {subj}, face in sharp focus, highly "
-                    f"detailed eyes, natural realistic skin texture with visible pores and fine "
-                    f"detail, individual hair strands, {_tail}"
-                )
-                output = _refine_face(output, _ref, _face_prompt)
+    # Phase-2 pass-through: no Quality Gate yet — every candidate becomes a winner (accepted).
+    winners = [
+        Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
+               slot_id=(c.slot_id if c.slot_id is not None else i))
+        for i, c in enumerate(candidates)
+    ]
+    finals = enh_engine.enhance(winners)
 
-            # Subtle film grain so the final frame reads as a photo, not a clean render.
-            output    = _add_film_grain(output)
-            output    = add_watermark(output)
-            _delivered_size = list(output.size)          # actual, not inferred (0.5)
-            blob_path = upload_image_to_blob(output, job_id, i)
-            result_blob_paths.append(blob_path)
-            log.info(f"✅ Output {i+1} complete ({output.size[0]}x{output.size[1]})")
-        except Exception:
-            # Do NOT swallow: log the FULL traceback and re-raise so __main__ marks
-            # the job FAILED (and refunds), instead of a silent short/empty result.
-            log.error(
-                f"❌ Output {i+1} FAILED — full traceback:\n{traceback.format_exc()}"
-            )
-            raise
+    # delivered_size read from the actual last final image (parity with legacy).
+    _delivered_size = None
+    if finals:
+        _last = ctx.images[finals[-1].output_ref.location]
+        _delivered_size = list(_last.size)
 
-    # 0.5: reproducibility manifest for this run (best-effort; never fails the job).
-    write_run_manifest(job_id, user_id, {
+    # manifest extra — SAME fields the legacy write_run_manifest call passed.
+    ctx.work["manifest_extra"] = {
         "ref_meta": ref_meta,
         "scheduler": type(pipe.scheduler).__name__,
-        "negative_prompt": _negative,
+        "negative_prompt": ctx.work.get("negative_prompt"),
         "seeds": [1000 + i for i in range(image_count)],
         "image_count": image_count,
         "delivered_size": _delivered_size,
         "generation_seconds": round(time.time() - _gen_t0, 1),
-    })
-    return result_blob_paths
+    }
+    gjob = GenerationJob(job_id=job_id, user_id=user_id)
+    return del_engine.deliver(finals, gjob)
 
 
 # ─────────────────────────────────────────────────────────

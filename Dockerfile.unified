@@ -103,6 +103,9 @@ COPY stage_runtime.py .
 COPY prompt_control.py .
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
 COPY main.py .
+# Phase 2: torch-free domain contracts + runtime engines (the orchestrated pipeline).
+COPY domain/ /app/domain/
+COPY runtime/ /app/runtime/
 
 # ── Trainer (/workspace) — reads the baked /models above; NO runtime HF download ──
 COPY training/trainer/train_dreambooth_lora_sdxl.py /workspace/train_dreambooth_lora_sdxl.py
