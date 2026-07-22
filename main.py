@@ -75,7 +75,7 @@ def write_debug(msg: str):
         # unbounded. Namespacing by JOB_ID isolates each run's log.
         job_id = os.environ.get("JOB_ID", "unknown")
         blob_name = f"debug/{job_id}.txt"
-        blob_client = blob_service.get_blob_client(container="outputs", blob=blob_name)
+        blob_client = blob_service.get_blob_client(container=AZURE_BLOB_CONTAINER, blob=blob_name)
         try:
             existing = blob_client.download_blob().readall().decode()
         except:
@@ -292,10 +292,15 @@ def load_base_model():
 
     try:
         write_debug("Loading SDXL txt2img + fp16-fix VAE from baked /models ...")
+        # VAE is env-configurable (default = baked fp16-fix VAE), mirroring BASE_MODEL
+        # below — so the actual load matches what the run manifest records (which already
+        # reads VAE_MODEL). Without this, setting VAE_MODEL changed ONLY the manifest.
+        _vae_path = os.environ.get("VAE_MODEL", "/models/sdxl-vae")
         vae = AutoencoderKL.from_pretrained(
-            "/models/sdxl-vae",
+            _vae_path,
             torch_dtype=torch.float16,
         )
+        write_debug(f"vae model: {_vae_path}")
         # Pure txt2img: identity comes from the per-user LoRA loaded per job, the
         # scene from the prompt. No source photo, no ControlNet at inference.
         # Base checkpoint is env-configurable (default = baked SDXL 1.0). Lets an
@@ -619,7 +624,7 @@ def _get_ref_faces(user_id: str, n: int = 3):
     from PIL import Image
     refs, ids = [], []
     for i in range(n):
-        blob_name = f"{user_id}/input/crop_upperbody/img{i}.jpg"
+        blob_name = f"{user_id}/{catalog.CROP_SUBDIR}/img{i}.jpg"
         try:
             data = blob_service.get_blob_client(container="inputs", blob=blob_name).download_blob().readall()
             refs.append(Image.open(io.BytesIO(data)).convert("RGB"))
@@ -694,7 +699,7 @@ def run_inference(job: dict) -> list:
         if not ref_faces:
             raise IpAdapterReferenceUnavailable(
                 f"IP-Adapter enabled (scale={IP_ADAPTER_SCALE}) but NO reference face crops "
-                f"exist for user_id={user_id} at inputs/{user_id}/input/crop_upperbody/ "
+                f"exist for user_id={user_id} at inputs/{user_id}/{catalog.CROP_SUBDIR}/ "
                 f"(retention may have deleted them). Refusing to silently fall back to "
                 f"LoRA-only. code={IpAdapterReferenceUnavailable.code}"
             )

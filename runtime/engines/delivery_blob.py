@@ -52,7 +52,7 @@ class BlobDeliveryEngine:
         buf.seek(0)
         blob_name   = f"results/{job_id}/headshot_{index + 1}.png"
         blob_client = self.blob_service.get_blob_client(
-            container=os.environ.get("AZURE_BLOB_CONTAINER", "outputs"), blob=blob_name)
+            container=self.cfg.AZURE_BLOB_CONTAINER, blob=blob_name)
         blob_client.upload_blob(buf, overwrite=True)
         self.log(f"Uploaded: {blob_name}")
         return blob_name
@@ -107,8 +107,8 @@ class BlobDeliveryEngine:
             }
             body = json.dumps(manifest, indent=2, default=str).encode()
             self.blob_service.get_blob_client(
-                container="outputs", blob=f"manifests/{job_id}.json").upload_blob(
+                container=self.cfg.AZURE_BLOB_CONTAINER, blob=f"manifests/{job_id}.json").upload_blob(
                 body, overwrite=True)
-            self.log(f"run manifest written: outputs/manifests/{job_id}.json")
+            self.log(f"run manifest written: {self.cfg.AZURE_BLOB_CONTAINER}/manifests/{job_id}.json")
         except Exception as e:
             self.log(f"manifest write FAILED (non-fatal): {e}")

@@ -50,8 +50,6 @@ _ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "MPO"}   # MPO = multi-frame JPEG from 
 # Measured training wall-time is ~51 min (17.6 class-image gen + 28.1 train + startup).
 # The watcher fails a run that blows past this, releasing any jobs parked behind it.
 TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
-# Where cropped training images live, under the user's own prefix in `inputs`.
-CROP_SUBDIR = "input/crop_upperbody"
 # Data retention: N days after the clock starts, the user's BLOBS (photos, LoRA,
 # results) are deleted; DB rows are KEPT for analytics. One-time plans start the clock
 # on each generation (last-gen + N); monthly plans on subscription end (period-end + N).
@@ -716,7 +714,7 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # discards the caption field. Hand-typing them was pure waste.
     files = []
     for i, data in enumerate(crops):
-        rel = f"{user_id}/{CROP_SUBDIR}/img{i}.jpg"
+        rel = f"{user_id}/{catalog.CROP_SUBDIR}/img{i}.jpg"
         upload_blob("inputs", rel, data)
         files.append({"blob": rel})
 

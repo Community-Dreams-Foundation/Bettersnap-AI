@@ -21,6 +21,14 @@ Each category:
   backgrounds { background_id: "<background phrase>" }
 """
 
+# ── Cross-layer storage paths (producer↔consumer contract) ───────────────────
+# Per-user face crops the trainer writes and the inference container reads as
+# IP-Adapter references. Producer (function_app) writes inputs/<user_id>/<CROP_SUBDIR>/;
+# consumer (main.py._get_ref_faces) reads the same. Defined ONCE here — the cross-layer
+# SSOT file COPYd into the inference image — so the path can never drift between units.
+CROP_SUBDIR = "input/crop_upperbody"
+
+
 # ── Identity vocabulary (shared by TRAINING and GENERATION) ──────────────────
 # The rare DreamBooth trigger token. Every per-user LoRA is trained with it in the
 # instance prompt, and main.py bakes it into every generation prompt; without it the
