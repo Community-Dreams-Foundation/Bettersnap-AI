@@ -156,9 +156,9 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
         f"{sorted(payload.keys())} (email_present={'email' in payload}, "
         f"name_present={'name' in payload})"
     )
-    # plan_name is set EXPLICITLY rather than left to the column default: the default
-    # was 'basic' (30 images = 30 credits) while the grant is 20, so every new user was
-    # created 10 credits short of ever running a single job. New users start on the free
+    # plan_name is set EXPLICITLY rather than left to the column default ('basic'): the
+    # default plan's credit expectations don't match the free-trial grant, so leaving it
+    # to the default created new users on the wrong plan. New users start on the free
     # trial plan, which REGISTRATION_CREDITS is sized to cover (see shared/plans.py).
     cursor.execute("""
         INSERT INTO users (user_id, email, full_name, credits_remaining, plan_name)
@@ -167,7 +167,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
     conn.commit()
 
     return func.HttpResponse(
-        json.dumps({"message": "User registered", "credits": 20}),
+        json.dumps({"message": "User registered", "credits": REGISTRATION_CREDITS}),
         mimetype="application/json",
         status_code=201
     )

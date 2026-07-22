@@ -795,5 +795,47 @@ class ReaperTests(unittest.TestCase):
                          "reaper still measures from created_at (submit time)")
 
 
+class RegistrationTests(unittest.TestCase):
+    """M1 regression: POST /users/register must REPORT the same credit balance it
+    GRANTS and PERSISTS (REGISTRATION_CREDITS) — never a hardcoded literal. Fails if
+    the 201 response value diverges from the granted/persisted amount (e.g. the old
+    hardcoded 20)."""
+
+    class _Req:
+        def __init__(self, token="Bearer faketoken"):
+            self.headers = {"Authorization": token}
+
+    def setUp(self):
+        self._cfg = {}
+        # register_user uses get_db() (not new_connection) + validate_token().
+        function_app.get_db.side_effect = None
+        function_app.get_db.return_value = FakeConn(self._cfg)
+        function_app.validate_token.side_effect = None
+        function_app.validate_token.return_value = {
+            "oid": "reg-user-1", "email": "new@example.com", "name": "New User",
+        }
+
+    def test_register_response_matches_granted_and_persisted(self):
+        resp = function_app.register_user(self._Req())
+
+        # Fresh insert (the 201 path), not the "already exists" 200 path.
+        self.assertEqual(resp.status_code, 201)
+
+        # GRANTED / PERSISTED: the users INSERT's credits_remaining arg
+        # (user_id, email, name, credits_remaining, plan_name).
+        inserts = [p for s, p in self._cfg["executed"] if "insert into users" in s.lower()]
+        self.assertEqual(len(inserts), 1, "expected exactly one users INSERT")
+        granted = inserts[0][3]
+        self.assertEqual(granted, function_app.REGISTRATION_CREDITS)
+
+        # RETURNED: the 201 body must equal the constant AND the granted amount.
+        returned = json.loads(resp.body)["credits"]
+        self.assertEqual(returned, function_app.REGISTRATION_CREDITS)
+        self.assertEqual(
+            returned, granted,
+            "register response 'credits' must match the granted/persisted balance",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
