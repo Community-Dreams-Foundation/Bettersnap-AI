@@ -8,12 +8,6 @@ from azure.mgmt.appcontainers.models import (
 SUBSCRIPTION_ID = "cf197124-2e9a-48d5-af4b-de22fbbd683e"
 RESOURCE_GROUP = "bettersnap-ai-rg"
 JOB_NAME = "bettersnapai-if"
-# RETIRED. Kept only so the constant still resolves for any legacy importer. Training
-# and inference now run on the SINGLE job `bettersnapai-if`, distinguished per-execution
-# by the MODE env (train|infer) — the unified image runs both. `bettersnapai-lora-trainer`
-# is decommissioned; do NOT dispatch to it.
-TRAINER_JOB_NAME = "bettersnapai-lora-trainer"
-
 # EVERY job that consumes the A100 workload profile. There is now exactly ONE such job
 # (bettersnapai-if on profile bettersnapaiWPn, Consumption-GPU-NC24-A100, 24 CPU/220Gi):
 # a training execution and an inference execution both land on it, so counting its live

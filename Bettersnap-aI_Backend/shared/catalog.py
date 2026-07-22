@@ -531,10 +531,6 @@ def category_type(category: str) -> str | None:
     return c["type"] if c else None
 
 
-def is_custom(category: str) -> bool:
-    return bool(CATEGORY_CATALOG.get(category, {}).get("custom"))
-
-
 def valid_attire_ids(category: str) -> set:
     return set(CATEGORY_CATALOG.get(category, {}).get("attires", {}).keys())
 
@@ -618,22 +614,6 @@ def build_combos_global(attire_refs: list, background_refs: list) -> list:
     background_ref) tuples."""
     a_sel = [r for r in (attire_refs or []) if valid_attire_ref(r)]
     b_sel = [r for r in (background_refs or []) if valid_background_ref(r)]
-    return [(a, b) for a in a_sel for b in b_sel]
-
-
-# ── Prompt spec builder (used by the inference container / main.py) ───────────
-def build_combos(category: str, attire_ids: list, background_ids: list) -> list:
-    """Cartesian product of the SELECTED attires × backgrounds for a category.
-    Falls back to ALL options in the category when a selection list is empty
-    (spec: 'none selected → all in category'). Unknown ids are dropped. Returns a
-    list of (attire_id, background_id) tuples; empty if the category has no menu."""
-    cat = CATEGORY_CATALOG.get(category)
-    if not cat:
-        return []
-    a_all = list(cat.get("attires", {}).keys())
-    b_all = list(cat.get("backgrounds", {}).keys())
-    a_sel = [a for a in (attire_ids or []) if a in cat.get("attires", {})] or a_all
-    b_sel = [b for b in (background_ids or []) if b in cat.get("backgrounds", {})] or b_all
     return [(a, b) for a in a_sel for b in b_sel]
 
 

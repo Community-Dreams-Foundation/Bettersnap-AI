@@ -8,9 +8,6 @@ from shared.plans import PLANS
 
 STRIPE_API_BASE = "https://api.stripe.com/v1"
 
-# 1 job = 20 credits = 4 image variations
-CREDITS_PER_JOB = 20
-
 # Plan economics are DERIVED from the single source of truth (shared/plans.py) so the billing
 # numbers can never drift from what submit_job enforces. One-time = image packs (1 credit == 1
 # image, so credits == images). Monthly = credit-based (credits_per_image = 5). The ONLY other
