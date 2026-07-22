@@ -2,15 +2,11 @@ import os
 import io
 import json
 import time
-import hashlib
 import logging
-import traceback
 import faulthandler
-import requests
 
 faulthandler.enable()   # dumps C++ stack to stderr on SIGSEGV / SIGABRT / SIGFPE / SIGBUS
-from datetime import datetime, timedelta, timezone
-from PIL import Image, ImageDraw, ImageFont
+from datetime import datetime, timezone
 
 import torch
 import pyodbc
@@ -32,7 +28,6 @@ import catalog
 # pose and reduces the scene variety the product needs. commercial-safe only —
 # do NOT swap to Depth-Anything-V2-Large or CMU OpenPose (both non-commercial).
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL
-import numpy as np
 # Real-ESRGAN generator (vendored, BSD-3-Clause — COMMERCIAL-SAFE). 2K upscale
 # post-process. do NOT swap to a non-commercial upscaler.
 from rrdbnet import RRDBNet
@@ -40,8 +35,7 @@ from stage_runtime import run_stage
 from prompt_control import apply_composition_control
 from azure.keyvault.secrets import SecretClient
 
-from azure.storage.queue import QueueClient, TextBase64DecodePolicy
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.communication.email import EmailClient
 
@@ -51,10 +45,8 @@ log = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────
 AZURE_STORAGE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "bettersnapaistorage")
-AZURE_QUEUE_NAME        = os.environ.get("AZURE_QUEUE_NAME", "inference-jobs")
 AZURE_BLOB_CONTAINER    = os.environ.get("AZURE_BLOB_CONTAINER", "outputs")
 AZURE_LORA_CONTAINER    = os.environ.get("AZURE_LORA_CONTAINER", "lora-weights")
-AZURE_STORAGE_KEY       = os.environ.get("AZURE_STORAGE_KEY")
 SQL_SERVER              = os.environ.get("SQL_SERVER", "bettersnap-srv.database.windows.net")
 SQL_DATABASE            = os.environ.get("SQL_DATABASE", "bettersnap-db")
 KEY_VAULT_URL           = "https://bettersnapkeyvault.vault.azure.net/"
@@ -65,14 +57,6 @@ credential = DefaultAzureCredential()
 blob_service = BlobServiceClient(
     account_url=f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net",
     credential=credential
-)
-queue_client = QueueClient(
-    account_url=f"https://{AZURE_STORAGE_ACCOUNT}.queue.core.windows.net",
-    queue_name=AZURE_QUEUE_NAME,
-    credential=credential,
-    # Messages are enqueued base64-encoded (to match the Functions queue
-    # extension default); decode them symmetrically on receive.
-    message_decode_policy=TextBase64DecodePolicy(),
 )
 
 # ── Key Vault helper ──────────────────────────────────────
@@ -152,31 +136,6 @@ class IpAdapterReferenceUnavailable(RuntimeError):
 # from their trained LoRA, never from anything hardcoded below.
 # ─────────────────────────────────────────────────────────
 
-# Phase-1 STARTER background menu (3). The full canonical 13-category menu
-# (6 professional + 7 personal) lands after Phase 1 proves txt2img works.
-BACKGROUND_MENU = [
-    ("studio_white", "against a clean, pure white photography studio backdrop"),
-    ("studio_gray",  "against a smooth neutral gray photography studio backdrop"),
-    ("modern_office","in a modern corporate office with softly blurred glass walls behind"),
-]
-
-# Phase-1 STARTER attire menu, keyed by gender (2 each). 'neutral' is the
-# fallback when gender is absent/unknown — we NEVER assume male or female.
-ATTIRE_MENU = {
-    "female":  [
-        "a tailored navy blazer over a white blouse",
-        "a charcoal grey business suit",
-    ],
-    "male":    [
-        "a navy blue business suit with a white shirt and tie",
-        "a charcoal grey business suit",
-    ],
-    "neutral": [
-        "professional business attire",
-        "a charcoal grey business suit",
-    ],
-}
-
 # Subject noun driven by gender — fixes the "gender is a dead read" bug (it was
 # read then never used, and defaulted to male). No default is assumed here.
 # Sourced from catalog — the SAME module the Functions app uses to build the trainer's
@@ -192,9 +151,6 @@ LIGHTING = [
     "clean natural window light",
     "bright high-key studio lighting",
 ]
-
-# General SDXL seeds — enough distinct values to span a full menu without repeats.
-SEEDS = [42, 1337, 9999, 77777, 271828, 161803, 314159, 112358]
 
 # GENERAL anti-idealization defaults (NOT tuned to any person). Env-overridable
 # for GLOBAL tuning only — never set per-user.
@@ -447,23 +403,6 @@ def load_base_model():
         raise
 
 
-def load_category_lora(category: str) -> bool:
-    """Download + register the category LoRA. Returns True if the adapter was
-    loaded, False otherwise. Caller decides set_adapters from what loaded."""
-    lora_path = f"/tmp/lora_category_{category}.safetensors"
-    blob_name  = f"category/{category}/adapter_model.safetensors"
-    try:
-        blob_client = blob_service.get_blob_client(container=AZURE_LORA_CONTAINER, blob=blob_name)
-        with open(lora_path, "wb") as f:
-            f.write(blob_client.download_blob().readall())
-        pipe.load_lora_weights(lora_path, adapter_name="category_lora")
-        log.info(f"✅ Category LoRA loaded: {category}")
-        return True
-    except Exception as e:
-        log.warning(f"⚠️ Category LoRA not found for '{category}': {e}")
-        return False
-
-
 def load_identity_lora(user_id: str) -> bool:
     """Download + register the identity LoRA from
     lora-weights/identity/<user_id>/adapter_model.safetensors. Returns True if the
@@ -507,113 +446,6 @@ def load_identity_lora(user_id: str) -> bool:
         log.warning(f"⚠️ Identity LoRA not found/failed for '{user_id}': {e}")
         return False
 
-
-def unload_loras():
-    try:
-        pipe.unload_lora_weights()
-        log.info("✅ LoRAs unloaded")
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────────────────
-# Image utilities
-# ─────────────────────────────────────────────────────────
-
-def generate_sas_url(container: str, blob_name: str, expiry_hours: int = 24) -> str:
-    sas_token = generate_blob_sas(
-        account_name=AZURE_STORAGE_ACCOUNT,
-        container_name=container,
-        blob_name=blob_name,
-        account_key=AZURE_STORAGE_KEY,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
-    )
-    return f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/{container}/{blob_name}?{sas_token}"
-
-
-def load_image_from_blob(container: str, blob_name: str) -> Image.Image:
-    blob_client = blob_service.get_blob_client(container=container, blob=blob_name)
-    data = blob_client.download_blob().readall()
-    return Image.open(io.BytesIO(data)).convert("RGB")
-
-
-def resize_for_sdxl(img: Image.Image) -> Image.Image:
-    # SDXL is trained at ~1024². Cap the long edge at 1024 and snap to a multiple
-    # of 8 (SDXL's latent stride). Today's render is text-to-image so this is only
-    # used to validate the input-blob read path; it becomes load-bearing when the
-    # img2img / identity path lands.
-    target = 1024
-    w, h   = img.size
-    ratio  = min(target / w, target / h)
-    new_w  = (int(w * ratio) // 8) * 8
-    new_h  = (int(h * ratio) // 8) * 8
-    return img.resize((new_w, new_h), Image.LANCZOS)
-
-
-def upscale_image(img: Image.Image) -> Image.Image:
-    """Real-ESRGAN x4 (BSD-3-Clause, commercial-safe) upscale, then fit the long
-    edge to UPSCALE_TARGET (2K). POST-PROCESS ONLY — no regeneration, identity is
-    untouched. Runs on the A100 right after generation. Falls back to the input
-    image if the upscaler failed to load.
-
-    commercial-safe license — do NOT swap to a non-commercial upscaler."""
-    if upscaler is None or UPSCALE_TARGET <= 0:
-        return img
-    dtype = torch.float16 if UPSCALE_HALF else torch.float32
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    ten = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=dtype)
-    with torch.no_grad():
-        out = upscaler(ten).clamp(0, 1)
-    out = (out.squeeze(0).permute(1, 2, 0).float().cpu().numpy() * 255.0)
-    up = Image.fromarray(out.round().astype(np.uint8))   # 4096² for a 1024² input
-    # Fit the long edge to the 2K target (high-quality Lanczos downscale from x4).
-    w, h = up.size
-    if max(w, h) != UPSCALE_TARGET:
-        ratio = UPSCALE_TARGET / max(w, h)
-        up = up.resize((round(w * ratio), round(h * ratio)), Image.LANCZOS)
-    return up
-
-
-def add_watermark(img: Image.Image) -> Image.Image:
-    img        = img.convert("RGBA")
-    w, h       = img.size
-    bar_height = int(h * 0.07)
-    overlay    = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw       = ImageDraw.Draw(overlay)
-    draw.rectangle([(0, h - bar_height), (w, h)], fill=(0, 0, 0, 160))
-    text      = "BetterSnap AI"
-    font_size = int(bar_height * 0.55)
-    font_paths = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    font = None
-    for path in font_paths:
-        if os.path.exists(path):
-            font = ImageFont.truetype(path, font_size)
-            break
-    if font is None:
-        font = ImageFont.load_default()
-    bbox   = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    x      = (w - text_w) // 2
-    y      = h - bar_height + (bar_height - text_h) // 2
-    draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 180))
-    draw.text((x, y),         text, font=font, fill=(255, 255, 255, 230))
-    return Image.alpha_composite(img, overlay).convert("RGB")
-
-
-def upload_image_to_blob(img: Image.Image, job_id: str, index: int) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    blob_name   = f"results/{job_id}/headshot_{index + 1}.png"
-    blob_client = blob_service.get_blob_client(container=AZURE_BLOB_CONTAINER, blob=blob_name)
-    blob_client.upload_blob(buf, overwrite=True)
-    log.info(f"✅ Uploaded: {blob_name}")
-    return blob_name
 
 
 # ─────────────────────────────────────────────────────────
@@ -694,11 +526,15 @@ def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
                         f"(refund + delivered images)."
                     )
             else:
-                # non-terminal (e.g. 'processing') — do NOT stamp completed_at
+                # non-terminal (e.g. 'processing') — do NOT stamp completed_at, and GUARD it
+                # like the terminal paths: a job the reaper already drove to 'failed' (and
+                # refunded) must NOT be flipped back to 'processing' — that reopens the
+                # double-credit race (user keeps the refund AND the delivered images). If the
+                # row is already terminal this is a no-op (rowcount 0). (Audit FF2)
                 cursor.execute("""
                     UPDATE jobs
                     SET status = ?, output_blob_path = ?
-                    WHERE job_id = ?
+                    WHERE job_id = ? AND status NOT IN ('failed', 'completed')
                 """, status, output_json, job_id)
                 conn.commit()
                 log.info(f"✅ Job {job_id} status updated to '{status}'")
@@ -793,210 +629,9 @@ def _get_ref_faces(user_id: str, n: int = 3):
     return refs, ids
 
 
-def _refine_face(image, ref_face, face_prompt):
-    """ADetailer-style face fix: locate the largest face, re-render JUST that crop at 1024
-    (LoRA + IP-Adapter still active via the shared UNet), and blend it back with a feathered
-    mask. This is what turns upscaler-mushy eyes/skin into sharp, exact detail. Graceful:
-    returns the ORIGINAL image on any miss so it can never break a generation."""
-    if img2img_pipe is None or _face_cascade is None:
-        return image
-    try:
-        import cv2, numpy as np
-        from PIL import Image as _Image, ImageFilter
-        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-        faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                                minSize=(96, 96))
-        if len(faces) == 0:
-            write_debug("face-refine: no face detected, using base image")
-            return image
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        # Asymmetric padding: reach further UP to capture the HAIR above the face box (Haar
-        # only boxes eyes-to-chin), so the re-render produces real hair strands, not the
-        # upscaler's plastic mush. Wider sides/bottom keep the blend seam off the face.
-        pad_x   = int(0.40 * w)
-        pad_top = int(0.85 * h)
-        pad_bot = int(0.45 * h)
-        x0 = max(0, x - pad_x)
-        y0 = max(0, y - pad_top)
-        x1 = min(image.width,  x + w + pad_x)
-        y1 = min(image.height, y + h + pad_bot)
-        crop = image.crop((x0, y0, x1, y1))
-        cw, ch = crop.size
-        crop_1024 = crop.resize((1024, 1024), _Image.LANCZOS)
-        kwargs = dict(
-            prompt=face_prompt,
-            # Push hard AGAINST the "AI plastic" look the user flagged on face + hair.
-            negative_prompt=(os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
-                             + ", plastic skin, airbrushed, smooth waxy skin, cgi, 3d render, "
-                               "doll, overprocessed, blurry hair"),
-            image=crop_1024,
-            strength=FACE_REFINE_STRENGTH,
-            num_inference_steps=DEFAULT_STEPS,
-            guidance_scale=DEFAULT_CFG,
-        )
-        if ref_face is not None and ip_adapter_ok:
-            kwargs["ip_adapter_image"] = ref_face
-        try:
-            _r = img2img_pipe(**kwargs).images[0]
-        except Exception as e_ip:
-            # If IP-Adapter on the img2img path is unhappy, still do a LoRA-only face refine
-            # (which alone fixes eye/skin detail) rather than skipping the whole thing.
-            if "ip_adapter_image" in kwargs:
-                write_debug(f"face-refine: img2img+IP failed ({e_ip}); retrying LoRA-only")
-                kwargs.pop("ip_adapter_image")
-                _r = img2img_pipe(**kwargs).images[0]
-            else:
-                raise
-        refined = _r.resize((cw, ch), _Image.LANCZOS)
-        # Feathered blend so the paste seam is invisible.
-        b = max(1, int(0.12 * min(cw, ch)))
-        m = np.zeros((ch, cw), dtype=np.uint8)
-        m[b:ch - b, b:cw - b] = 255
-        mask = _Image.fromarray(m).filter(ImageFilter.GaussianBlur(max(1, b // 2)))
-        out = image.copy()
-        out.paste(refined, (x0, y0), mask)
-        write_debug(f"face-refine OK: crop ({x0},{y0})-({x1},{y1}) "
-                    f"strength={FACE_REFINE_STRENGTH} ip={'yes' if (ref_face is not None and ip_adapter_ok) else 'no'}")
-        return out
-    except Exception as e:
-        write_debug(f"face-refine FAILED (using base image): {e}")
-        return image
-
-
-def _realism_pass(image, ref_face, prompt):
-    """Light WHOLE-IMAGE img2img over the upscaled frame to de-plasticize hair/skin/fabric
-    that Real-ESRGAN over-smoothed. Runs at the 2048 resolution (A100 80GB has ample VRAM;
-    the base pass peaked ~11GB). Low strength => identity, pose, attire, and background are
-    preserved; only fine texture is rebuilt. Identity LoRA + IP-Adapter ride along on the
-    shared UNet. Graceful: returns the input image on any miss so it can't break a job."""
-    if img2img_pipe is None or REALISM_PASS_STRENGTH <= 0:
-        return image
-    try:
-        kwargs = dict(
-            prompt=prompt,
-            negative_prompt=(os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
-                             + ", plastic skin, airbrushed, smooth waxy skin, cgi, 3d render, "
-                               "digital painting, illustration, overprocessed, blurry hair, "
-                               "smooth hair"),
-            image=image,
-            strength=REALISM_PASS_STRENGTH,
-            num_inference_steps=DEFAULT_STEPS,
-            guidance_scale=DEFAULT_CFG,
-        )
-        if ref_face is not None and ip_adapter_ok:
-            kwargs["ip_adapter_image"] = ref_face
-        try:
-            out = img2img_pipe(**kwargs).images[0]
-        except Exception as e_ip:
-            if "ip_adapter_image" in kwargs:
-                write_debug(f"realism-pass: img2img+IP failed ({e_ip}); retrying LoRA-only")
-                kwargs.pop("ip_adapter_image")
-                out = img2img_pipe(**kwargs).images[0]
-            else:
-                raise
-        # img2img may return the native training size (1024); restore the 2K frame.
-        if out.size != image.size:
-            from PIL import Image as _Image
-            out = out.resize(image.size, _Image.LANCZOS)
-        write_debug(f"realism-pass OK: {image.size} strength={REALISM_PASS_STRENGTH} "
-                    f"ip={'yes' if (ref_face is not None and ip_adapter_ok) else 'no'}")
-        return out
-    except Exception as e:
-        write_debug(f"realism-pass FAILED (using upscaled image): {e}")
-        return image
-
-
-def _add_film_grain(image):
-    """Add subtle monochrome sensor grain so the frame reads as a photo, not a clean render.
-    Luminance-only noise (added equally to R/G/B) avoids color speckle. No-op if disabled."""
-    if FILM_GRAIN_AMOUNT <= 0:
-        return image
-    try:
-        import numpy as _np
-        from PIL import Image as _Image
-        arr = _np.asarray(image.convert("RGB"), dtype=_np.float32)
-        noise = _np.random.normal(0.0, FILM_GRAIN_AMOUNT, arr.shape[:2])[..., None]
-        out = _np.clip(arr + noise, 0, 255).astype(_np.uint8)
-        return _Image.fromarray(out)
-    except Exception as e:
-        write_debug(f"film-grain FAILED (skipping): {e}")
-        return image
-
-
 # ─────────────────────────────────────────────────────────
 # Core inference
 # ─────────────────────────────────────────────────────────
-
-def _sha256_file(path):
-    """SHA-256 of a file, or None if unreadable. Used for the LoRA-adapter fingerprint
-    in the run manifest so a run can be tied to the EXACT adapter it used."""
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
-
-
-def write_run_manifest(job_id, user_id, extra):
-    """Emit a reproducibility manifest to outputs/manifests/<job_id>.json (0.5).
-
-    Records what is needed to reproduce or audit a run: the exact image/commit, model
-    versions + adapter checksum, per-stage init status (STAGE_STATUS), the IP-Adapter
-    references actually used, sampling config, seeds, GPU, durations, and the DELIVERED
-    resolution (read from the real output, not inferred). Fields that only build/deploy
-    knows (image digest, git SHA, lockfile hash) are read from env and recorded as 'unset'
-    when not wired, so a gap is visible rather than hidden. Best-effort: never fails a job."""
-    try:
-        try:
-            gpu = torch.cuda.get_device_properties(0).name
-        except Exception:
-            gpu = "unknown"
-        manifest = {
-            "schema": "bettersnap.run_manifest/v1",
-            "job_id": job_id,
-            "user_id_sha256": hashlib.sha256((user_id or "").encode()).hexdigest(),
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "mode": os.environ.get("MODE", "infer"),
-            # reproducibility — injected by build/deploy; 'unset' until wired (follow-up)
-            "container_image": os.environ.get("CONTAINER_IMAGE", "unset"),
-            "container_image_digest": os.environ.get("CONTAINER_IMAGE_DIGEST", "unset"),
-            "git_commit_sha": os.environ.get("GIT_COMMIT_SHA", "unset"),
-            "lockfile_sha256": os.environ.get("LOCKFILE_SHA256", "unset"),
-            # models
-            "base_model": os.environ.get("BASE_MODEL", "/models/sdxl-base"),
-            "vae_model": os.environ.get("VAE_MODEL", "/models/sdxl-vae"),
-            "lora_adapter_sha256": _sha256_file(f"/tmp/lora_identity_{user_id}.safetensors"),
-            "lora_identity_weight": DEFAULT_LORA_WEIGHT,
-            "identity_trigger": IDENTITY_TRIGGER,
-            # ip-adapter (model + which refs were fetched vs used, from 0.3/0.4)
-            "ip_adapter": {"model": "ip-adapter-plus-face_sdxl_vit-h.safetensors",
-                           **extra.get("ref_meta", {})},
-            # sampling
-            "scheduler": extra.get("scheduler", "unknown"),
-            "guidance_scale": DEFAULT_CFG,
-            "num_inference_steps": DEFAULT_STEPS,
-            "gen_resolution": [DEFAULT_WIDTH, DEFAULT_HEIGHT],
-            "delivered_resolution": extra.get("delivered_size"),
-            "negative_prompt": extra.get("negative_prompt"),
-            "seeds": extra.get("seeds", []),
-            "image_count": extra.get("image_count"),
-            # stages (0.2) — enabled/initialized/reason per optional stage
-            "stages": dict(STAGE_STATUS),
-            # perf
-            "gpu": gpu,
-            "generation_seconds": extra.get("generation_seconds"),
-        }
-        body = json.dumps(manifest, indent=2, default=str).encode()
-        blob_service.get_blob_client(
-            container="outputs", blob=f"manifests/{job_id}.json").upload_blob(
-            body, overwrite=True)
-        write_debug(f"run manifest written: outputs/manifests/{job_id}.json")
-    except Exception as e:
-        write_debug(f"manifest write FAILED (non-fatal): {e}")
-
 
 
 # ─────────────────────────────────────────────────────────
@@ -1144,37 +779,6 @@ def run_inference(job: dict) -> list:
     }
     gjob = GenerationJob(job_id=job_id, user_id=user_id)
     return del_engine.deliver(finals, gjob)
-
-
-# ─────────────────────────────────────────────────────────
-# Queue polling (legacy)
-# ─────────────────────────────────────────────────────────
-
-def process_queue():
-    log.info(f"📭 Polling queue: {AZURE_QUEUE_NAME}")
-    while True:
-        messages = queue_client.receive_messages(max_messages=1, visibility_timeout=600)
-        message  = next(messages, None)
-
-        if message is None:
-            log.info("Queue empty. Waiting 10s...")
-            time.sleep(10)
-            continue
-
-        job_id = None
-        try:
-            job    = json.loads(message.content)
-            job_id = job.get("job_id")
-            log.info(f"📦 Job received: {job_id}")
-            update_job_status(job_id, "processing")
-            result_blob_paths = run_inference(job)
-            update_job_status(job_id, "completed", result_blob_paths)
-            queue_client.delete_message(message)
-            log.info(f"✅ Job {job_id} complete")
-        except Exception as e:
-            log.error(f"❌ Job failed: {e}")
-            if job_id:
-                update_job_status(job_id, "failed")
 
 
 # ─────────────────────────────────────────────────────────
