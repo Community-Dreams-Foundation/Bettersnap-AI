@@ -85,5 +85,11 @@ if mode in FUSED:
 elif mode.startswith("train"):
     _exec(TRAIN_DIR, TRAIN_SCRIPT)
 
-else:
+elif mode in ("infer", ""):
     _exec(INFER_DIR, INFER_SCRIPT)
+
+else:
+    # A typo like MODE=inferr used to silently run inference — so a mis-set training job would
+    # generate against a missing adapter instead of failing loudly. Refuse unknown modes. (Audit A7)
+    log.error("Unknown MODE=%r — expected one of train | train_infer | infer. Refusing to guess.", mode)
+    sys.exit(2)
