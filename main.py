@@ -67,6 +67,33 @@ blob_service = BlobServiceClient(
     credential=credential
 )
 
+
+# ── Blob helper ───────────────────────────────────────────
+def _read_blob(container: str, blob_name: str, *, retries: int = 3, base_delay: float = 0.5) -> bytes:
+    """Download a blob's bytes, retrying TRANSIENT failures with exponential backoff.
+    A definitive ResourceNotFoundError (BlobNotFound) is NOT retried — it is re-raised
+    immediately so callers can tell 'missing' (e.g. retention deleted the crops) from
+    'flaky' (a transient blip that would otherwise fail a 30-min job). Centralizes the
+    retry policy (count / backoff / logging) that was previously hand-rolled per read.
+    Raises the last transient error after `retries` attempts."""
+    from azure.core.exceptions import ResourceNotFoundError
+    last = None
+    for attempt in range(retries):
+        try:
+            return blob_service.get_blob_client(
+                container=container, blob=blob_name).download_blob().readall()
+        except ResourceNotFoundError:
+            raise  # definitive 'not there' — do not retry; let the caller decide
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(f"blob read {container}/{blob_name} failed "
+                            f"(attempt {attempt + 1}/{retries}: {e}); retrying in {delay:.1f}s")
+                time.sleep(delay)
+    raise last
+
+
 # ── Key Vault helper ──────────────────────────────────────
 # Cache the SecretClient + fetched values in-process (mirrors shared/keyvault.py): rebuilding
 # the client and re-reading Key Vault on every call is a wasteful round-trip, and secrets change
@@ -446,9 +473,8 @@ def load_identity_lora(user_id: str) -> bool:
     lora_path = f"/tmp/lora_identity_{user_id}.safetensors"
     blob_name  = f"identity/{user_id}/adapter_model.safetensors"
     try:
-        blob_client = blob_service.get_blob_client(container=AZURE_LORA_CONTAINER, blob=blob_name)
         with open(lora_path, "wb") as f:
-            f.write(blob_client.download_blob().readall())
+            f.write(_read_blob(AZURE_LORA_CONTAINER, blob_name))
 
         import logging as _logging
         caught = []
@@ -651,7 +677,7 @@ def _get_ref_faces(user_id: str, n: int = 3):
     for i in range(n):
         blob_name = f"{user_id}/{catalog.CROP_SUBDIR}/img{i}.jpg"
         try:
-            data = blob_service.get_blob_client(container="inputs", blob=blob_name).download_blob().readall()
+            data = _read_blob("inputs", blob_name)
             refs.append(Image.open(io.BytesIO(data)).convert("RGB"))
             ids.append(f"img{i}.jpg")
         except Exception as e:
