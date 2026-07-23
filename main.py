@@ -46,7 +46,15 @@ log = logging.getLogger(__name__)
 # ── Environment Variables ─────────────────────────────────
 AZURE_STORAGE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "bettersnapaistorage")
 AZURE_BLOB_CONTAINER    = os.environ.get("AZURE_BLOB_CONTAINER", "outputs")
-AZURE_LORA_CONTAINER    = os.environ.get("AZURE_LORA_CONTAINER", "lora-weights")
+# LoRA-weights container. AZURE_LORA_CONTAINER is CANONICAL (matches AZURE_BLOB_CONTAINER /
+# AZURE_STORAGE_ACCOUNT and the ACA job manifest job.yaml). LORA_CONTAINER is a DEPRECATED
+# alias kept for the trainer's older convention: read both (canonical first) so an operator can
+# set EITHER and the trainer + inference always agree on one container. Remove the alias once
+# deploy manifests + docs use AZURE_LORA_CONTAINER everywhere (see run_training.py for the twin).
+AZURE_LORA_CONTAINER    = (os.environ.get("AZURE_LORA_CONTAINER")
+                           or os.environ.get("LORA_CONTAINER") or "lora-weights")
+if not os.environ.get("AZURE_LORA_CONTAINER") and os.environ.get("LORA_CONTAINER"):
+    log.warning("LORA_CONTAINER is DEPRECATED; use AZURE_LORA_CONTAINER instead.")
 SQL_SERVER              = os.environ.get("SQL_SERVER", "bettersnap-srv.database.windows.net")
 SQL_DATABASE            = os.environ.get("SQL_DATABASE", "bettersnap-db")
 KEY_VAULT_URL           = "https://bettersnapkeyvault.vault.azure.net/"

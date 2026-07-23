@@ -44,7 +44,14 @@ try:
 except (KeyError, ValueError) as e:
     fail(f"bad/missing env: {e}")
 IN_CONTAINER   = os.environ.get("INPUT_CONTAINER", "inputs")
-LORA_CONTAINER = os.environ.get("LORA_CONTAINER", "lora-weights")
+# AZURE_LORA_CONTAINER is the CANONICAL name (see inference/main.py + job.yaml); LORA_CONTAINER
+# is a DEPRECATED alias. Read canonical-first so the trainer and inference always resolve to the
+# SAME container even if only one name is set on the job. (job.yaml sets AZURE_LORA_CONTAINER, so
+# prod already resolves to canonical and no warning fires.)
+LORA_CONTAINER = (os.environ.get("AZURE_LORA_CONTAINER")
+                  or os.environ.get("LORA_CONTAINER") or "lora-weights")
+if not os.environ.get("AZURE_LORA_CONTAINER") and os.environ.get("LORA_CONTAINER"):
+    log.warning("LORA_CONTAINER is DEPRECATED; use AZURE_LORA_CONTAINER instead.")
 RANK   = os.environ.get("RANK", "32")
 STEPS  = os.environ.get("MAX_TRAIN_STEPS", "1400")
 LR     = os.environ.get("LEARNING_RATE", "1e-4")
