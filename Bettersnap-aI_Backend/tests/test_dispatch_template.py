@@ -113,7 +113,23 @@ _mod("azure.mgmt.appcontainers.models",
      JobExecutionTemplate=FakeTemplate, Container=FakeContainer,
      EnvironmentVar=FakeEnvVar, ContainerResources=FakeResources)
 
-from shared import queue_trigger, training_trigger  # noqa: E402  — real code, Azure stubbed
+# Import the REAL dispatchers WITHOUT disturbing a sibling test module's stubs: when the whole
+# suite runs in one process, test_dispatch_logic replaces sys.modules["shared.queue_trigger"]
+# with a Mock. Pop any such stub, import the real modules into local references, then restore
+# the stub — so this is order-independent and leaves the other module's tests untouched.
+import importlib  # noqa: E402
+_saved = {n: sys.modules.get(n) for n in ("shared.queue_trigger", "shared.training_trigger")}
+for _n in _saved:
+    sys.modules.pop(_n, None)
+try:
+    queue_trigger = importlib.import_module("shared.queue_trigger")
+    training_trigger = importlib.import_module("shared.training_trigger")
+finally:
+    for _n, _m in _saved.items():
+        if _m is not None:
+            sys.modules[_n] = _m
+        else:
+            sys.modules.pop(_n, None)
 
 
 class DispatchTemplateTests(unittest.TestCase):
