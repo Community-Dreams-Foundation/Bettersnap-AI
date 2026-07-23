@@ -68,9 +68,26 @@ blob_service = BlobServiceClient(
 )
 
 # ── Key Vault helper ──────────────────────────────────────
+# Cache the SecretClient + fetched values in-process (mirrors shared/keyvault.py): rebuilding
+# the client and re-reading Key Vault on every call is a wasteful round-trip, and secrets change
+# rarely, so a short TTL is safe. The inference container runs ONE job single-threaded, so no
+# locking is needed (unlike the multi-threaded Functions host the backend guards).
+_kv_client = None
+_secret_cache: "dict[str, tuple[float, str]]" = {}
+_SECRET_TTL = int(os.environ.get("KEYVAULT_CACHE_TTL_SECONDS", "600"))
+
+
 def get_secret(name: str) -> str:
-    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
-    return kv_client.get_secret(name).value
+    global _kv_client
+    now = time.time()
+    cached = _secret_cache.get(name)
+    if cached and (now - cached[0]) < _SECRET_TTL:
+        return cached[1]
+    if _kv_client is None:
+        _kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+    value = _kv_client.get_secret(name).value
+    _secret_cache[name] = (now, value)
+    return value
 
 # ── Debug logger to blob ──────────────────────────────────
 def write_debug(msg: str):
