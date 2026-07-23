@@ -846,7 +846,14 @@ if __name__ == "__main__":
     log.info("🚀 BetterSnap AI Inference Container Starting...")
 
     job_id  = os.environ.get("JOB_ID")
-    user_id = os.environ.get("USER_ID")
+    # Normalize USER_ID to lowercase ONCE, here at the single point it enters the process.
+    # Training writes every per-user blob (the LoRA adapter AND the IP-Adapter face crops)
+    # under the lowercase Entra oid, but SQL returns the GUID UPPERCASE and the dispatcher
+    # forwards it as-is. Blob paths are CASE-SENSITIVE, so without this the adapter read
+    # (load_identity_lora) and the reference read (_get_ref_faces) both look up a
+    # non-existent uppercase path and generation fails. This is the ONLY read of USER_ID,
+    # so normalizing here covers every downstream blob path + the run manifest.
+    user_id = (os.environ.get("USER_ID") or "").lower()
 
     write_debug(f"JOB_ID={job_id}, USER_ID={user_id}")
 
