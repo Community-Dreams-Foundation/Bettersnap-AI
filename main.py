@@ -220,6 +220,11 @@ IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.6"))
 # is passed in via this env — the GPU worker does no detection of its own. Clamped to the
 # available crops at use time.
 IP_ADAPTER_REF_INDEX  = int(os.environ.get("IP_ADAPTER_REF_INDEX", "0"))
+# How many crops _get_ref_faces tries to download (img0..img{N-1}). Was a hardcoded 3,
+# which made img3+ unreachable for IP_ADAPTER_REF_INDEX above. Measured cost of the larger
+# window is ~0.1 s and ~16 MB (see _get_ref_faces), so the default now covers a full
+# training set. Index 0 is still img0.jpg -> DEFAULT OUTPUT IS UNCHANGED.
+IP_ADAPTER_REF_FETCH_N = int(os.environ.get("IP_ADAPTER_REF_FETCH_N", "12"))
 # Phase-5 composition control: append explicit head-and-shoulders framing + composition
 # negatives to steer away from full-body/averted output. DEFAULT 0 so the Phase-2 baseline
 # (current prompts) is unchanged; the Phase-5 experiment sets it to 1.
@@ -659,10 +664,25 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
         log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
 
 
-def _get_ref_faces(user_id: str, n: int = 3):
+def _get_ref_faces(user_id: str, n: int = None):
     """Download up to `n` of the user's face crops (from the `inputs` container) to use as
     IP-Adapter Plus-Face reference images. These are the SAME crops the LoRA trained on, so
     the two identity signals agree.
+
+    WHY THIS FETCHES ALL CROPS, NOT THE FIRST 3 (2026-07-23)
+    -------------------------------------------------------
+    The old default (n=3) was a prototype value, not a constraint: it made crops img3+
+    UNREACHABLE for IP_ADAPTER_REF_INDEX, so reference selection could only ever choose
+    among the first three. Measured on a real user's set, the centroid-closest crop was
+    img7 (0.934) while the fetched-3 window contained only 0.829-0.909 and the pipeline
+    used img0 (0.835) — i.e. the best reference was structurally unreachable.
+    Measured cost of fetching all ~9 instead of 3: +1.1 MB download, +5 blob reads
+    (~50-150 ms in-region), +16 MB RAM for the decoded PIL images — against a 14-minute
+    job that peaks at 11.1 GB VRAM. Negligible, so there is no performance argument for
+    the smaller window. DEFAULT BEHAVIOR IS UNCHANGED: index 0 is still img0.jpg, so the
+    baseline pipeline picks the same reference it always did; only the *reachable* set
+    grows. Missing indices are skipped (ResourceNotFoundError is not retried), so
+    over-asking is cheap and a short crop set costs a few fast 404s.
 
     IMPORTANT: these crops live under the user's `inputs` prefix, which retention deletes —
     so at generation time they may be gone. The caller decides what to do with an empty
@@ -673,6 +693,8 @@ def _get_ref_faces(user_id: str, n: int = 3):
     which one is used (the pipeline currently uses index 0 only)."""
     import io
     from PIL import Image
+    if n is None:
+        n = IP_ADAPTER_REF_FETCH_N
     refs, ids = [], []
     for i in range(n):
         blob_name = f"{user_id}/{catalog.CROP_SUBDIR}/img{i}.jpg"
