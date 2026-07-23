@@ -51,50 +51,40 @@ def _newest_execution_name(client, job_name: str = JOB_NAME) -> str:
     return newest
 
 
-def trigger_container_job(job_id: str, user_id: str):
+def _start_execution(owned_env_keys, env_overrides, job_name: str = JOB_NAME) -> str:
+    """Start ONE execution of `job_name`. Extracted verbatim from the two dispatchers
+    (inference + training) — NO behavior change; only the per-run env policy differs and
+    that is supplied by the caller (owned_env_keys to strip + env_overrides to set).
+
+    ACA REPLACES (does not merge) the container spec when a start-time execution template
+    is supplied, so the override must echo back EVERYTHING the live job template defines:
+      - name + image: without these the env override is dropped (vars never reach the container).
+      - resources: rebuilt EXPLICITLY — passing base.resources back through begin_start does
+        NOT round-trip; ACA silently drops it to the platform default 0.5 CPU / 1Gi, which
+        SIGKILLs the container (exit 137) during peft's LoRA load vs the 220Gi it needs. A
+        freshly-constructed ContainerResources IS honored (== `job start --cpu 24 --memory 220Gi`).
+      - volume_mounts: the /models AzureFile mount; omitting it launches with no model mount,
+        so from_pretrained('/models') fails. (JobExecutionTemplate has no `volumes` field —
+        volumes stay at the job-template level, referenced here only via volume_mounts.)
+    Reading every field from the live job keeps this correct across image/profile bumps.
+
+    begin_start SUBMITTING is the point of no return: once it returns the execution exists
+    server-side. poller.result() can block on a slow GPU start or RAISE on a fast failure —
+    that raise used to lose the execution id, so recover it by listing.
+    """
     credential = DefaultAzureCredential()
     client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
 
-    # ACA REPLACES (does not merge) the container spec when a start-time
-    # execution template is supplied, so the override must echo back EVERYTHING
-    # the job template defines for the container — not just name+image+env:
-    #   - name + image: without these the env override is dropped (JOB_ID/USER_ID
-    #     never reach the container).
-    #   - resources: the GPU profile's fixed cpu/memory alloc.
-    #   - volume_mounts: the /models AzureFile mount. Omitting it is a latent
-    #     production bug — the manual `az containerapp job start` path preserves
-    #     the full template, but THIS dispatch path would launch the container
-    #     with no model mount, so from_pretrained('/models') fails.
-    # (JobExecutionTemplate has no `volumes` field — volumes stay defined at the
-    # job-template level and are referenced here only via volume_mounts.)
-    # Reading every field from the live job keeps this correct across image and
-    # profile bumps without hardcoding.
-    job = client.jobs.get(RESOURCE_GROUP, JOB_NAME)
+    job = client.jobs.get(RESOURCE_GROUP, job_name)
     base = job.template.containers[0]
 
-    # Strip JOB_ID/USER_ID (per-run) and MODE, then set them. MODE=infer is set
-    # EXPLICITLY: this one job also runs training (MODE=train), so we must never let an
-    # inference run inherit a stale/baked MODE and boot the container into the trainer.
-    env = [e for e in (base.env or []) if e.name not in ("JOB_ID", "USER_ID", "MODE")]
-    env.append(EnvironmentVar(name="JOB_ID", value=job_id))
-    env.append(EnvironmentVar(name="USER_ID", value=user_id))
-    env.append(EnvironmentVar(name="MODE", value="infer"))
+    env = [e for e in (base.env or []) if e.name not in owned_env_keys]
+    env.extend(env_overrides)
 
-    # CRITICAL: rebuild resources EXPLICITLY. Passing base.resources (the
-    # ContainerResources object read back from jobs.get()) does NOT round-trip through
-    # begin_start — ACA silently drops it and the execution falls back to the platform
-    # default 0.5 CPU / 1Gi. That 1Gi caused a host-RAM SIGKILL (exit 137, ProcessExited)
-    # during peft's LoRA load, while the job template says 220Gi. A freshly-constructed
-    # ContainerResources with explicit cpu/memory IS honored — this is exactly what
-    # `az containerapp job start --cpu 24 --memory 220Gi` sends and it launches at 220Gi.
     resources = ContainerResources(
         cpu=float(base.resources.cpu),
         memory=str(base.resources.memory),
     )
-    logging.info(
-        f"dispatch resources for job_id={job_id}: cpu={resources.cpu} memory={resources.memory}"
-    )
-
     template = JobExecutionTemplate(
         containers=[
             Container(
@@ -106,32 +96,39 @@ def trigger_container_job(job_id: str, user_id: str):
             )
         ]
     )
+    logging.info(
+        f"ACA start: job={job_name} image={base.image} "
+        f"cpu={resources.cpu} memory={resources.memory}"
+    )
 
-    # begin_start() SUBMITTING the start is the point of no return: if this raises the
-    # execution was never created (caller reverts the claim + retries). Once it returns,
-    # the execution EXISTS server-side. poller.result() can then either block on a slow
-    # GPU start or RAISE if the container fails fast — in the old code that raise lost the
-    # execution id (external_execution_id/last_dispatch_at stayed NULL). Recover the id by
-    # listing so dispatch idempotency + observability survive a slow/failed start.
     poller = client.jobs.begin_start(
         resource_group_name=RESOURCE_GROUP,
-        job_name=JOB_NAME,
+        job_name=job_name,
         template=template,
     )
     try:
-        result = poller.result()
-        execution_id = getattr(result, "name", None)
+        execution_id = getattr(poller.result(), "name", None)
     except Exception as e:
         logging.warning(
-            f"begin_start LRO did not resolve cleanly for job_id={job_id} ({e}); "
+            f"begin_start LRO did not resolve cleanly for job={job_name} ({e}); "
             f"recovering execution id from the executions list"
         )
         execution_id = None
     if not execution_id:
-        execution_id = _newest_execution_name(client)
+        execution_id = _newest_execution_name(client, job_name)
+    return execution_id
 
-    logging.info(
-        f"Triggered Container Apps Job for job_id={job_id}, "
-        f"image={base.image}, execution_id={execution_id}"
+
+def trigger_container_job(job_id: str, user_id: str):
+    # MODE=infer is set EXPLICITLY: this one job also runs training (MODE=train), so an
+    # inference run must never inherit a stale/baked MODE and boot into the trainer.
+    execution_id = _start_execution(
+        owned_env_keys=("JOB_ID", "USER_ID", "MODE"),
+        env_overrides=[
+            EnvironmentVar(name="JOB_ID", value=job_id),
+            EnvironmentVar(name="USER_ID", value=user_id),
+            EnvironmentVar(name="MODE", value="infer"),
+        ],
     )
+    logging.info(f"Triggered Container Apps Job for job_id={job_id}, execution_id={execution_id}")
     return execution_id

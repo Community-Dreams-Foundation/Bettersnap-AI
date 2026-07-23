@@ -26,13 +26,11 @@ import logging
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.appcontainers import ContainerAppsAPIClient
-from azure.mgmt.appcontainers.models import (
-    JobExecutionTemplate, Container, EnvironmentVar, ContainerResources,
-)
+from azure.mgmt.appcontainers.models import EnvironmentVar
 
 from . import catalog
 from .queue_trigger import (
-    SUBSCRIPTION_ID, RESOURCE_GROUP, JOB_NAME, _newest_execution_name,
+    SUBSCRIPTION_ID, RESOURCE_GROUP, JOB_NAME, _start_execution,
 )
 
 # Env keys this dispatcher OWNS. Always removed from the job template, then re-set
@@ -77,70 +75,23 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
             f"training file(s) outside user {user_id}'s prefix: {stray[:3]} — refusing to start"
         )
 
-    credential = DefaultAzureCredential()
-    client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
-
-    job = client.jobs.get(RESOURCE_GROUP, JOB_NAME)
-    base = job.template.containers[0]
-
-    # Strip every user-identifying key from the template, then set ours. Non-owned keys
+    # Strip every user-identifying key (_OWNED_ENV) and re-set ours. Non-owned keys
     # (STORAGE_CONNECTION_STRING secretRef, RANK, MAX_TRAIN_STEPS, LEARNING_RATE,
-    # TEXT_ENCODER_LR, NUM_CLASS_IMAGES, PRIOR_LOSS_WEIGHT, LORA_CONTAINER, ...) are the
-    # tuned recipe and are carried through untouched.
-    env = [e for e in (base.env or []) if e.name not in _OWNED_ENV]
-    env.append(EnvironmentVar(name="MODE", value="train"))   # boot the trainer, not inference
-    env.append(EnvironmentVar(name="USER_ID", value=str(user_id)))
-    env.append(EnvironmentVar(name="FILES_JSON", value=json.dumps(files)))
-    env.append(EnvironmentVar(name="CLASS_WORD", value=class_word))
-    env.append(EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)))
-    env.append(EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)))
-
-    # Built via EnvironmentVar objects through the ARM SDK — there is no shell, so the
-    # Windows `az ... --env-vars` quote-stripping that mangled FILES_JSON into invalid
-    # JSON cannot happen on this path.
-
-    # CRITICAL (same trap as the inference dispatcher): rebuild resources EXPLICITLY.
-    # Passing base.resources back through begin_start does NOT round-trip — ACA silently
-    # drops it and the execution falls back to the platform default 0.5 CPU / 1Gi, which
-    # SIGKILLs the trainer. A freshly-constructed ContainerResources IS honored.
-    resources = ContainerResources(
-        cpu=float(base.resources.cpu),
-        memory=str(base.resources.memory),
+    # TEXT_ENCODER_LR, NUM_CLASS_IMAGES, PRIOR_LOSS_WEIGHT, AZURE_LORA_CONTAINER, ...) are
+    # the tuned recipe, carried through untouched. Built as EnvironmentVar objects via the
+    # ARM SDK (no shell), so the Windows --env-vars quote-stripping that mangled FILES_JSON
+    # into invalid JSON cannot happen. MODE=train boots the trainer, not inference.
+    execution_id = _start_execution(
+        owned_env_keys=_OWNED_ENV,
+        env_overrides=[
+            EnvironmentVar(name="MODE", value="train"),
+            EnvironmentVar(name="USER_ID", value=str(user_id)),
+            EnvironmentVar(name="FILES_JSON", value=json.dumps(files)),
+            EnvironmentVar(name="CLASS_WORD", value=class_word),
+            EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)),
+            EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)),
+        ],
     )
-
-    template = JobExecutionTemplate(
-        containers=[
-            Container(
-                name=base.name,
-                image=base.image,
-                env=env,
-                resources=resources,
-                volume_mounts=base.volume_mounts,
-            )
-        ]
-    )
-
-    logging.info(
-        f"dispatching training: user={user_id} files={len(files)} class_word={class_word} "
-        f"image={base.image} cpu={resources.cpu} memory={resources.memory}"
-    )
-
-    poller = client.jobs.begin_start(
-        resource_group_name=RESOURCE_GROUP,
-        job_name=JOB_NAME,
-        template=template,
-    )
-    try:
-        execution_id = getattr(poller.result(), "name", None)
-    except Exception as e:
-        logging.warning(
-            f"begin_start LRO did not resolve cleanly for training user={user_id} ({e}); "
-            f"recovering execution id from the executions list"
-        )
-        execution_id = None
-    if not execution_id:
-        execution_id = _newest_execution_name(client, JOB_NAME)
-
     logging.info(f"Started training job for user={user_id}, execution_id={execution_id}")
     return execution_id
 
