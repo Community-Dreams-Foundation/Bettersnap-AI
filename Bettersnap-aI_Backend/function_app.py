@@ -20,6 +20,27 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # Kill-switch pause uses a long, fixed delay (NOT the backoff) so an intentional
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
+
+
+def _utc_iso(dt):
+    """Serialise a DB timestamp as ISO-8601 WITH the Z marker. Use for every datetime
+    that reaches JSON.
+
+    Every timestamp column is written with GETUTCDATE(), so the value IS UTC — but pyodbc
+    hands back a NAIVE datetime, and both str() and .isoformat() then emit it with no
+    offset. JavaScript's Date() parses a string without an offset as LOCAL time, so the
+    browser took a UTC instant to be local and rendered it unshifted: a customer in EDT
+    saw "06:25 PM" on a job they created at 2:25 PM — four hours in the future.
+
+    Fixed HERE rather than by formatting a fixed timezone in the UI, because the frontend
+    already calls toLocaleString(undefined, ...) — once the instant is unambiguous, every
+    viewer sees it in their OWN timezone, which also survives customers outside EST.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 # Head start for the FUSED train+generate path (MODE=train_infer, see _dispatch_training).
 # The dispatcher fuses only if the user's generation job is ALREADY parked in
 # 'waiting_lora' when it runs. The frontend calls /train first and /jobs/submit second, and
@@ -373,7 +394,7 @@ def terms_status(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
 
     return func.HttpResponse(
-        json.dumps({"terms_accepted_at": str(row[0]) if row[0] else None}),
+        json.dumps({"terms_accepted_at": _utc_iso(row[0])}),
         mimetype="application/json",
         status_code=200,
     )
@@ -816,8 +837,8 @@ def training_status(req: func.HttpRequest) -> func.HttpResponse:
         payload["training"] = {
             "training_id": str(t[0]), "status": t[1], "photos": t[2],
             "error": t[3],
-            "created_at": t[4].isoformat() if t[4] else None,
-            "completed_at": t[5].isoformat() if t[5] else None,
+            "created_at": _utc_iso(t[4]),
+            "completed_at": _utc_iso(t[5]),
         }
     return func.HttpResponse(json.dumps(payload), mimetype="application/json", status_code=200)
 
@@ -1220,7 +1241,7 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
             "job_type": r[2],
             "category": r[3],
             "output_blob_path": _paths(r[4]),
-            "created_at": str(r[5])
+            "created_at": _utc_iso(r[5])
         }
         for r in rows
     ]
@@ -1324,7 +1345,7 @@ def admin_stuck_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     )
     jobs = [
         {"job_id": str(r[0]), "user_id": r[1], "status": r[2],
-         "external_execution_id": r[3], "created_at": str(r[4])}
+         "external_execution_id": r[3], "created_at": _utc_iso(r[4])}
         for r in cursor.fetchall()
     ]
     return func.HttpResponse(json.dumps({"stuck": jobs}), mimetype="application/json")
@@ -2253,7 +2274,7 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
             # UI works with no coordinated frontend release.
             "monthly_quota": row[3],
-            "subscription_renewed_at": str(row[4]) if row[4] else None,
+            "subscription_renewed_at": _utc_iso(row[4]),
             "next_renewal": next_renewal,
             # ALIAS: Dashboard.tsx / Onboarding.tsx read `renewal_date` — same drift, which is
             # why "renews on {date}" never appeared.
@@ -2261,11 +2282,11 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             # Dunning: non-null means the latest monthly renewal charge FAILED and Stripe is
             # retrying — the UI should prompt "update your card". Cleared on the next success.
             "payment_failed": bool(row[5]),
-            "payment_failed_at": str(row[5]) if row[5] else None,
+            "payment_failed_at": _utc_iso(row[5]),
             # Cancellation: non-null means a period-end cancel is scheduled — the UI shows
             # "cancels on {cancel_at}" and offers Reactivate (POST /subscriptions/reactivate).
             "cancel_pending": bool(row[6]),
-            "cancel_at": str(row[6]) if row[6] else None,
+            "cancel_at": _utc_iso(row[6]),
             # Queued (pay-at-activation) plan purchase, if any — complete it when the current
             # product ends. null when nothing is queued.
             "queued_purchase": queued_purchase,
@@ -2521,7 +2542,7 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps({
             "message": "Subscription will cancel at end of billing period",
-            "cancel_at": str(cancel_at) if cancel_at else None,
+            "cancel_at": _utc_iso(cancel_at),
         }),
         mimetype="application/json",
         status_code=200,
