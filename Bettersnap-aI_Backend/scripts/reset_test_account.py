@@ -47,9 +47,21 @@ PROTECTED_OIDS = {
                                               # rule) — 5 jobs, trained adapter
 }
 
-# Addresses that are obviously disposable/test. Anything else is treated as a real person.
+# Addresses that are obviously disposable/test. Anything else is treated as a real person
+# and needs --force-real, because the cost of a false "test" match is deleting a customer.
+#
+# The house convention is a single Google Workspace ALIAS plus sub-addressing:
+#     qa@bettersnap.ai  ->  qa+bs01@bettersnap.ai, qa+bs02@bettersnap.ai, ...
+# Workspace ignores everything after '+', so all of those land in one inbox while Entra
+# issues a distinct oid for each — unlimited throwaway accounts, no personal address, and
+# it reads as a company address on a screen-share. Both the bare alias and any +suffix
+# form must therefore be recognised as test accounts.
 _TEST_EMAIL = re.compile(
-    r"(@(example|test)\.(com|local)|\.invalid$|^exp-|^qa[+._-]|[+](test|qa|bs)\d*@)", re.I)
+    r"(@(example|test)\.(com|local)"      # example.com / test.local
+    r"|\.invalid$"                        # RFC 2606 reserved
+    r"|^exp-"                             # exp-girl-..., exp-new-...
+    r"|^qa(\d+)?([+._-]|@)"               # qa@, qa01@, qa+bs01@, qa.bs01@
+    r"|[+](test|qa|bs|demo)\w*@)", re.I)  # anything+test@, +qa@, +bs01@, +demo@
 
 
 def sh(cmd, check=True):
