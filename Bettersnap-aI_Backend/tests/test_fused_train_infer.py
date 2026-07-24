@@ -173,5 +173,41 @@ class NoDoubleGenerationTests(unittest.TestCase):
         self.assertIn("processing", ("processing", "dispatching"))
 
 
+
+class FuseHeadStartTests(unittest.TestCase):
+    """The head start is what makes the fused path actually reachable from the real
+    frontend flow, so it is easy to 'clean up' later without realising it silently
+    disables fusion. These pin the contract."""
+
+    def _src(self):
+        p = os.path.join(BACKEND_DIR, "function_app.py")
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def test_training_enqueue_is_delayed(self):
+        src = self._src()
+        self.assertIn("TRAIN_FUSE_HEAD_START", src)
+        # the fast-path send must carry the delay, not fire immediately
+        self.assertIn("visibility_timeout=TRAIN_FUSE_HEAD_START", src,
+                      "the training enqueue lost its head start -> the dispatcher will "
+                      "look for the parked job before /jobs/submit creates it, and the "
+                      "fused MODE=train_infer path stops firing")
+
+    def test_head_start_is_env_tunable_and_disableable(self):
+        src = self._src()
+        self.assertIn('os.environ.get("TRAIN_FUSE_HEAD_START"', src)
+        # `or None` so 0 means "send immediately" rather than "0-second visibility"
+        self.assertIn("TRAIN_FUSE_HEAD_START or None", src)
+
+    def test_head_start_is_short_relative_to_training(self):
+        """A head start long enough to matter against a ~34 min run would be a
+        regression in itself. Keep it well under a minute."""
+        import re
+        m = re.search(r'TRAIN_FUSE_HEAD_START = int\(os\.environ\.get\("TRAIN_FUSE_HEAD_START", "(\d+)"\)\)',
+                      self._src())
+        self.assertIsNotNone(m, "TRAIN_FUSE_HEAD_START default not found")
+        self.assertLessEqual(int(m.group(1)), 60,
+                             "head start should be seconds, not minutes")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

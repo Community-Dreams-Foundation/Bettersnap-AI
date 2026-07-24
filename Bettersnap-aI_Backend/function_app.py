@@ -20,6 +20,17 @@ MAX_DISPATCH_DEFERS   = int(os.environ.get("MAX_DISPATCH_DEFERS", "20"))
 # Kill-switch pause uses a long, fixed delay (NOT the backoff) so an intentional
 # GPU_DISPATCH_ENABLED=false doesn't churn the queue / logs every few seconds.
 KILL_SWITCH_PAUSE_DELAY = int(os.environ.get("KILL_SWITCH_PAUSE_DELAY", "900"))
+# Head start for the FUSED train+generate path (MODE=train_infer, see _dispatch_training).
+# The dispatcher fuses only if the user's generation job is ALREADY parked in
+# 'waiting_lora' when it runs. The frontend calls /train first and /jobs/submit second, and
+# this queue message is otherwise sent immediately — so the dispatcher fires within seconds
+# and looks BEFORE the job exists, finds nothing, and falls back to plain MODE=train. The
+# fused path then almost never triggers in the flow it was built for.
+# Holding the message briefly lets /jobs/submit land first. Costs ~25s on a ~34-minute
+# training run to save ~4 minutes (one cold start + one queue hop). NOT correctness-critical
+# in either direction: if the job still isn't parked we simply don't fuse, which is exactly
+# today's behaviour. Set to 0 to disable.
+TRAIN_FUSE_HEAD_START = int(os.environ.get("TRAIN_FUSE_HEAD_START", "25"))
 # Reaper: auto-fail jobs stuck in 'processing' or 'dispatching' past these thresholds,
 # measured from dispatched_at (COALESCE created_at) — NOT submit time — so queue wait
 # doesn't count against the deadline (finding #5, part A).
@@ -757,10 +768,15 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     finally:
         conn2.close()
 
-    outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg)
+    # Delayed on purpose — see TRAIN_FUSE_HEAD_START. Gives /jobs/submit time to park the
+    # generation job so _dispatch_training can fuse it into this same container. The
+    # transactional-outbox guarantee is unaffected: the row is already committed, and
+    # outbox_dispatch_pending still backstops a failed send.
+    outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg,
+                        visibility_timeout=TRAIN_FUSE_HEAD_START or None)
     logging.info(
         f"training queued: training_id={training_id} user={user_id} "
-        f"photos={len(files)} class_word={cword}"
+        f"photos={len(files)} class_word={cword} head_start={TRAIN_FUSE_HEAD_START}s"
     )
 
     return func.HttpResponse(
