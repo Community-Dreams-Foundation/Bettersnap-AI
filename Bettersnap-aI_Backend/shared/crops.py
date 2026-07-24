@@ -49,7 +49,7 @@ import os
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 # SDXL training resolution.
 DEFAULT_SIZE = 1024
@@ -349,6 +349,28 @@ def _encode(pil: Image.Image, size: int) -> bytes:
     return buf.getvalue()
 
 
+def _open_upright(image_bytes: bytes) -> Image.Image:
+    """Decode an upload AND apply its EXIF orientation. Every entry point must use this.
+
+    WHY (2026-07-23) — this was a real, user-visible bug
+    ---------------------------------------------------
+    Phone cameras store a portrait shot as LANDSCAPE pixels plus an EXIF orientation tag
+    (iPhone portrait = tag 6, "rotate 90° CW"). `Image.open` does NOT apply that tag, so a
+    straight-from-the-camera portrait arrived here rotated 90°, the face was sideways, and
+    YuNet found nothing -> FACE_NOT_FOUND. Measured on a real 7.2 MP iPhone upload:
+    0 faces before the fix; 1 face at 643px (conf 0.75, comfortably past WARN_FACE_PX) after.
+
+    The failure mode was perverse: WhatsApp/messenger copies BAKE the rotation into the
+    pixels and strip the tag, so degraded, low-resolution photos passed while pristine
+    originals were rejected — i.e. the gate systematically threw away its best input, which
+    is exactly the input the MIN_FACE_PX gate exists to obtain.
+
+    exif_transpose is a no-op when the tag is absent or already upright, so this is safe for
+    every path that worked before.
+    """
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+
+
 def crop_head_and_shoulders(image_bytes: bytes, size: int = DEFAULT_SIZE,
                             face_frac: float = DEFAULT_FACE_FRAC,
                             headroom: float = DEFAULT_HEADROOM,
@@ -364,7 +386,7 @@ def crop_head_and_shoulders(image_bytes: bytes, size: int = DEFAULT_SIZE,
     to see how soft an undersized crop actually is. Never pass it on the /train path.
     """
     try:
-        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        pil = _open_upright(image_bytes)
     except Exception as e:
         raise ValueError(f"not a readable image: {e}") from e
 
@@ -397,7 +419,7 @@ def assess(image_bytes: bytes):
     """Non-raising inspection of one photo — for diagnostics, tests and any future
     'rate my upload set' UI. Returns a dict; never raises for image content."""
     try:
-        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        pil = _open_upright(image_bytes)
     except Exception as e:
         return {"ok": False, "code": "NOT_AN_IMAGE", "detail": str(e)}
 
@@ -429,7 +451,7 @@ def assess(image_bytes: bytes):
 def center_square_crop(image_bytes: bytes, size: int = DEFAULT_SIZE) -> bytes:
     """Centred square crop. NOT used by /train — a faceless photo must be rejected,
     not guessed at. Kept for the CLI, which flags such photos explicitly."""
-    pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pil = _open_upright(image_bytes)
     w, h = pil.size
     side = min(w, h)
     left, top = (w - side) // 2, (h - side) // 2
