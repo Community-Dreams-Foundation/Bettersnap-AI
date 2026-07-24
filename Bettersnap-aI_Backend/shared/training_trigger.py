@@ -43,11 +43,33 @@ _OWNED_ENV = {
     "CLASS_WORD",
     "INPUT_BLOB_PATH",   # stripped, never re-set — FILES_JSON is the input contract
     "MODE",              # shared job with inference — MUST re-set to "train" every run
+    # Owned for the SAME reason as USER_ID. The deployed template carries a JOB_ID baked in
+    # from manual runs; without stripping it we would (a) append a second JOB_ID in fused
+    # mode, leaving which one wins undefined, and (b) leak a previous user's job id into a
+    # plain MODE=train run. Stripped always, re-set ONLY when fusing.
+    "JOB_ID",
 }
 
 
-def trigger_training_job(user_id: str, files: list, class_word: str):
+def trigger_training_job(user_id: str, files: list, class_word: str, job_id: str = None):
     """Start a training execution for ONE user.
+
+    FUSED MODE (job_id given) — one container, one cold start
+    --------------------------------------------------------
+    When `job_id` is supplied we start MODE=train_infer instead of MODE=train: the SAME
+    container trains the adapter and then generates that job's images, so a one-time buyer
+    (and a monthly user's first session) pays ONE cold start and ONE queue hop instead of
+    two. Measured saving ~4 min of a ~45 min journey: ~3.3 min ACA scheduling + image pull,
+    plus ~30 s model load on the second container.
+
+    entrypoint.py refuses MODE=train_infer without JOB_ID/USER_ID (exit 2) rather than
+    training for 30 minutes and failing at the handoff, so both are always set here.
+
+    THE CALLER MUST HAVE CLAIMED THE JOB OUT OF 'waiting_lora' FIRST. _finish_training
+    releases every job still in 'waiting_lora' for the user when training completes — if the
+    fused job were left there it would be enqueued a SECOND time and the user would get two
+    generations for one payment. Claiming it (to 'processing') before this call is what makes
+    the fused path safe; see _dispatch_training.
 
     user_id     — the authenticated user. Used for BOTH the input photo paths (by the
                   caller, when it built `files`) and the adapter output path
@@ -81,18 +103,27 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
     # the tuned recipe, carried through untouched. Built as EnvironmentVar objects via the
     # ARM SDK (no shell), so the Windows --env-vars quote-stripping that mangled FILES_JSON
     # into invalid JSON cannot happen. MODE=train boots the trainer, not inference.
+    fused = bool(job_id)
+    overrides = [
+        EnvironmentVar(name="MODE", value="train_infer" if fused else "train"),
+        EnvironmentVar(name="USER_ID", value=str(user_id)),
+        EnvironmentVar(name="FILES_JSON", value=json.dumps(files)),
+        EnvironmentVar(name="CLASS_WORD", value=class_word),
+        EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)),
+        EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)),
+    ]
+    if fused:
+        overrides.append(EnvironmentVar(name="JOB_ID", value=str(job_id)))
+
     execution_id = _start_execution(
         owned_env_keys=_OWNED_ENV,
-        env_overrides=[
-            EnvironmentVar(name="MODE", value="train"),
-            EnvironmentVar(name="USER_ID", value=str(user_id)),
-            EnvironmentVar(name="FILES_JSON", value=json.dumps(files)),
-            EnvironmentVar(name="CLASS_WORD", value=class_word),
-            EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)),
-            EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)),
-        ],
+        env_overrides=overrides,
     )
-    logging.info(f"Started training job for user={user_id}, execution_id={execution_id}")
+    logging.info(
+        f"Started {'FUSED train_infer' if fused else 'training'} job for user={user_id}"
+        + (f", job_id={job_id}" if fused else "")
+        + f", execution_id={execution_id}"
+    )
     return execution_id
 
 

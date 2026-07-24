@@ -1718,6 +1718,52 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             if not claimed:
                 logging.info(f"training_id={training_id} claim lost (concurrent); skipping")
                 return
+
+            # ── FUSED train+generate (MODE=train_infer) ──────────────────────────────
+            # A user who just paid sees ONE action ("make my headshots"), not a training
+            # run and then a generation run. If they already parked a job behind this
+            # training, hand it to the SAME container: it trains, then generates, with one
+            # cold start and one queue hop instead of two (~4 min of a ~45 min journey).
+            #
+            # CLAIMING IT HERE IS WHAT MAKES THIS SAFE. _finish_training releases EVERY job
+            # still in 'waiting_lora' for this user when training completes; a fused job left
+            # there would be enqueued a second time and generated twice for one payment.
+            # Moving it to 'processing' inside this same transaction removes it from that
+            # query, so no change to _finish_training is needed. 'processing' is also what
+            # the reaper watches (REAPER_STUCK_MINUTES), so a fused run that dies after start
+            # is still recovered and refunded by the existing safety net.
+            #
+            # Oldest parked job only: fusing carries exactly one job, and any others stay
+            # parked and release normally when training finishes.
+            fused_job_id = None
+            try:
+                cur.execute(
+                    "SELECT TOP 1 job_id FROM jobs WHERE user_id = ? AND status = 'waiting_lora' "
+                    "ORDER BY created_at",
+                    user_id,
+                )
+                row = cur.fetchone()
+                if row:
+                    candidate = str(row[0])
+                    cur.execute(
+                        "UPDATE jobs SET status = 'processing', dispatched_at = GETUTCDATE() "
+                        "WHERE job_id = ? AND status = 'waiting_lora'",
+                        candidate,
+                    )
+                    if cur.rowcount == 1:
+                        fused_job_id = candidate
+                    conn.commit()
+            except Exception:
+                # Fusing is an OPTIMISATION. If the claim fails for any reason, fall back to
+                # plain MODE=train — the job stays parked and _finish_training releases it
+                # exactly as it does today. Never let this break the working path.
+                logging.exception(
+                    f"fused-job claim failed for training_id={training_id}; using MODE=train")
+                fused_job_id = None
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
         finally:
             conn.close()
 
@@ -1725,12 +1771,34 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             # user_id is passed ONCE and drives both the input photo paths and the
             # adapter output path. trigger_training_job re-verifies every file lives
             # under this user's prefix before it will start.
-            execution_id = trigger_training_job(user_id, json.loads(files_json), class_word)
+            execution_id = trigger_training_job(
+                user_id, json.loads(files_json), class_word, job_id=fused_job_id)
         except Exception as e:
             logging.exception(f"training start failed for training_id={training_id}")
-            # No A100 was started. Revert to 'queued' so the queue retry can pick it up
-            # again — unless the payload itself is bad (ValueError from the prefix guard),
-            # which will never succeed and must fail loudly instead of looping.
+            # No A100 was started, so UN-CLAIM the fused job before anything else: we moved
+            # it to 'processing' in anticipation of a container that never ran. Left there it
+            # would sit until the reaper timed it out (~130 min) even though the training
+            # itself is about to be retried. Back to 'waiting_lora' means the retry can fuse
+            # it again, or _finish_training releases it normally.
+            if fused_job_id:
+                try:
+                    c0 = new_connection()
+                    try:
+                        cc = c0.cursor()
+                        cc.execute(
+                            "UPDATE jobs SET status = 'waiting_lora', dispatched_at = NULL "
+                            "WHERE job_id = ? AND status = 'processing'",
+                            fused_job_id,
+                        )
+                        c0.commit()
+                    finally:
+                        c0.close()
+                except Exception:
+                    logging.exception(
+                        f"could not un-claim fused job {fused_job_id}; reaper will recover it")
+            # Revert to 'queued' so the queue retry can pick it up again — unless the payload
+            # itself is bad (ValueError from the prefix guard), which will never succeed and
+            # must fail loudly instead of looping.
             if isinstance(e, ValueError):
                 _fail_training(training_id, str(e))
                 return
