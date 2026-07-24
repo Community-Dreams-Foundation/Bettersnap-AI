@@ -2793,8 +2793,42 @@ def _handle_topup(session: dict, event_id: str):
         conn.close()
 
 
+def _invoice_subscription_id(invoice: dict):
+    """The subscription id on an invoice, across Stripe API versions.
+
+    THE BUG THIS FIXES — SILENT RENEWAL FAILURE
+    -------------------------------------------
+    Stripe removed the top-level invoice.subscription field. As of the version this account
+    now sends events in (2026-05-27.dahlia), the top-level invoice.subscription is None, and
+    the id lives at invoice.parent.subscription_details.subscription. Both invoice handlers
+    read the old field, hit `if not sub_id: return`, and no-op — so EVERY monthly renewal's
+    invoice.paid (billing_reason=subscription_cycle) silently failed to reset credits, and
+    every invoice.payment_failed silently failed to flag dunning. Only the FIRST month
+    worked, because activation goes through checkout.session.completed, a different handler.
+
+    Confirmed live: a test-clock subscription_cycle invoice paid, its top-level subscription
+    was None, parent.subscription_details.subscription held the id, and the user's credits
+    did not reset.
+
+    Checks new location first, then the legacy top-level field, then the line item — so it
+    works whatever version an event arrives in.
+    """
+    sub = invoice.get("subscription")
+    if sub:
+        return sub
+    parent = invoice.get("parent") or {}
+    sub = (parent.get("subscription_details") or {}).get("subscription")
+    if sub:
+        return sub
+    for line in (invoice.get("lines", {}) or {}).get("data", []):
+        lp = (line.get("parent") or {}).get("subscription_item_details") or {}
+        if lp.get("subscription"):
+            return lp["subscription"]
+    return None
+
+
 def _handle_invoice_paid(invoice: dict, event_id: str):
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)
     if not sub_id:
         return
     conn = new_connection()
@@ -2826,7 +2860,8 @@ def _handle_payment_failed(invoice: dict, event_id: str):
     (dunning) for days, and the terminal canceled/unpaid is handled by
     _handle_subscription_ended. The flag is cleared automatically by the next successful
     invoice.paid (recovery)."""
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)   # see _invoice_subscription_id: the
+    # top-level invoice.subscription field is gone in current API versions
     if not sub_id:
         return
     conn = new_connection()
