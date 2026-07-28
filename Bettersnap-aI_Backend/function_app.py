@@ -3,6 +3,7 @@ import os
 import hmac
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
@@ -109,7 +110,8 @@ from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
-    cancel_subscription, reactivate_subscription, verify_webhook,
+    cancel_subscription, reactivate_subscription, create_billing_portal,
+    monthly_plan_for_price_id, subscription_period_end, verify_webhook,
 )
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -191,9 +193,13 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
     # to the default created new users on the wrong plan. New users start on the free
     # trial plan, which REGISTRATION_CREDITS is sized to cover (see shared/plans.py).
     cursor.execute("""
-        INSERT INTO users (user_id, email, full_name, credits_remaining, plan_name)
-        VALUES (?, ?, ?, ?, ?)
-    """, user_id, email, name, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY)
+        INSERT INTO users (
+            user_id, email, full_name, credits_remaining, plan_name,
+            one_time_credits_remaining, one_time_plan, one_time_plan_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'trial', ?)
+    """, user_id, email, name, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY,
+         REGISTRATION_CREDITS, DEFAULT_PLAN_KEY)
     conn.commit()
 
     return func.HttpResponse(
@@ -772,10 +778,16 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         """, user_id, len(files), cword, json.dumps(files), train_source)
         training_id = cur2.fetchone()[0]
         if is_retrain:
+            balance_column = (
+                "monthly_credits_remaining"
+                if train_source == "monthly"
+                else "one_time_credits_remaining"
+            )
             cur2.execute(
                 "UPDATE users SET lora_status = 'training', retrain_count = retrain_count + 1, "
-                "credits_remaining = credits_remaining - ? WHERE user_id = ?",
-                retrain_cost, user_id,
+                f"credits_remaining = credits_remaining - ?, "
+                f"{balance_column} = {balance_column} - ? WHERE user_id = ?",
+                retrain_cost, retrain_cost, user_id,
             )
         else:
             cur2.execute(
@@ -878,13 +890,18 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # ── Resolve the user's plan (image_count + selection limits live in shared/plans) ──
     conn0 = get_db()
     cur0 = conn0.cursor()
-    cur0.execute("SELECT plan_name, lora_status, credits_remaining FROM users WHERE user_id = ?", user_id)
+    cur0.execute(
+        "SELECT plan_name, lora_status, credits_remaining, "
+        "one_time_credits_remaining FROM users WHERE user_id = ?",
+        user_id,
+    )
     prow = cur0.fetchone()
     if not prow:
         return func.HttpResponse("User not found", status_code=404)
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
     credits_remaining = int(prow[2] or 0)
+    one_time_credits_remaining = int(prow[3] or 0)
 
     # ── Identity-LoRA gate ───────────────────────────────────────────────────
     # Without the user's adapter, txt2img has NOTHING carrying their identity and
@@ -947,7 +964,10 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # the client request more, clamp to the monthly quota and to what credits can pay for.
     if plan.plan_type == "monthly":
         requested = int(body.get("image_count") or plan.min_session_images)
-        max_by_credits = credits_remaining // plan.credits_per_image
+        max_by_credits = (
+            credits_remaining // plan.credits_per_image
+            + one_time_credits_remaining
+        )
         # Honor the min-session floor normally, but NEVER floor above what the user's remaining
         # credits can pay for — otherwise a user with less than one full session's worth of
         # credits could never spend them (every submit asked for the floor and 402'd, stranding
@@ -983,6 +1003,8 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     result = reserve_job_slot(
         user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
         credit_cost=cost,
+        image_count=image_count,
+        credits_per_image=plan.credits_per_image,
         initial_status="waiting_lora" if parked else "queued",
         # Tag the job with the product it belongs to (finding #6 foundation): drives the
         # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
@@ -1557,7 +1579,10 @@ def _mark_failed(job_id: str):
             # stored as credit_cost in job_params. Falls back to 1 for any legacy job
             # written before per-image charging. Tied to the same state-transition
             # rowcount guard above, so it can never double-refund.
-            cur.execute("SELECT job_params, user_id FROM jobs WHERE job_id = ?", job_id)
+            cur.execute(
+                "SELECT job_params, user_id, source_type FROM jobs WHERE job_id = ?",
+                job_id,
+            )
             r = cur.fetchone()
             refund = 1
             if r and r[0]:
@@ -1565,15 +1590,46 @@ def _mark_failed(job_id: str):
                     refund = max(1, int(json.loads(r[0]).get("credit_cost", 1)))
                 except (TypeError, ValueError):
                     refund = 1
-            cur.execute(
-                # Refund the amount ACTUALLY charged (image_count * credits_per_image,
-                # carried in job_params.credit_cost) — not a flat 20. The other side of
-                # this merge hardcoded "+ 20" while still passing `refund` as a parameter
-                # for a single placeholder, which would have thrown on every failure.
-                "UPDATE users SET credits_remaining = credits_remaining + ? "
-                "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                refund, job_id,
-            )
+            source_type = r[2] if r and len(r) > 2 else None
+            if source_type == "monthly":
+                monthly_refund = refund
+                one_time_refund = 0
+                if r and r[0]:
+                    try:
+                        refund_params = json.loads(r[0])
+                        monthly_refund = max(
+                            0, int(refund_params.get("monthly_credit_cost", refund))
+                        )
+                        one_time_refund = max(
+                            0, int(refund_params.get("one_time_credit_cost", 0))
+                        )
+                    except (TypeError, ValueError):
+                        monthly_refund = refund
+                        one_time_refund = 0
+                cur.execute(
+                    "UPDATE users SET "
+                    "monthly_credits_remaining = monthly_credits_remaining + "
+                    "CASE WHEN subscription_type = 'monthly' THEN ? ELSE 0 END, "
+                    "one_time_credits_remaining = one_time_credits_remaining + ?, "
+                    "credits_remaining = credits_remaining + "
+                    "CASE WHEN subscription_type = 'monthly' THEN ? ELSE ? END "
+                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
+                    monthly_refund, one_time_refund,
+                    monthly_refund, one_time_refund, job_id,
+                )
+            elif source_type == "one_time":
+                cur.execute(
+                    "UPDATE users SET credits_remaining = credits_remaining + ?, "
+                    "one_time_credits_remaining = one_time_credits_remaining + ? "
+                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
+                    refund, refund, job_id,
+                )
+            else:
+                cur.execute(
+                    "UPDATE users SET credits_remaining = credits_remaining + ? "
+                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
+                    refund, job_id,
+                )
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
@@ -2235,7 +2291,8 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     cursor.execute(
         "SELECT subscription_plan, subscription_type, credits_remaining, "
         "credits_monthly_limit, subscription_renewed_at, payment_failed_at, "
-        "subscription_cancel_at FROM users WHERE user_id = ?",
+        "subscription_cancel_at, one_time_credits_remaining, "
+        "monthly_credits_remaining FROM users WHERE user_id = ?",
         user_id,
     )
     row = cursor.fetchone()
@@ -2269,6 +2326,8 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "plan": row[0],
             "type": row[1],
             "credits_remaining": row[2],
+            "one_time_credits_remaining": row[7],
+            "monthly_credits_remaining": row[8],
             "credits_monthly_limit": row[3],
             # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
             # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
@@ -2291,6 +2350,54 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             # product ends. null when nothing is queued.
             "queued_purchase": queued_purchase,
         }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+@app.route(route="subscriptions/portal", methods=["POST"])
+def create_subscription_portal(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    return_url = (
+        body.get("return_url")
+        or os.environ.get("FRONTEND_URL", "https://bettersnap.ai") + "/billing"
+    )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT stripe_customer_id FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return func.HttpResponse(
+            json.dumps({"error": "No Stripe customer found for this account"}),
+            mimetype="application/json",
+            status_code=409,
+        )
+
+    try:
+        session = create_billing_portal(row[0], return_url)
+    except Exception as e:
+        logging.error(f"Stripe billing portal failed for user {user_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json",
+            status_code=502,
+        )
+
+    return func.HttpResponse(
+        json.dumps({"portal_url": session["url"]}),
         mimetype="application/json",
         status_code=200,
     )
@@ -2320,6 +2427,59 @@ def _clear_pending_purchase(cur, user_id: str):
     cur.execute(
         "UPDATE pending_purchases SET status = 'done' WHERE user_id = ? AND status = 'pending'",
         user_id)
+
+
+def _reserve_monthly_checkout(user_id: str) -> tuple[str | None, str | None]:
+    """Atomically allow only one live monthly Checkout Session per account."""
+    checkout_token = uuid.uuid4().hex
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users WITH (UPDLOCK, ROWLOCK) SET
+                stripe_checkout_token      = ?,
+                stripe_checkout_expires_at = DATEADD(MINUTE, 32, GETUTCDATE())
+            WHERE user_id = ?
+              AND NOT (subscription_type = 'monthly' AND stripe_subscription_id IS NOT NULL)
+              AND (stripe_checkout_token IS NULL
+                   OR stripe_checkout_expires_at IS NULL
+                   OR stripe_checkout_expires_at <= GETUTCDATE())""",
+            checkout_token, user_id,
+        )
+        if cur.rowcount == 1:
+            conn.commit()
+            return checkout_token, None
+
+        cur.execute(
+            "SELECT subscription_type, stripe_subscription_id, stripe_checkout_expires_at "
+            "FROM users WITH (UPDLOCK, ROWLOCK) WHERE user_id = ?",
+            user_id,
+        )
+        row = cur.fetchone()
+        conn.rollback()
+        if not row:
+            return None, "user_not_found"
+        if row[0] == "monthly" and row[1]:
+            return None, "monthly_active"
+        return None, "checkout_in_progress"
+    finally:
+        conn.close()
+
+
+def _release_monthly_checkout(user_id: str, checkout_token: str):
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                stripe_checkout_token = NULL,
+                stripe_checkout_expires_at = NULL
+            WHERE user_id = ? AND stripe_checkout_token = ?""",
+            user_id, checkout_token,
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── Subscriptions: Create Checkout ────────────────────────
@@ -2416,9 +2576,33 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({"error": "Invalid plan. Choose: basic, pro, expert"}),
                 mimetype="application/json", status_code=400,
             )
+        checkout_token, reservation_error = _reserve_monthly_checkout(user_id)
+        if not checkout_token:
+            messages = {
+                "monthly_active": "You already have an active monthly subscription.",
+                "checkout_in_progress": "A monthly checkout is already in progress. Complete it or try again shortly.",
+                "user_not_found": "User not found.",
+            }
+            return func.HttpResponse(
+                json.dumps({
+                    "error": messages[reservation_error],
+                    "billing_state": reservation_error,
+                }),
+                mimetype="application/json",
+                status_code=404 if reservation_error == "user_not_found" else 409,
+            )
+        expires_at = int((datetime.now(timezone.utc) + timedelta(minutes=31)).timestamp())
         try:
-            session = create_monthly_checkout(user_id, email, plan, success_url, cancel_url)
+            session = create_monthly_checkout(
+                user_id, email, plan, success_url, cancel_url,
+                checkout_token, expires_at,
+            )
         except Exception as e:
+            try:
+                _release_monthly_checkout(user_id, checkout_token)
+            except Exception:
+                logging.exception(
+                    f"Failed to release monthly checkout reservation for user {user_id}")
             logging.error(f"Stripe monthly checkout failed: {e}")
             return func.HttpResponse(
                 json.dumps({"error": "Payment provider error"}),
@@ -2531,7 +2715,7 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
     # Record the scheduled cancellation (exact date from Stripe's current_period_end) so the
     # UI can show "cancels on {date}" while the plan is still active, and so it can be undone.
     cancel_at = None
-    ts = result.get("current_period_end")
+    ts = subscription_period_end(result)
     if ts:
         cancel_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
         cursor.execute(
@@ -2636,8 +2820,11 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
     elif event_type == "invoice.payment_failed":
         _handle_payment_failed(event["data"]["object"], event_id)
 
-    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+    elif event_type == "customer.subscription.deleted":
         _handle_subscription_ended(event["data"]["object"], event_id)
+
+    elif event_type == "customer.subscription.updated":
+        _handle_subscription_updated(event["data"]["object"], event_id)
 
     return func.HttpResponse("OK", status_code=200)
 
@@ -2677,9 +2864,13 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 subscription_plan = ?,
                 subscription_type = 'one_time',
                 plan_name         = ?,
-                credits_remaining = credits_remaining + ?
+                credits_remaining = credits_remaining + ?,
+                one_time_credits_remaining = one_time_credits_remaining + ?,
+                one_time_plan     = ?,
+                one_time_plan_name = ?
             WHERE user_id = ?""",
-            plan, plan_key_for(plan, "one_time"), credits, user_id,
+            plan, plan_key_for(plan, "one_time"), credits, credits,
+            plan, plan_key_for(plan, "one_time"), user_id,
         )
         applied = cur.rowcount
         if applied == 0:
@@ -2705,6 +2896,7 @@ def _handle_monthly_checkout(session: dict, event_id: str):
     plan     = session.get("metadata", {}).get("plan")
     customer = session.get("customer")
     sub_id   = session.get("subscription")
+    checkout_token = session.get("metadata", {}).get("checkout_token")
 
     if not all([user_id, plan, customer, sub_id]) or plan not in MONTHLY_PLANS:
         logging.error(f"monthly checkout missing fields: {session}")
@@ -2727,11 +2919,29 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 stripe_customer_id      = ?,
                 stripe_subscription_id  = ?,
                 credits_remaining       = ?,
+                monthly_credits_remaining = ?,
+                one_time_credits_remaining =
+                    CASE WHEN subscription_type = 'monthly'
+                         THEN one_time_credits_remaining ELSE credits_remaining END,
+                one_time_plan =
+                    CASE WHEN subscription_type = 'monthly'
+                         THEN one_time_plan
+                         ELSE ISNULL(one_time_plan, ISNULL(subscription_plan, plan_name)) END,
+                one_time_plan_name =
+                    CASE WHEN subscription_type = 'monthly'
+                         THEN one_time_plan_name
+                         ELSE ISNULL(one_time_plan_name, plan_name) END,
                 credits_monthly_limit   = ?,
                 subscription_renewed_at = GETUTCDATE(),
-                retention_expires_at    = NULL
-            WHERE user_id = ?""",
-            plan, plan_key_for(plan, "monthly"), customer, sub_id, credits, credits, user_id,
+                retention_expires_at    = NULL,
+                stripe_checkout_token   = NULL,
+                stripe_checkout_expires_at = NULL
+            WHERE user_id = ?
+              AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?)
+              AND (stripe_checkout_token IS NULL OR stripe_checkout_token = ?)""",
+            plan, plan_key_for(plan, "monthly"), customer, sub_id,
+            credits, credits, credits,
+            user_id, sub_id, checkout_token,
         )
         applied = cur.rowcount
         if applied == 0:
@@ -2753,10 +2963,12 @@ def _handle_monthly_checkout(session: dict, event_id: str):
 
 
 def _handle_topup(session: dict, event_id: str):
-    """Grant a credit top-up to an ACTIVE monthly account (finding #6). Adds `images` worth of
-    generation at the account's monthly credit rate (credits_per_image). Idempotent via
-    _claim_event; refuses to apply to a non-monthly account so a top-up can never land on a
-    one-time/idle user and reintroduce the credit-rate ambiguity."""
+    """Grant a persistent one-time add-on to an ACTIVE monthly account.
+
+    Monthly credits expire at the end of the billing cycle. Add-on credits are stored in the
+    separate one-time bucket, are consumed only after monthly credits, and any unused amount
+    becomes the active balance when the subscription ends.
+    """
     user_id = session.get("metadata", {}).get("user_id")
     pack    = session.get("metadata", {}).get("plan")
     if not user_id or pack not in ONE_TIME_PLANS:
@@ -2770,8 +2982,6 @@ def _handle_topup(session: dict, event_id: str):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping topup.")
             return
-        # Only an active monthly account can receive a top-up; read its plan to get the credit
-        # rate so we add the right number of credits for `images` images.
         cur.execute(
             "SELECT plan_name FROM users WHERE user_id = ? AND subscription_type = 'monthly'",
             user_id)
@@ -2782,13 +2992,19 @@ def _handle_topup(session: dict, event_id: str):
                 f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
                 f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
             return
-        rate = max(1, get_plan(prow[0]).credits_per_image)
-        grant = images * rate
         cur.execute(
-            "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
-            grant, user_id)
+            """UPDATE users SET
+                one_time_credits_remaining = one_time_credits_remaining + ?,
+                one_time_plan = ?,
+                one_time_plan_name = ?
+            WHERE user_id = ? AND subscription_type = 'monthly'""",
+            images, pack, plan_key_for(pack, "one_time"), user_id,
+        )
         conn.commit()  # claim + grant commit atomically
-        logging.info(f"Top-up: user={user_id} pack={pack} +{grant} credits ({images} images)")
+        logging.info(
+            f"Persistent add-on: user={user_id} pack={pack} "
+            f"+{images} one-time credits"
+        )
     finally:
         conn.close()
 
@@ -2809,6 +3025,7 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
         cur.execute(
             """UPDATE users SET
                 credits_remaining       = credits_monthly_limit,
+                monthly_credits_remaining = credits_monthly_limit,
                 subscription_renewed_at = GETUTCDATE(),
                 payment_failed_at       = NULL
             WHERE stripe_subscription_id = ?""",
@@ -2846,6 +3063,62 @@ def _handle_payment_failed(invoice: dict, event_id: str):
         conn.close()
 
 
+def _handle_subscription_updated(sub: dict, event_id: str):
+    sub_id = sub.get("id")
+    status = sub.get("status")
+    if status in ("canceled", "unpaid"):
+        _handle_subscription_ended(sub, event_id)
+        return
+    if not sub_id or status not in ("active", "trialing", "past_due"):
+        return
+
+    items = sub.get("items", {}).get("data", [])
+    price_id = items[0].get("price", {}).get("id") if items else None
+    try:
+        plan = monthly_plan_for_price_id(price_id)
+    except Exception as e:
+        logging.error(f"Cannot map Stripe price for subscription={sub_id}: {e}")
+        return
+    if plan not in MONTHLY_PLANS:
+        logging.error(f"Unknown monthly Stripe price={price_id} for subscription={sub_id}")
+        return
+
+    cancel_at = None
+    period_end = subscription_period_end(sub)
+    if sub.get("cancel_at_period_end") and period_end:
+        cancel_at = datetime.fromtimestamp(
+            period_end, tz=timezone.utc,
+        ).replace(tzinfo=None)
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping plan sync.")
+            return
+        credits = MONTHLY_PLANS[plan]["credits"]
+        cur.execute(
+            """UPDATE users SET
+                subscription_plan      = ?,
+                subscription_type      = 'monthly',
+                plan_name              = ?,
+                credits_monthly_limit  = ?,
+                subscription_cancel_at = ?,
+                retention_expires_at   = NULL
+            WHERE stripe_subscription_id = ?""",
+            plan, plan_key_for(plan, "monthly"), credits, cancel_at, sub_id,
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            logging.error(f"Subscription update matched no user: subscription={sub_id}")
+            return
+        conn.commit()
+        logging.info(f"Subscription plan synced: subscription={sub_id} plan={plan}")
+    finally:
+        conn.close()
+
+
 def _handle_subscription_ended(sub: dict, event_id: str):
     sub_id = sub.get("id")
     status = sub.get("status")
@@ -2869,11 +3142,20 @@ def _handle_subscription_ended(sub: dict, event_id: str):
             # more, then the hourly cleanup deletes the blobs.
             cur.execute(
                 """UPDATE users SET
-                    subscription_plan      = 'free',
-                    subscription_type      = NULL,
-                    plan_name              = 'trial',
+                    subscription_plan      =
+                        CASE WHEN one_time_credits_remaining > 0
+                             THEN ISNULL(one_time_plan, ISNULL(one_time_plan_name, 'free'))
+                             ELSE 'free' END,
+                    subscription_type      =
+                        CASE WHEN one_time_credits_remaining > 0
+                             THEN 'one_time' ELSE NULL END,
+                    plan_name              =
+                        CASE WHEN one_time_credits_remaining > 0
+                             THEN ISNULL(one_time_plan_name, 'trial') ELSE 'trial' END,
                     stripe_subscription_id = NULL,
-                    credits_monthly_limit  = 20,
+                    credits_remaining      = one_time_credits_remaining,
+                    monthly_credits_remaining = 0,
+                    credits_monthly_limit  = NULL,
                     subscription_cancel_at = NULL,
                     payment_failed_at      = NULL,
                     retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())

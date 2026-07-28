@@ -148,6 +148,7 @@ class FakeCursor:
     def execute(self, sql, *params):
         self.executed.append((" ".join(sql.split()), params))
         self._fetchall = []
+        self.rowcount = 0
         s = sql.lower()
         # simulate a crash mid-operation (e.g. while recording execution id)
         raise_on = self.cfg.get("raise_on")
@@ -173,32 +174,84 @@ class FakeCursor:
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
-        # Plan + identity-LoRA gate lookup in submit_job. submit_job now selects a THIRD
-        # column, credits_remaining (prow[2]), so the row must be a 3-tuple.
+        # Plan + identity-LoRA gate lookup in submit_job.
         elif "select plan_name, lora_status" in s:
             self._fetch = (self.cfg.get("plan_name", "basic"),
                            self.cfg.get("lora_status", "ready"),
-                           self.cfg.get("credits", 20))
+                           self.cfg.get("credits", 20),
+                           self.cfg.get("one_time_credits", 0))
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
-        elif "select job_params, user_id from jobs" in s:
+        elif "select job_params, user_id, source_type from jobs" in s:
             self._fetch = (self.cfg.get("job_params",
-                                        json.dumps({"credit_cost": 1})), "user-1")
+                                        json.dumps({"credit_cost": 1})), "user-1",
+                           self.cfg.get("job_source_type"))
         elif "select job_id, job_params from jobs" in s:
             self._fetch = None
             self._fetchall = self.cfg.get("parked_jobs", [])
-        elif "select credits_remaining" in s:
+        elif "select monthly_credits_remaining, one_time_credits_remaining" in s:
+            self._fetch = (
+                self.cfg.get("credits", 20),
+                self.cfg.get("one_time_credits", 0),
+            )
+        elif ("select credits_remaining" in s
+              or "select monthly_credits_remaining" in s
+              or "select one_time_credits_remaining" in s):
             self._fetch = (self.cfg.get("credits", 20),)
         # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
         # user-count branch, which the same "count(*) from jobs where user_id" would swallow.
         elif "count(*) from jobs where user_id" in s and "status in" in s:
             self._fetch = (self.cfg.get("jobs_in_flight", 0),)
         elif "select subscription_type, stripe_subscription_id" in s:
-            self._fetch = (self.cfg.get("subscription_type"),
-                           self.cfg.get("stripe_subscription_id"))
+            if "stripe_checkout_expires_at" in s:
+                self._fetch = (
+                    self.cfg.get("subscription_type"),
+                    self.cfg.get("stripe_subscription_id"),
+                    self.cfg.get("stripe_checkout_expires_at"),
+                )
+            else:
+                self._fetch = (self.cfg.get("subscription_type"),
+                               self.cfg.get("stripe_subscription_id"))
+        elif "select stripe_subscription_id, subscription_type" in s:
+            self._fetch = (
+                self.cfg.get("stripe_subscription_id"),
+                self.cfg.get("subscription_type"),
+            )
+        elif "select stripe_customer_id from users" in s:
+            customer_id = self.cfg.get("stripe_customer_id")
+            self._fetch = (customer_id,) if customer_id else None
+        elif ("select plan_name from users" in s
+              and "subscription_type = 'monthly'" in s):
+            self._fetch = (
+                self.cfg.get("plan_name", "monthly_pro"),
+            ) if self.cfg.get("subscription_type", "monthly") == "monthly" else None
+        elif "update users with (updlock, rowlock) set" in s:
+            if self.cfg.get("subscription_type") == "monthly" and self.cfg.get("stripe_subscription_id"):
+                self.rowcount = 0
+            elif self.cfg.get("checkout_reserved"):
+                self.rowcount = 0
+            else:
+                self.cfg["checkout_reserved"] = True
+                self.cfg["stripe_checkout_token"] = params[0]
+                self.rowcount = 1
+        elif ("stripe_checkout_token = null" in s
+              and "stripe_checkout_expires_at = null" in s
+              and "stripe_checkout_token = ?" in s):
+            if self.cfg.get("stripe_checkout_token") == params[1]:
+                self.cfg["checkout_reserved"] = False
+                self.cfg["stripe_checkout_token"] = None
+                self.rowcount = 1
+        elif "insert into processed_stripe_events" in s:
+            self.rowcount = self.cfg.get("event_claim_rowcount", 1)
+        elif "where stripe_subscription_id = ?" in s and "update users set" in s:
+            self.rowcount = self.cfg.get("subscription_update_rowcount", 1)
+        elif "stripe_checkout_token   = null" in s and "update users set" in s:
+            self.rowcount = self.cfg.get("monthly_activation_rowcount", 1)
         # subscription_status: plan/type/credits/quota/renewed/failed/cancel_at
         elif "select subscription_plan, subscription_type" in s:
             self._fetch = self.cfg.get(
-                "sub_status_row", ("monthly_pro", "monthly", 120, 200, None, None, None))
+                "sub_status_row",
+                ("monthly_pro", "monthly", 120, 200, None, None, None, 40, 120),
+            )
         elif "select purchase_type, plan_key from pending_purchases" in s:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
@@ -710,13 +763,17 @@ class BillingGateTests(unittest.TestCase):
         # The frontend reads `monthly_quota` and `renewal_date`; the backend's canonical names
         # are `credits_monthly_limit` and `next_renewal`. Emitting BOTH is what stops the UI
         # rendering a blank quota ("X of  credits") and a missing renewal date.
-        self._cfg["sub_status_row"] = ("monthly_pro", "monthly", 120, 200, None, None, None)
+        self._cfg["sub_status_row"] = (
+            "monthly_pro", "monthly", 120, 200, None, None, None, 40, 120,
+        )
         resp = function_app.subscription_status(self._req())
         self.assertEqual(resp.status_code, 200)
         body = json.loads(resp.body)
         self.assertEqual(body["monthly_quota"], 200)                        # what the UI shows
         self.assertEqual(body["monthly_quota"], body["credits_monthly_limit"])
         self.assertEqual(body["renewal_date"], body["next_renewal"])        # alias present
+        self.assertEqual(body["one_time_credits_remaining"], 40)
+        self.assertEqual(body["monthly_credits_remaining"], 120)
 
     def test_topup_requires_active_monthly(self):
         # A non-subscriber cannot buy loose credits — they buy a plan.
@@ -732,6 +789,261 @@ class BillingGateTests(unittest.TestCase):
             resp = function_app.topup_credits(self._req(plan="basic"))
         self.assertEqual(resp.status_code, 200)
         self.assertIn("checkout_url", resp.body)
+
+
+class SubscriptionReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        sys.modules["shared.auth"].validate_token.return_value = {
+            "oid": "user-1",
+            "email": "user@example.com",
+        }
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+        self._cfg = {}
+        self._get_db = mock.patch.object(
+            function_app, "get_db", side_effect=lambda: FakeConn(self._cfg))
+        self._new_connection = mock.patch.object(
+            function_app, "new_connection", side_effect=lambda: FakeConn(self._cfg))
+        self._get_db.start()
+        self._new_connection.start()
+
+    def tearDown(self):
+        self._get_db.stop()
+        self._new_connection.stop()
+
+    def _req(self, body=None):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.get_json = lambda: body or {}
+        return req
+
+    def test_b1_billing_portal_returns_stripe_url(self):
+        self._cfg["stripe_customer_id"] = "cus_123"
+        with mock.patch.object(
+            function_app,
+            "create_billing_portal",
+            return_value={"url": "https://billing.stripe.test/session"},
+        ) as create_portal:
+            response = function_app.create_subscription_portal(
+                self._req({"return_url": "http://localhost:5173/billing"}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("https://billing.stripe.test/session", response.body)
+        create_portal.assert_called_once_with(
+            "cus_123", "http://localhost:5173/billing")
+
+    def test_b1_payment_failure_is_recorded(self):
+        function_app._handle_payment_failed(
+            {"subscription": "sub_123"}, "evt_payment_failed")
+
+        executed = self._cfg["executed"]
+        self.assertTrue(any(
+            "payment_failed_at = getutcdate()" in sql.lower()
+            and params == ("sub_123",)
+            for sql, params in executed
+        ))
+
+    def test_local_webhook_secret_overrides_key_vault(self):
+        from shared import stripe_client
+
+        payload = b'{"id":"evt_local","type":"invoice.payment_failed"}'
+        timestamp = str(int(stripe_client.time.time()))
+        signature = stripe_client.hmac.new(
+            b"whsec_local",
+            f"{timestamp}.{payload.decode()}".encode(),
+            stripe_client.hashlib.sha256,
+        ).hexdigest()
+        with mock.patch.dict(
+            os.environ, {"STRIPE_WEBHOOK_SECRET": "whsec_local"}, clear=False
+        ), mock.patch.object(stripe_client, "get_secret") as get_secret:
+            event = stripe_client.verify_webhook(
+                payload, f"t={timestamp},v1={signature}")
+
+        self.assertEqual(event["id"], "evt_local")
+        get_secret.assert_not_called()
+
+    def test_cancel_subscription_reads_period_end_from_stripe_items(self):
+        self._cfg.update(
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+        stripe_response = {
+            "id": "sub_123",
+            "cancel_at_period_end": True,
+            "items": {
+                "data": [
+                    {"current_period_end": 1_800_000_000},
+                ],
+            },
+        }
+        with mock.patch.object(
+            function_app, "cancel_subscription", return_value=stripe_response
+        ):
+            response = function_app.cancel_user_subscription(self._req())
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertIsNotNone(body["cancel_at"])
+        self.assertTrue(any(
+            "update users set subscription_cancel_at = ?" in sql.lower()
+            and params[1] == "user-1"
+            for sql, params in self._cfg["executed"]
+        ))
+
+    def test_b2_active_subscription_update_syncs_plan_without_resetting_credits(self):
+        subscription = {
+            "id": "sub_123",
+            "status": "active",
+            "items": {"data": [{"price": {"id": "price_expert"}}]},
+            "cancel_at_period_end": False,
+        }
+        with mock.patch.object(
+            function_app, "monthly_plan_for_price_id", return_value="expert"
+        ):
+            function_app._handle_subscription_updated(subscription, "evt_sub_updated")
+
+        updates = [
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "credits_monthly_limit" in sql.lower()
+            and "where stripe_subscription_id = ?" in sql.lower()
+        ]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
+        self.assertNotIn("credits_remaining", sql.lower())
+        self.assertEqual(params[0], "expert")
+        self.assertEqual(params[-1], "sub_123")
+
+    def test_monthly_checkout_parks_existing_one_time_balance(self):
+        function_app._handle_monthly_checkout(
+            {
+                "metadata": {
+                    "user_id": "user-1",
+                    "plan": "pro",
+                    "checkout_token": "checkout-token",
+                },
+                "customer": "cus_123",
+                "subscription": "sub_123",
+            },
+            "evt_monthly_checkout",
+        )
+
+        activation_sql = next(
+            sql for sql, _ in self._cfg["executed"]
+            if "monthly_credits_remaining" in sql.lower()
+            and "stripe_checkout_token" in sql.lower()
+            and "update users set" in sql.lower()
+        )
+        self.assertIn(
+            "one_time_credits_remaining = case when subscription_type = 'monthly'",
+            activation_sql.lower(),
+        )
+        self.assertIn("else credits_remaining end", activation_sql.lower())
+
+    def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
+        function_app._handle_subscription_ended(
+            {"id": "sub_123", "status": "canceled"},
+            "evt_subscription_ended",
+        )
+
+        downgrade_sql = next(
+            sql for sql, _ in self._cfg["executed"]
+            if "monthly_credits_remaining = 0" in sql.lower()
+        )
+        self.assertIn(
+            "credits_remaining = one_time_credits_remaining",
+            downgrade_sql.lower(),
+        )
+        self.assertIn(
+            "subscription_type = case when one_time_credits_remaining > 0",
+            downgrade_sql.lower(),
+        )
+        self.assertIn("credits_monthly_limit = null", downgrade_sql.lower())
+
+    def test_invoice_paid_resets_only_monthly_balance(self):
+        function_app._handle_invoice_paid(
+            {"subscription": "sub_123"},
+            "evt_invoice_paid",
+        )
+
+        reset_sql = next(
+            sql for sql, _ in self._cfg["executed"]
+            if "monthly_credits_remaining = credits_monthly_limit" in sql.lower()
+        )
+        self.assertNotIn("one_time_credits_remaining =", reset_sql.lower())
+
+    def test_pro_addon_grants_50_separate_one_time_credits(self):
+        self._cfg["subscription_type"] = "monthly"
+        function_app._handle_topup(
+            {
+                "metadata": {
+                    "user_id": "user-1",
+                    "plan": "pro",
+                },
+            },
+            "evt_pro_addon",
+        )
+
+        addon_updates = [
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "one_time_credits_remaining = one_time_credits_remaining + ?" in sql.lower()
+        ]
+        self.assertEqual(len(addon_updates), 1)
+        sql, params = addon_updates[0]
+        self.assertNotIn("credits_remaining = credits_remaining +", sql.lower())
+        self.assertNotIn("monthly_credits_remaining", sql.lower())
+        self.assertEqual(params[0], 50)
+        self.assertEqual(params[1], "pro")
+
+    def test_monthly_job_spends_monthly_then_addon_credits(self):
+        from shared.job_reservation import reserve_job_slot
+
+        self._cfg.update(
+            credits=10,
+            one_time_credits=3,
+            new_job_id=123,
+        )
+        with mock.patch(
+            "shared.job_reservation.new_connection",
+            side_effect=lambda: FakeConn(self._cfg),
+        ):
+            result = reserve_job_slot(
+                "user-1",
+                "input.jpg",
+                json.dumps({"credit_cost": 25}),
+                per_user_cap=10,
+                global_cap=100,
+                credit_cost=25,
+                source_type="monthly",
+                image_count=5,
+                credits_per_image=5,
+            )
+
+        self.assertTrue(result.ok)
+        debit = next(
+            params for sql, params in self._cfg["executed"]
+            if "monthly_credits_remaining = monthly_credits_remaining - ?" in sql.lower()
+        )
+        self.assertEqual(debit[:3], (10, 3, 10))
+
+    def test_b3_only_one_monthly_checkout_reservation_is_allowed(self):
+        first_token, first_error = function_app._reserve_monthly_checkout("user-1")
+        second_token, second_error = function_app._reserve_monthly_checkout("user-1")
+
+        self.assertIsNotNone(first_token)
+        self.assertIsNone(first_error)
+        self.assertIsNone(second_token)
+        self.assertEqual(second_error, "checkout_in_progress")
+
+    def test_b3_provider_failure_releases_checkout_reservation(self):
+        with mock.patch.object(
+            function_app,
+            "create_monthly_checkout",
+            side_effect=RuntimeError("Stripe unavailable"),
+        ):
+            response = function_app.create_subscription(
+                self._req({"plan": "pro", "type": "monthly"}))
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(self._cfg["checkout_reserved"])
 
 
 class RetentionBlobCaseTests(unittest.TestCase):
@@ -827,6 +1139,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(inserts), 1, "expected exactly one users INSERT")
         granted = inserts[0][3]
         self.assertEqual(granted, function_app.REGISTRATION_CREDITS)
+        self.assertEqual(inserts[0][5], function_app.REGISTRATION_CREDITS)
 
         # RETURNED: the 201 body must equal the constant AND the granted amount.
         returned = json.loads(resp.body)["credits"]

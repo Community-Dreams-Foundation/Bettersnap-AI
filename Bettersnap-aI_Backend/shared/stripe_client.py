@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import os
 import time
 import json
 import requests
@@ -46,11 +47,13 @@ def _price_id(plan_type: str, plan: str) -> str:
     return get_secret(f"stripe-price-{plan_type}-{plan}")
 
 
-def _post(path: str, data: dict) -> dict:
+def _post(path: str, data: dict, idempotency_key: str | None = None) -> dict:
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
     resp = requests.post(
         f"{STRIPE_API_BASE}/{path}",
         auth=(_secret_key(), ""),
         data=data,
+        headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
@@ -96,6 +99,30 @@ def _maybe_email(params: dict, email: str) -> dict:
     return params
 
 
+def monthly_plan_for_price_id(price_id: str) -> str | None:
+    """Resolve a Stripe monthly Price ID to the BetterSnap plan tier."""
+    if not price_id:
+        return None
+    for plan in MONTHLY_PLANS:
+        if hmac.compare_digest(price_id, _price_id("monthly", plan)):
+            return plan
+    return None
+
+
+def subscription_period_end(subscription: dict) -> int | None:
+    """Return the effective period end across legacy and current Stripe response shapes."""
+    if subscription.get("cancel_at"):
+        return int(subscription["cancel_at"])
+    if subscription.get("current_period_end"):
+        return int(subscription["current_period_end"])
+    item_period_ends = [
+        int(item["current_period_end"])
+        for item in subscription.get("items", {}).get("data", [])
+        if item.get("current_period_end")
+    ]
+    return min(item_period_ends) if item_period_ends else None
+
+
 def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("onetime", plan)
     return _post("checkout/sessions", _maybe_email({
@@ -128,7 +155,15 @@ def create_topup_checkout(user_id: str, email: str, pack: str, success_url: str,
     }, email))
 
 
-def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
+def create_monthly_checkout(
+    user_id: str,
+    email: str,
+    plan: str,
+    success_url: str,
+    cancel_url: str,
+    checkout_token: str,
+    expires_at: int,
+) -> dict:
     price_id = _price_id("monthly", plan)
     return _post("checkout/sessions", _maybe_email({
         "mode": "subscription",
@@ -139,9 +174,11 @@ def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: st
         "metadata[user_id]": user_id,
         "metadata[plan]": plan,
         "metadata[payment_type]": "monthly",
+        "metadata[checkout_token]": checkout_token,
         "subscription_data[metadata][user_id]": user_id,
         "subscription_data[metadata][plan]": plan,
-    }, email))
+        "expires_at": str(expires_at),
+    }, email), idempotency_key=f"monthly-checkout-{checkout_token}")
 
 
 def cancel_subscription(stripe_subscription_id: str) -> dict:
@@ -159,8 +196,18 @@ def reactivate_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
+def create_billing_portal(stripe_customer_id: str, return_url: str) -> dict:
+    """Create a Stripe-hosted session where the customer can update payment details."""
+    return _post("billing_portal/sessions", {
+        "customer": stripe_customer_id,
+        "return_url": return_url,
+    })
+
+
 def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
-    webhook_secret = get_secret("stripe-webhook-secret")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    if not webhook_secret:
+        webhook_secret = get_secret("stripe-webhook-secret")
 
     parts = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(","))}
     timestamp = parts.get("t", "")
