@@ -113,5 +113,29 @@ COPY training/trainer/train_text_to_image_lora_sdxl.py /workspace/train_text_to_
 COPY training/trainer/run_training.py /workspace/run_training.py
 
 # MODE=train -> trainer, anything else -> inference.
+# gpu_preflight.py MUST sit in the same directory as entrypoint.py so `import gpu_preflight`
+# resolves from the script directory (sys.path[0]) with no PYTHONPATH juggling.
+COPY gpu_preflight.py /gpu_preflight.py
 COPY entrypoint.py /entrypoint.py
+
+# Full build provenance captured by the GPU preflight for the durable diagnostic record.
+# BUILD_GIT_SHA is the BASE commit only; when the image is built from an uncommitted working
+# tree (mixed unrelated work that must not be committed — e.g. domain/identity_profile.py),
+# BUILD_DIRTY=true and BUILD_SOURCE_HASH (a deterministic sha256 over every baked source file)
+# identify the ACTUAL source in the image. build_provenance.json is baked in and lists every
+# file hash + the exact uncommitted files. Build with:
+#   BUILD_SOURCE_HASH=$(python gen_provenance.py); az acr build \
+#     --build-arg BUILD_GIT_SHA=$(git rev-parse HEAD) --build-arg BUILD_IMAGE_REF=<tag> \
+#     --build-arg BUILD_DIRTY=true --build-arg BUILD_SOURCE_HASH=$BUILD_SOURCE_HASH ...
+COPY build_provenance.json /build_provenance.json
+ARG BUILD_GIT_SHA=unknown
+ARG BUILD_IMAGE_REF=unknown
+ARG BUILD_DIRTY=false
+ARG BUILD_SOURCE_HASH=unknown
+ENV BUILD_GIT_SHA=${BUILD_GIT_SHA} \
+    BUILD_IMAGE_REF=${BUILD_IMAGE_REF} \
+    BUILD_DIRTY=${BUILD_DIRTY} \
+    BUILD_SOURCE_HASH=${BUILD_SOURCE_HASH} \
+    BUILD_PROVENANCE=/build_provenance.json
+
 CMD ["python3.11", "/entrypoint.py"]
