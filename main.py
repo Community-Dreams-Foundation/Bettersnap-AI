@@ -211,9 +211,12 @@ LIGHTING = [
 #  • LoRA identity weight ~1.0: let the user's own trained identity dominate.
 DEFAULT_CFG           = float(os.environ.get("GUIDANCE_SCALE", "6.0"))
 DEFAULT_LORA_WEIGHT   = float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0"))
-# IP-Adapter Plus-Face conditioning strength (0 disables). 0.5-0.7 adds identity from the
-# user's own face crop without fighting the prompt/attire. Env-tunable for A/B testing.
-IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.6"))
+# IP-Adapter Plus-Face conditioning strength (0 disables). FROZEN at 0.2 (DECISIONS.md A1):
+# an A/B on female+male subjects showed 0.6 OVER-conditions — visible reference bleed that
+# fights the attire/scene prompt — while 0.2 follows the prompt and preserves likeness.
+# Env-tunable for A/B testing, but the DEFAULT must stay 0.2 so a missing/dropped env var
+# can't silently revert to the rejected 0.6. Deployment also sets it explicitly (job.yaml).
+IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.2"))
 # Which fetched reference crop feeds IP-Adapter (Phase-3 ablation). DEFAULT 0 = the first
 # crop = current behavior (strategy A), so the baseline / Phase-2 control is unchanged. The
 # harness (evaluation.reference_selection) picks a best-quality index for strategy B and it
@@ -792,6 +795,19 @@ def run_inference(job: dict) -> list:
             f"USING 1 (index {ref_idx} = {ref_ids[ref_idx]}); scale={IP_ADAPTER_SCALE}"
         )
 
+    # ── B3: resolve effective gender from trained class_word (Policy B) ──────────────
+    # The LoRA is trained to bind the trigger token to "<IDENTITY_TRIGGER> <class_word>".
+    # Generation-time gender may differ (returning sessions re-default to "male", user changes
+    # preferences, legacy records). Use the TRAINED class_word as source of truth when available;
+    # fall back to generation-time gender for legacy records (no class_word).
+    gen_gender = job_params.get("gender") or ""
+    class_word_trained = job_params.get("class_word")
+    if class_word_trained and class_word_trained in SUBJECT_NOUN.values():
+        effective_gender = catalog.gender_from_class_word(class_word_trained)
+        if effective_gender:
+            gen_gender = effective_gender  # override: use the trained gender
+    # ─────────────────────────────────────────────────────────────────────────────────
+
     # ── resolved plan + runtime context ──────────────────────────────────────
     _plan = Plan(   # worker-side reconstruction; billing fields UNUSED here (control plane owns billing)
         key=(job_params.get("plan_name") or "unknown"),
@@ -802,7 +818,7 @@ def run_inference(job: dict) -> list:
         user_id=user_id, job_id=job_id, plan=_plan,
         billable_count=image_count, credit_cost=0, candidate_budget=image_count,
         acceptance_threshold=0.0, retry_limit=0,
-        gender=(job_params.get("gender") or ""),
+        gender=gen_gender,
         age_range=(job_params.get("age_range") or ""),
         hair_color=(job_params.get("hair_color") or ""),
         attire_refs=tuple(attire_refs), background_refs=tuple(background_refs),

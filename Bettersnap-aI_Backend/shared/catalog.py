@@ -59,6 +59,18 @@ def class_word(gender: str) -> str:
     return SUBJECT_NOUN[normalize_gender(gender)]
 
 
+def gender_from_class_word(cw: str) -> str:
+    """Reverse-map: class_word (woman|man|person) → gender (female|male|neutral).
+    Returns the gender if the class_word is recognized, else None (for legacy/corrupt rows)."""
+    if cw in ("woman",):
+        return "female"
+    if cw in ("man",):
+        return "male"
+    if cw in ("person",):
+        return "neutral"
+    return None  # legacy/NULL/unrecognized
+
+
 def instance_prompt(class_word_: str) -> str:
     """What the LoRA is trained to bind the trigger token to."""
     return f"a photo of {IDENTITY_TRIGGER} {class_word_}"
