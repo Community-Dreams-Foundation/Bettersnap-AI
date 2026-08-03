@@ -225,6 +225,8 @@ class FakeCursor:
         # _finish_training's txn) — OUTPUT INSERTED.outbox_id, so fetchone must return an id.
         elif "insert into outbox" in s:
             self._fetch = (self.cfg.get("new_outbox_id", 12345),)
+        elif "insert into processed_stripe_events" in s:
+            self.rowcount = self.cfg.get("claim_event_rowcount", 1)
         elif "select user_id from lora_trainings" in s:
             self._fetch = (self.cfg.get("training_user", "user-1"),)
         else:
@@ -951,6 +953,62 @@ class RegistrationTests(unittest.TestCase):
             returned, granted,
             "register response 'credits' must match the granted/persisted balance",
         )
+
+
+class PublicCatalogPrivacyTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.sql = ""
+
+        def execute(self, sql, *_params):
+            self.sql = " ".join(sql.lower().split())
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def __init__(self, rows):
+            self.cur = PublicCatalogPrivacyTests.Cursor(rows)
+
+        def cursor(self):
+            return self.cur
+
+    def test_attires_exclude_internal_blob_path(self):
+        conn = self.Conn([("suit", "Navy Suit", "professional")])
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.get_attires(None)
+        item = json.loads(response.body)["attires"][0]
+        self.assertNotIn("blob_path", item)
+        self.assertNotIn("blob_path", conn.cur.sql)
+
+    def test_backgrounds_exclude_internal_blob_path(self):
+        conn = self.Conn([("studio", "Studio", "professional")])
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.get_backgrounds(None)
+        item = json.loads(response.body)["backgrounds"][0]
+        self.assertNotIn("blob_path", item)
+        self.assertNotIn("blob_path", conn.cur.sql)
+
+
+class SubscriptionDowngradeTests(unittest.TestCase):
+    def test_ended_subscription_uses_trial_credit_limit(self):
+        cfg = {}
+        with mock.patch.object(function_app, "new_connection",
+                               return_value=FakeConn(cfg)):
+            function_app._handle_subscription_ended(
+                {"id": "sub-ended", "status": "canceled"}, "evt-ended"
+            )
+
+        updates = [
+            (sql, params) for sql, params in cfg["executed"]
+            if "update users set" in sql.lower() and "credits_monthly_limit" in sql.lower()
+        ]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
+        self.assertNotIn("credits_monthly_limit = 20", sql.lower())
+        self.assertEqual(params[0], function_app.DEFAULT_PLAN_KEY)
+        self.assertEqual(params[1], function_app.REGISTRATION_CREDITS)
 
 
 class StripePaidGrantTests(unittest.TestCase):

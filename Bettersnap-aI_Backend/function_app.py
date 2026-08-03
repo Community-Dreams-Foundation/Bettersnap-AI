@@ -1274,11 +1274,11 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
 def get_attires(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT attire_id, name, category, blob_path FROM attires WHERE is_active = 1")
+    cursor.execute("SELECT attire_id, name, category FROM attires WHERE is_active = 1")
     rows = cursor.fetchall()
 
     attires = [
-        {"id": r[0], "name": r[1], "category": r[2], "blob_path": r[3]}
+        {"id": r[0], "name": r[1], "category": r[2]}
         for r in rows
     ]
 
@@ -1293,11 +1293,11 @@ def get_attires(req: func.HttpRequest) -> func.HttpResponse:
 def get_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT background_id, name, category, blob_path FROM backgrounds WHERE is_active = 1")
+    cursor.execute("SELECT background_id, name, category FROM backgrounds WHERE is_active = 1")
     rows = cursor.fetchall()
 
     backgrounds = [
-        {"id": r[0], "name": r[1], "category": r[2], "blob_path": r[3]}
+        {"id": r[0], "name": r[1], "category": r[2]}
         for r in rows
     ]
 
@@ -2955,14 +2955,14 @@ def _handle_subscription_ended(sub: dict, event_id: str):
                 """UPDATE users SET
                     subscription_plan      = 'free',
                     subscription_type      = NULL,
-                    plan_name              = 'trial',
+                    plan_name              = ?,
                     stripe_subscription_id = NULL,
-                    credits_monthly_limit  = 20,
+                    credits_monthly_limit  = ?,
                     subscription_cancel_at = NULL,
                     payment_failed_at      = NULL,
                     retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())
                 WHERE stripe_subscription_id = ?""",
-                RETENTION_DAYS, sub_id,
+                DEFAULT_PLAN_KEY, REGISTRATION_CREDITS, RETENTION_DAYS, sub_id,
             )
             conn.commit()
             logging.info(f"Subscription {sub_id} ended → free; retention starts (+{RETENTION_DAYS}d)")
