@@ -12,7 +12,8 @@ from .queue_client import INFERENCE_QUEUE
 
 
 class ReserveResult:
-    def __init__(self, ok: bool, job_id=None, reason: str = None, outbox_id=None):
+    def __init__(self, ok: bool, job_id=None, reason: str = None, outbox_id=None,
+                 status: str = None):
         self.ok = ok
         self.job_id = job_id
         self.reason = reason   # one of: busy | credits | user_cap | global_cap
@@ -20,12 +21,15 @@ class ReserveResult:
         # charge, so the caller can fast-path the send (and the dispatcher can retry it).
         # None for 'waiting_lora' rows, which are deliberately not enqueued.
         self.outbox_id = outbox_id
+        # Final status chosen inside the reservation transaction. This can differ
+        # from a status observed earlier by the HTTP handler if training completes.
+        self.status = status
 
 
 def reserve_job_slot(user_id, input_blob_path, job_params,
                      per_user_cap, global_cap, lock_timeout_ms=5000,
                      credit_cost=1, initial_status="queued",
-                     source_type=None) -> ReserveResult:
+                     source_type=None, resolve_lora_status=False) -> ReserveResult:
     """credit_cost = total credits this job consumes = image_count *
     plan.credits_per_image (resolved by the caller). One-time plans use
     credits_per_image=1 so credit_cost == number of images. The decrement and the
@@ -54,11 +58,33 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="busy")
 
-        cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
+        # When submit depends on LoRA readiness, resolve it HERE under an update/range
+        # lock held until commit. _finish_training's UPDATE users must then serialize
+        # with this transaction: either it releases our already-inserted parked job, or
+        # we observe 'ready' and enqueue immediately. No charged waiting_lora orphan can
+        # be inserted after the training-completion release scan.
+        if resolve_lora_status:
+            cur.execute(
+                "SELECT credits_remaining, lora_status FROM users WITH (UPDLOCK, HOLDLOCK) "
+                "WHERE user_id = ?",
+                user_id,
+            )
+        else:
+            cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
         row = cur.fetchone()
         if not row or row[0] < credit_cost:
             conn.rollback()
             return ReserveResult(False, reason="credits")
+
+        if resolve_lora_status:
+            lora_status = (row[1] or "none").strip()
+            if lora_status == "ready":
+                initial_status = "queued"
+            elif lora_status == "training":
+                initial_status = "waiting_lora"
+            else:
+                conn.rollback()
+                return ReserveResult(False, reason="lora_not_ready")
 
         cur.execute(
             "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created_at >= CAST(GETUTCDATE() AS DATE)",
@@ -99,6 +125,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             )
 
         conn.commit()   # releases the app lock; job + credit charge + outbox row commit together
-        return ReserveResult(True, job_id=job_id, outbox_id=outbox_id)
+        return ReserveResult(
+            True, job_id=job_id, outbox_id=outbox_id, status=initial_status)
     finally:
         conn.close()

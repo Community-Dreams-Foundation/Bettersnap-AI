@@ -14,10 +14,13 @@ from .db import new_connection
 
 LEASE_NAME = "gpu-dispatch"
 LEASE_TTL_SECONDS = int(os.environ.get("GPU_LEASE_TTL_SECONDS", "180"))
-# A just-started job may not appear in the Container Apps executions API for a
-# few seconds (eventual consistency). During this window treat it as active so a
-# second job can't slip in.
-DISPATCH_GRACE_SECONDS = int(os.environ.get("GPU_DISPATCH_GRACE_SECONDS", "60"))
+# The start LRO / A100 cold-start can outlive the short crash-recovery lease.
+# last_dispatch_at is stamped before that blocking call and remains a global
+# pending-capacity reservation after ownership expires. Keep the safety window
+# at least 30 minutes even if an old deployment still supplies the former 60s.
+DISPATCH_GRACE_SECONDS = max(
+    1800, int(os.environ.get("GPU_DISPATCH_GRACE_SECONDS", "1800"))
+)
 
 
 class DispatchConfigError(Exception):
@@ -88,8 +91,11 @@ def release_dispatch_lease(owner: str):
 
 
 def mark_dispatched(owner: str):
-    """Stamp the moment an A100 job was started so recent_dispatch_pending()
-    counts it as active until the executions API catches up."""
+    """Reserve one A100 dispatch before the blocking start request.
+
+    This timestamp outlives the ownership TTL, so another Functions instance
+    counts the cold-starting job while the executions API still reports zero.
+    """
     conn = new_connection()
     try:
         cur = conn.cursor()

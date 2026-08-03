@@ -186,6 +186,11 @@ class FakeCursor:
         elif "select job_id, job_params from jobs" in s:
             self._fetch = None
             self._fetchall = self.cfg.get("parked_jobs", [])
+        elif "select credits_remaining, lora_status" in s:
+            self._fetch = (
+                self.cfg.get("credits", 20),
+                self.cfg.get("reservation_lora_status", self.cfg.get("lora_status", "ready")),
+            )
         elif "select credits_remaining" in s:
             self._fetch = (self.cfg.get("credits", 20),)
         # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
@@ -315,6 +320,20 @@ class DispatchTests(unittest.TestCase):
         # the processing deadline from GPU-run start instead of submit time.
         self.assertTrue(any("dispatched_at = getutcdate()" in s.lower()
                             for s, _ in self._cfg["executed"]))
+
+    def test_cold_start_is_reserved_before_azure_start(self):
+        gl = sys.modules["shared.gpu_lease"]
+        qt = sys.modules["shared.queue_trigger"]
+
+        def start_only_after_reservation(*_args, **_kwargs):
+            gl.mark_dispatched.assert_called_once_with("owner-1")
+            return "exec-123"
+
+        qt.trigger_container_job.side_effect = start_only_after_reservation
+        function_app.process_inference_job(
+            _QueueMessage({"job_id": "1", "user_id": "u"})
+        )
+        qt.trigger_container_job.assert_called_once()
 
     # 4) over-cap -> defers, does not start
     def test_over_cap_defers(self):
@@ -566,6 +585,32 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertIn("waiting_lora", resp.body)
         inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
         self.assertEqual(inserts[0][1], "waiting_lora")                  # parked status
+        sys.modules["shared.queue_client"]._send.assert_not_called()
+
+    def test_training_finishes_between_gate_and_reservation_queues_job(self):
+        """Regression: the early handler read says training, but completion wins the
+        race before the atomic reservation. The locked re-read must choose queued and
+        write an outbox message, never insert an orphaned waiting_lora row."""
+        self._cfg["lora_status"] = "training"              # early, stale read
+        self._cfg["reservation_lora_status"] = "ready"     # locked transactional read
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn('"status": "queued"', resp.body)
+        inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertEqual(inserts[0][1], "queued")
+        locked_reads = [s.lower() for s, _ in self._cfg["executed"]
+                        if "select credits_remaining, lora_status" in s.lower()]
+        self.assertTrue(any("updlock" in s and "holdlock" in s for s in locked_reads))
+        sys.modules["shared.queue_client"]._send.assert_called_once()
+
+    def test_training_failure_between_gate_and_reservation_does_not_charge(self):
+        self._cfg["lora_status"] = "training"              # early, stale read
+        self._cfg["reservation_lora_status"] = "failed"    # locked transactional read
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 409)
+        sqls = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertFalse(any("insert into jobs" in s for s in sqls))
+        self.assertFalse(any("credits_remaining -" in s for s in sqls))
         sys.modules["shared.queue_client"]._send.assert_not_called()
 
     def test_ready_lora_dispatches_normally(self):

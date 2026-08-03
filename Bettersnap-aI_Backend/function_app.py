@@ -979,17 +979,27 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # image_count * plan.credits_per_image — the counter tracks images, not jobs.
     # 'waiting_lora' rows are reserved (credits taken, cap counted) but deliberately
     # NOT enqueued — see the identity-LoRA gate above.
-    parked = lora_status == "training"
     result = reserve_job_slot(
         user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
         credit_cost=cost,
-        initial_status="waiting_lora" if parked else "queued",
+        # Resolve ready vs training again under the reservation transaction's
+        # UPDLOCK/HOLDLOCK. The earlier read is only for validation/prompt planning;
+        # using it for the INSERT creates a training-completion orphan race.
+        resolve_lora_status=True,
         # Tag the job with the product it belongs to (finding #6 foundation): drives the
         # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
         # 'one_time' | 'monthly'.
         source_type=plan.plan_type,
     )
     if not result.ok:
+        if result.reason == "lora_not_ready":
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "Your model is no longer training or ready. Start training first.",
+                    "train_endpoint": "/api/train",
+                }),
+                mimetype="application/json", status_code=409,
+            )
         if result.reason == "credits":
             return func.HttpResponse(
                 json.dumps({"error": "Insufficient credits", "required": cost,
@@ -1010,6 +1020,7 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     job_id = result.job_id
+    parked = result.status == "waiting_lora"
 
     # One-time plans: (re)start the retention clock at each generation (last-gen + N days).
     # Monthly plans keep retention_expires_at NULL until the subscription ends. Best-effort
@@ -1515,7 +1526,12 @@ def process_inference_job(msg: func.QueueMessage):
         finally:
             conn.close()
 
-        # 6) Start the GPU job. If the start fails, revert the claim so the job
+        # 6) Reserve capacity BEFORE the blocking Container Apps start call.
+        #    The short ownership lease may expire during A100 cold-start, but
+        #    last_dispatch_at remains visible to recent_dispatch_pending().
+        mark_dispatched(owner)
+
+        # Start the GPU job. If the start fails, revert the claim so the job
         #    can be retried (no A100 was started -> no double-spend), then
         #    re-raise so the queue retries the message.
         try:
@@ -1525,7 +1541,6 @@ def process_inference_job(msg: func.QueueMessage):
             _revert_claim(job_id)
             raise
 
-        mark_dispatched(owner)
         _record_execution_id(job_id, execution_id)
         logging.info(f"Started job_id={job_id} execution_id={execution_id} (active before={active})")
     finally:
@@ -1804,6 +1819,9 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
         finally:
             conn.close()
 
+        # Training and inference share the same A100 cap, so training needs the
+        # same pre-start reservation across lease expiry and API visibility lag.
+        mark_dispatched(owner)
         try:
             # user_id is passed ONCE and drives both the input photo paths and the
             # adapter output path. trigger_training_job re-verifies every file lives
@@ -1852,7 +1870,6 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
                 conn3.close()
             raise
 
-        mark_dispatched(owner)
         conn4 = new_connection()
         try:
             c4 = conn4.cursor()
