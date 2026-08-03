@@ -2600,6 +2600,10 @@ def reactivate_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ── Stripe Webhook ────────────────────────────────────────
+class RetryableStripeWebhookError(Exception):
+    """A valid paid event whose entitlement could not be applied yet."""
+
+
 @app.route(route="webhooks/stripe", methods=["POST"])
 def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
     sig_header = req.headers.get("Stripe-Signature", "")
@@ -2620,24 +2624,30 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Stripe event has no id; skipping to stay idempotent: type={event_type}")
         return func.HttpResponse("OK", status_code=200)
 
-    if event_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        payment_type = session.get("metadata", {}).get("payment_type")
-        if payment_type == "one_time":
-            _handle_onetime_payment(session, event_id)
-        elif payment_type == "monthly":
-            _handle_monthly_checkout(session, event_id)
-        elif payment_type == "topup":
-            _handle_topup(session, event_id)
+    try:
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            payment_type = session.get("metadata", {}).get("payment_type")
+            if payment_type == "one_time":
+                _handle_onetime_payment(session, event_id)
+            elif payment_type == "monthly":
+                _handle_monthly_checkout(session, event_id)
+            elif payment_type == "topup":
+                _handle_topup(session, event_id)
 
-    elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
-        _handle_invoice_paid(event["data"]["object"], event_id)
+        elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
+            _handle_invoice_paid(event["data"]["object"], event_id)
 
-    elif event_type == "invoice.payment_failed":
-        _handle_payment_failed(event["data"]["object"], event_id)
+        elif event_type == "invoice.payment_failed":
+            _handle_payment_failed(event["data"]["object"], event_id)
 
-    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
-        _handle_subscription_ended(event["data"]["object"], event_id)
+        elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+            _handle_subscription_ended(event["data"]["object"], event_id)
+    except RetryableStripeWebhookError as e:
+        # A 2xx tells Stripe the event is permanently handled. A 500 makes Stripe replay
+        # the still-unclaimed event after registration/reconciliation creates its target.
+        logging.error(f"Retryable Stripe webhook failure: event={event_id}: {e}")
+        return func.HttpResponse("Entitlement not applied; retry", status_code=500)
 
     return func.HttpResponse("OK", status_code=200)
 
@@ -2692,7 +2702,8 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 f"credits={credits} matched 0 user rows — user not registered. "
                 f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
             )
-            return
+            raise RetryableStripeWebhookError(
+                f"one_time grant matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + grant commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
@@ -2744,7 +2755,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 f"credits={credits} sub={sub_id} matched 0 user rows — user not registered. "
                 f"MANUAL RECONCILIATION REQUIRED."
             )
-            return
+            raise RetryableStripeWebhookError(
+                f"monthly activation matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         conn.commit()  # claim + activation commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
@@ -2781,7 +2793,8 @@ def _handle_topup(session: dict, event_id: str):
             logging.error(
                 f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
                 f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
-            return
+            raise RetryableStripeWebhookError(
+                f"topup matched no active monthly user: user_id={user_id} pack={pack}")
         rate = max(1, get_plan(prow[0]).credits_per_image)
         grant = images * rate
         cur.execute(
@@ -2808,12 +2821,28 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             return
         cur.execute(
             """UPDATE users SET
-                credits_remaining       = credits_monthly_limit,
+                -- Renewal restores the monthly floor but must never reduce the balance:
+                -- credits above the limit can be paid top-ups and are non-expiring.
+                credits_remaining       = CASE
+                    WHEN credits_remaining > credits_monthly_limit
+                        THEN credits_remaining
+                    ELSE credits_monthly_limit
+                END,
                 subscription_renewed_at = GETUTCDATE(),
                 payment_failed_at       = NULL
             WHERE stripe_subscription_id = ?""",
             sub_id,
         )
+        if cur.rowcount == 0:
+            # Checkout/user registration and the first invoice can race. Roll back the
+            # processed-event claim and force a retry instead of losing a paid renewal.
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (invoice): subscription={sub_id} matched 0 user rows. "
+                f"Returning non-2xx for Stripe retry; event_id={event_id}."
+            )
+            raise RetryableStripeWebhookError(
+                f"invoice grant matched no subscription: subscription={sub_id}")
         conn.commit()  # claim + reset commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
     finally:

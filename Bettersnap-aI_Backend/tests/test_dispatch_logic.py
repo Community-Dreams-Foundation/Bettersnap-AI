@@ -837,5 +837,116 @@ class RegistrationTests(unittest.TestCase):
         )
 
 
+class StripePaidGrantTests(unittest.TestCase):
+    """A paid entitlement must not be acknowledged after a zero-row update."""
+
+    class _Req:
+        headers = {"Stripe-Signature": "sig"}
+
+        @staticmethod
+        def get_body():
+            return b"{}"
+
+    def test_retryable_paid_grant_returns_500(self):
+        event = {
+            "id": "evt_paid_unregistered",
+            "type": "checkout.session.completed",
+            "data": {"object": {"metadata": {"payment_type": "one_time"}}},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value=event), \
+             mock.patch.object(
+                 function_app,
+                 "_handle_onetime_payment",
+                 side_effect=function_app.RetryableStripeWebhookError("no user row"),
+             ):
+            response = function_app.stripe_webhook(self._Req())
+        self.assertEqual(response.status_code, 500)
+
+    def test_invoice_zero_row_rolls_back_and_is_retryable(self):
+        class Cursor:
+            rowcount = 0
+
+            def execute(self, sql, *params):
+                self.rowcount = 1 if "processed_stripe_events" in sql else 0
+                return self
+
+        class Conn:
+            def __init__(self):
+                self.cur = Cursor()
+                self.committed = False
+                self.rolled_back = False
+
+            def cursor(self):
+                return self.cur
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                self.rolled_back = True
+
+            def close(self):
+                pass
+
+        conn = Conn()
+        with mock.patch.object(function_app, "new_connection", return_value=conn):
+            with self.assertRaises(function_app.RetryableStripeWebhookError):
+                function_app._handle_invoice_paid(
+                    {"subscription": "sub_missing"}, "evt_invoice_missing"
+                )
+        self.assertTrue(conn.rolled_back)
+        self.assertFalse(conn.committed)
+
+    def test_renewal_never_overwrites_balance_with_monthly_limit(self):
+        class Cursor:
+            rowcount = 0
+
+            def __init__(self):
+                self.sql = []
+
+            def execute(self, sql, *params):
+                normalized = " ".join(sql.lower().split())
+                self.sql.append(normalized)
+                self.rowcount = 1
+                return self
+
+        class Conn:
+            def __init__(self):
+                self.cur = Cursor()
+                self.committed = False
+
+            def cursor(self):
+                return self.cur
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        conn = Conn()
+        with mock.patch.object(function_app, "new_connection", return_value=conn):
+            function_app._handle_invoice_paid(
+                {"subscription": "sub_topup"}, "evt_renew_topup"
+            )
+
+        renewal_sql = next(
+            sql for sql in conn.cur.sql
+            if "update users set" in sql and "credits_monthly_limit" in sql
+        )
+        self.assertIn(
+            "when credits_remaining > credits_monthly_limit then credits_remaining",
+            renewal_sql,
+        )
+        self.assertNotIn(
+            "credits_remaining = credits_monthly_limit",
+            renewal_sql,
+        )
+        self.assertTrue(conn.committed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
