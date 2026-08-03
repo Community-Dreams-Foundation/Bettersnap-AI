@@ -97,6 +97,7 @@ from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 from shared.auth import validate_token, get_user_id
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
+from shared.training_reservation import reserve_training_slot
 from shared.queue_client import enqueue_job, INFERENCE_QUEUE, TRAINING_QUEUE
 from shared.outbox import outbox_add, outbox_try_send_now
 from shared.blob import upload_blob, download_blob, get_blob_client
@@ -598,10 +599,6 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
     credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
-    # Product this training belongs to (finding #6 foundation) — drives per-product retention
-    # + LoRA lifecycle. get_plan maps plan_name -> plan_type ('one_time' | 'monthly').
-    train_source = get_plan(row[3]).plan_type
-
     if lora_status == "training":
         return func.HttpResponse(
             json.dumps({"status": "training", "message": "Training already in progress"}),
@@ -761,33 +758,38 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # Insert the run, flip the user to 'training', and CHARGE the retrain in ONE
     # transaction — so a crash between them can't take credits without starting a run,
     # or start a run without charging.
-    conn2 = new_connection()
-    try:
-        conn2.autocommit = False
-        cur2 = conn2.cursor()
-        cur2.execute("""
-            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json, source_type)
-            OUTPUT INSERTED.training_id
-            VALUES (?, 'queued', ?, ?, ?, ?)
-        """, user_id, len(files), cword, json.dumps(files), train_source)
-        training_id = cur2.fetchone()[0]
-        if is_retrain:
-            cur2.execute(
-                "UPDATE users SET lora_status = 'training', retrain_count = retrain_count + 1, "
-                "credits_remaining = credits_remaining - ? WHERE user_id = ?",
-                retrain_cost, user_id,
-            )
-        else:
-            cur2.execute(
-                "UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
-        # Transactional outbox (finding #4): the training enqueue commits WITH the row +
-        # lora_status + retrain charge, so a queue outage after commit can't strand the user
-        # in 'training' with no message. Fast-path the send below; outbox_dispatcher backstops.
-        train_msg = {"training_id": str(training_id), "user_id": str(user_id)}
-        outbox_tid = outbox_add(cur2, TRAINING_QUEUE, train_msg)
-        conn2.commit()
-    finally:
-        conn2.close()
+    reserved = reserve_training_slot(
+        user_id, files, cword, force, FREE_RETRAINS, RETRAIN_CREDITS,
+        MAX_TRAININGS_PER_DAY,
+    )
+    if not reserved.ok:
+        if reserved.reason == "busy":
+            return func.HttpResponse("Service busy, please retry", status_code=503)
+        if reserved.reason == "user_missing":
+            return func.HttpResponse("User not found", status_code=404)
+        if reserved.reason == "already_training":
+            return func.HttpResponse(
+                json.dumps({"status": "training", "message": "Training already in progress"}),
+                mimetype="application/json", status_code=409)
+        if reserved.reason == "force_required":
+            return func.HttpResponse(
+                json.dumps({"status": "ready", "message": "Pass force=true to retrain."}),
+                mimetype="application/json", status_code=409)
+        if reserved.reason == "credits":
+            return func.HttpResponse(
+                json.dumps({"error": "Not enough credits to retrain your model.",
+                            "required": RETRAIN_CREDITS}),
+                mimetype="application/json", status_code=402)
+        return func.HttpResponse(
+            json.dumps({"error": "Daily training limit reached. Try again tomorrow.",
+                        "limit": MAX_TRAININGS_PER_DAY}),
+            mimetype="application/json", status_code=429)
+
+    training_id = reserved.training_id
+    is_retrain = reserved.retrain
+    retrain_cost = reserved.credits_charged
+    train_msg = reserved.message
+    outbox_tid = reserved.outbox_id
 
     # Delayed on purpose — see TRAIN_FUSE_HEAD_START. Gives /jobs/submit time to park the
     # generation job so _dispatch_training can fuse it into this same container. The
