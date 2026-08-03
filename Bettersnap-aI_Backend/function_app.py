@@ -409,19 +409,16 @@ def accept_terms(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    try:
-        body = req.get_json()
-        accepted_at = body.get("accepted_at")
-    except Exception:
-        accepted_at = None
-
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET terms_accepted_at = ? WHERE user_id = ?",
-        accepted_at, user_id,
+        "UPDATE users SET terms_accepted_at = GETUTCDATE() WHERE user_id = ?",
+        user_id,
     )
     conn.commit()
+    cursor.execute("SELECT terms_accepted_at FROM users WHERE user_id = ?", user_id)
+    row = cursor.fetchone()
+    accepted_at = _utc_iso(row[0]) if row else None
 
     return func.HttpResponse(
         json.dumps({"terms_accepted_at": accepted_at}),
@@ -854,7 +851,14 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    body = req.get_json()
+    try:
+        body = req.get_json()
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
+    except Exception:
+        return func.HttpResponse(
+            json.dumps({"error": "invalid JSON body"}),
+            mimetype="application/json", status_code=400)
     gender = body.get("gender")
     age_range = body.get("age_range")
     hair_color = body.get("hair_color")
@@ -1432,7 +1436,9 @@ def admin_fail_job(req: func.HttpRequest) -> func.HttpResponse:
 # ── Queue Trigger ─────────────────────────────────────────
 @app.queue_trigger(arg_name="msg", queue_name="inference-jobs", connection="AzureWebJobsStorage")
 def process_inference_job(msg: func.QueueMessage):
-    from shared.queue_trigger import trigger_container_job, count_active_job_executions
+    from shared.queue_trigger import (
+        trigger_container_job, count_active_job_executions, find_execution_for_job,
+    )
     from shared.queue_client import enqueue_job
     from shared.gpu_lease import (
         acquire_dispatch_lease, release_dispatch_lease,
@@ -1441,6 +1447,11 @@ def process_inference_job(msg: func.QueueMessage):
     # The host already base64-decodes the transport (messageEncoding=base64,
     # the extension-bundle default), so get_body() returns the raw JSON.
     payload = json.loads(msg.get_body().decode("utf-8"))
+    if not isinstance(payload, dict) or not payload.get("job_id") or not payload.get("user_id"):
+        # Raising keeps the message retryable and ultimately visible in the poison
+        # queue; acknowledging it here would silently lose the associated job.
+        logging.error(f"malformed inference queue message: {payload!r}")
+        raise ValueError("inference queue message requires job_id and user_id")
     job_id = payload["job_id"]
     user_id = payload["user_id"]
 
@@ -1493,6 +1504,13 @@ def process_inference_job(msg: func.QueueMessage):
                 logging.error(f"job_id={job_id} not found in DB; dropping message")
                 return
             status, exec_id = row[0], row[1]
+            if status == "dispatching" and not exec_id:
+                exec_id = find_execution_for_job(job_id)
+                if exec_id:
+                    _record_execution_id(job_id, exec_id)
+                    logging.warning(
+                        f"job_id={job_id} recovered execution_id={exec_id} after dispatch commit gap"
+                    )
             if exec_id or status in ("dispatching", "processing", "completed", "failed"):
                 logging.info(
                     f"job_id={job_id} already dispatched/terminal "
@@ -2048,6 +2066,12 @@ def handle_poison_job(msg: func.QueueMessage):
         logging.error(f"POISON: unparseable message dropped: {msg.get_body()!r}")
         return
 
+    if not job_id:
+        # There is no safe DB row to update without an identifier. Do not acknowledge
+        # and discard the evidence: fail this trigger so operators retain visibility.
+        logging.critical(f"POISON: message missing job_id: {payload!r}")
+        raise ValueError("poison inference message missing job_id")
+
     logging.error(
         f"POISON: job_id={job_id} exceeded retry limit (dequeue_count={msg.dequeue_count}); "
         f"marking failed"
@@ -2070,6 +2094,7 @@ def handle_poison_job(msg: func.QueueMessage):
 # is killed before it can write — this reaper is the ONLY thing that clears it.
 @app.timer_trigger(schedule="0 */10 * * * *", arg_name="timer", run_on_startup=False)
 def reaper(timer: func.TimerRequest):
+    from shared.queue_trigger import find_execution_for_job
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -2084,13 +2109,24 @@ def reaper(timer: func.TimerRequest):
         stuck = [str(r[0]) for r in cur.fetchall()]
 
         cur.execute(
-            "SELECT job_id FROM jobs WHERE status = 'dispatching' "
+            "SELECT job_id, external_execution_id FROM jobs WHERE status = 'dispatching' "
             "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_DISPATCHING_MINUTES,
         )
-        stuck += [str(r[0]) for r in cur.fetchall()]
+        dispatching = [(str(r[0]), r[1]) for r in cur.fetchall()]
     finally:
         conn.close()
+
+    for job_id, exec_id in dispatching:
+        if not exec_id:
+            recovered = find_execution_for_job(job_id)
+            if recovered:
+                _record_execution_id(job_id, recovered)
+                logging.warning(
+                    f"REAPER: recovered live execution_id={recovered} for job_id={job_id}; not failing"
+                )
+                continue
+        stuck.append(job_id)
 
     for job_id in stuck:
         logging.warning(f"REAPER: failing stuck job_id={job_id}")

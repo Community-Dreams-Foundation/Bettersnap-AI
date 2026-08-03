@@ -21,6 +21,7 @@ import sys
 import json
 import types
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -88,6 +89,7 @@ _mod("azure.storage")
 _mod("azure.storage.blob",
      generate_blob_sas=mock.Mock(return_value="sas"),
      BlobSasPermissions=mock.Mock())
+_mod("requests", post=mock.Mock(), get=mock.Mock())
 
 # Stub the heavy LEAF modules so importing function_app never pulls pyodbc / jwt
 # / azure-mgmt. NOTE: 'shared' itself and shared.job_reservation are left REAL so
@@ -105,7 +107,8 @@ _mod("shared.blob",
 _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
 _mod("shared.queue_trigger",
      trigger_container_job=mock.Mock(return_value="exec-123"),
-     count_active_job_executions=mock.Mock(return_value=0))
+     count_active_job_executions=mock.Mock(return_value=0),
+     find_execution_for_job=mock.Mock(return_value=None))
 
 
 # Identity-LoRA training deps. crops pulls opencv and training_trigger pulls
@@ -164,6 +167,12 @@ class FakeCursor:
             )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
+        elif "select job_id from jobs where status = 'processing'" in s:
+            self._fetchall = self.cfg.get("reaper_processing", [])
+        elif "select job_id, external_execution_id from jobs where status = 'dispatching'" in s:
+            self._fetchall = self.cfg.get("reaper_dispatching", [])
+        elif "select terms_accepted_at from users" in s:
+            self._fetch = (self.cfg.get("terms_accepted_at"),)
         elif "update jobs set status = 'dispatching'" in s:
             self.rowcount = self.cfg.get("claim_rowcount", 1)
         elif "update lora_trainings set status = 'dispatching'" in s:
@@ -259,12 +268,13 @@ class DispatchTests(unittest.TestCase):
         qc = sys.modules["shared.queue_client"]
         for m in (gl.acquire_dispatch_lease, gl.release_dispatch_lease, gl.mark_dispatched,
                   gl.recent_dispatch_pending, qt.trigger_container_job,
-                  qt.count_active_job_executions, qc.enqueue_job):
+                  qt.count_active_job_executions, qt.find_execution_for_job, qc.enqueue_job):
             m.reset_mock(); m.side_effect = None
         gl.acquire_dispatch_lease.return_value = "owner-1"
         gl.recent_dispatch_pending.return_value = False
         qt.trigger_container_job.return_value = "exec-123"
         qt.count_active_job_executions.return_value = 0
+        qt.find_execution_for_job.return_value = None
         os.environ["GPU_DISPATCH_ENABLED"] = "true"
         self._cfg = {"job_row": ("queued", None), "claim_rowcount": 1}
         self._patch = mock.patch.object(
@@ -408,6 +418,25 @@ class DispatchTests(unittest.TestCase):
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_not_called()
 
+    def test_retry_after_start_commit_gap_recovers_execution_id(self):
+        qt = sys.modules["shared.queue_trigger"]
+        self._cfg["job_row"] = ("dispatching", None)
+        qt.find_execution_for_job.return_value = "exec-recovered"
+        function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
+        qt.trigger_container_job.assert_not_called()
+        self.assertTrue(any(
+            "set external_execution_id" in sql.lower() and params[0] == "exec-recovered"
+            for sql, params in self._cfg["executed"]
+        ))
+
+    def test_malformed_message_is_not_silently_acknowledged(self):
+        with self.assertRaises(ValueError):
+            function_app.process_inference_job(_QueueMessage({"user_id": "u"}))
+
+    def test_poison_message_without_job_id_is_not_dropped(self):
+        with self.assertRaises(ValueError):
+            function_app.handle_poison_job(_QueueMessage({"user_id": "u"}, dequeue_count=3))
+
     # 11) a terminal failure refunds the credit exactly once (guarded transition).
     #     The refund is the FULL amount charged at submit (image_count *
     #     credits_per_image, carried in job_params.credit_cost) — NOT a hardcoded 1.
@@ -470,6 +499,14 @@ class DailyCapTests(unittest.TestCase):
         }
         return r
 
+    def test_malformed_json_returns_400(self):
+        req = self._req()
+        req.get_json = mock.Mock(side_effect=ValueError("bad JSON"))
+        resp = function_app.submit_job(req)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("invalid JSON body", resp.body)
+
+
     def test_per_user_cap_blocks_at_limit(self):
         self._cfg["user_count"] = function_app.PER_USER_DAILY_CAP
         self._cfg["global_count"] = 0
@@ -524,6 +561,25 @@ class DailyCapTests(unittest.TestCase):
             mf.assert_not_called()                     # NOT refunded; the dispatcher retries
         finally:
             qc._send.side_effect = None
+
+
+class AcceptTermsTests(unittest.TestCase):
+    def test_uses_server_utc_time_and_ignores_client_timestamp(self):
+        server_time = datetime(2026, 8, 3, 12, 34, 56, tzinfo=timezone.utc)
+        cfg = {"terms_accepted_at": server_time}
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer t"}
+        req.get_json = mock.Mock(return_value={"accepted_at": "1999-01-01T00:00:00Z"})
+
+        with mock.patch.object(function_app, "get_db", return_value=FakeConn(cfg)):
+            resp = function_app.accept_terms(req)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(req.get_json.called)
+        update_sql, update_params = cfg["executed"][0]
+        self.assertIn("terms_accepted_at = GETUTCDATE()", update_sql)
+        self.assertEqual(update_params, ("user-1",))
+        self.assertNotIn("1999", resp.body)
 
 
 class IdentityLoraGateTests(unittest.TestCase):
@@ -838,6 +894,21 @@ class ReaperTests(unittest.TestCase):
         # ...and must NOT age from the bare submit-time column.
         self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
                          "reaper still measures from created_at (submit time)")
+
+    def test_reaper_recovers_live_null_execution_instead_of_failing_it(self):
+        cfg = {"reaper_dispatching": [("job-7", None)]}
+        qt = sys.modules["shared.queue_trigger"]
+        qt.find_execution_for_job.reset_mock()
+        qt.find_execution_for_job.return_value = "exec-live"
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+
+        self.assertTrue(any(
+            "set external_execution_id" in sql.lower() and params == ("exec-live", "job-7")
+            for sql, params in cfg["executed"]
+        ))
+        self.assertFalse(any("status = 'failed'" in sql.lower() for sql, _ in cfg["executed"]))
 
 
 class RegistrationTests(unittest.TestCase):
