@@ -53,12 +53,66 @@ def _migration_files():
     )
 
 
+_MIGRATION_NAME = re.compile(r"^(\d{3})_.+\.sql$", re.IGNORECASE)
+
+
+def _version(filename: str) -> int:
+    match = _MIGRATION_NAME.match(os.path.basename(filename))
+    if not match:
+        raise RuntimeError(
+            f"invalid migration filename {filename!r}; expected NNN_description.sql"
+        )
+    return int(match.group(1))
+
+
+def validate_migration_order(names, applied, allow_backfill=False):
+    """Reject ambiguous numbering and migrations added behind deployed history."""
+    versions = [_version(name) for name in names]
+    if len(versions) != len(set(versions)):
+        raise RuntimeError("duplicate migration version found")
+    if versions:
+        expected = list(range(versions[0], versions[-1] + 1))
+        if versions != expected:
+            missing = sorted(set(expected) - set(versions))
+            raise RuntimeError(f"migration version gap; missing: {missing}")
+
+    applied_versions = [_version(name) for name in applied]
+    if applied_versions and not allow_backfill:
+        highest_applied = max(applied_versions)
+        backfills = [
+            name for name in names
+            if name not in applied and _version(name) <= highest_applied
+        ]
+        if backfills:
+            raise RuntimeError(
+                "refusing out-of-order migration(s) older than the highest applied "
+                f"version {highest_applied:03d}: {', '.join(backfills)}; "
+                "repair schema_migrations explicitly before deploying"
+            )
+
+
+def apply_migration(conn, cur, name: str, sql: str):
+    """Apply every batch and record the filename in one SQL transaction."""
+    try:
+        for batch in split_batches(sql):
+            cur.execute(batch)
+        cur.execute("INSERT INTO dbo.schema_migrations (filename) VALUES (?)", name)
+        conn.commit()
+    except Exception:
+        # SQL Server supports transactional DDL. Rolling back here restores every
+        # earlier GO batch and leaves no tracking row, so retry starts cleanly.
+        conn.rollback()
+        raise
+
+
 def main():
     dry = "--dry-run" in sys.argv
     baseline = "--baseline" in sys.argv
 
     conn = new_connection()
-    conn.autocommit = True   # DDL auto-commits; each migration is its own unit of work.
+    # One explicit transaction per migration file. GO only separates driver batches;
+    # it must not become a commit boundary.
+    conn.autocommit = False
     cur = conn.cursor()
 
     # Applied set (the tracking table may not exist yet on a first run).
@@ -71,6 +125,9 @@ def main():
 
     files = _migration_files()
     names = [os.path.basename(f) for f in files]
+    # --baseline is the explicit repair/adoption operation, so it may record a
+    # reserved/backfilled marker. Normal and dry runs must remain monotonic.
+    validate_migration_order(names, applied, allow_backfill=baseline)
     pending = [f for f in files if os.path.basename(f) not in applied]
 
     if dry:
@@ -83,12 +140,14 @@ def main():
 
     # Ensure the tracking table exists for real runs.
     cur.execute(_TRACKING_DDL)
+    conn.commit()
 
     if baseline:
         for name in names:
             if name not in applied:
                 cur.execute(
                     "INSERT INTO dbo.schema_migrations (filename) VALUES (?)", name)
+        conn.commit()
         print(f"[baseline] recorded {len(names)} migration file(s) as applied "
               "WITHOUT running them.")
         conn.close()
@@ -99,9 +158,7 @@ def main():
         name = os.path.basename(f)
         print(f"  applying {name} ...")
         sql = open(f, encoding="utf-8").read()
-        for batch in split_batches(sql):
-            cur.execute(batch)
-        cur.execute("INSERT INTO dbo.schema_migrations (filename) VALUES (?)", name)
+        apply_migration(conn, cur, name, sql)
     print("migrations up to date.")
     conn.close()
 
