@@ -24,7 +24,7 @@ snapshot_download(
     local_dir=f"{OUT}/sdxl-base",
     ignore_patterns=["*.ckpt", "*.pt"],
 )
-print("✅ SDXL base done")
+print("[OK] SDXL base done")
 
 # ── 2. IP-Adapter image encoder (CLIP ViT-H) ─────────────
 print("Downloading IP-Adapter image encoder...")
@@ -36,7 +36,7 @@ snapshot_download(
         "sdxl_models/ip-adapter-plus-face_sdxl.bin",
     ],
 )
-print("✅ IP-Adapter done")
+print("[OK] IP-Adapter done")
 
 print("\nAll downloads complete. Files saved to ./downloads/")
 print("\nNext: upload to Azure file share:")
