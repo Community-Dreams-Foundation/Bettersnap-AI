@@ -847,6 +847,25 @@ def run_inference(job: dict) -> list:
     adapter    = Ref(RefKind.ADAPTER, f"/tmp/lora_identity_{user_id}.safetensors")
     candidates = gen_engine.generate(prompts, adapter)
 
+    # ── Diagnostic STAGE CAPTURE (instrumentation only; DEFAULT OFF) ──────────────
+    # When STAGE_CAPTURE=1, upload the RAW base-generation image (post SDXL+LoRA+IP-Adapter,
+    # BEFORE upscale/realism/face-refine) for each seed to a diagnostics prefix, IN ADDITION to
+    # the normal final delivery. This reads the already-produced ctx.images[gen://…] and writes
+    # EXTRA blobs only — it changes NO image computation, RNG, or delivered output, so it cannot
+    # affect results. Lets ONE run compare raw-vs-final expression (E1/E2 causal isolation).
+    if os.environ.get("STAGE_CAPTURE", "0").strip() == "1":
+        for i, c in enumerate(candidates):
+            try:
+                _raw = ctx.images[c.image_ref.location]
+                _buf = io.BytesIO(); _raw.save(_buf, format="PNG"); _buf.seek(0)
+                blob_service.get_blob_client(
+                    container=AZURE_BLOB_CONTAINER,
+                    blob=f"diagnostics/stages/{job_id}/headshot_{i + 1}_raw.png",
+                ).upload_blob(_buf, overwrite=True)
+                write_debug(f"STAGE_CAPTURE: raw headshot_{i + 1} -> diagnostics/stages/{job_id}/")
+            except Exception as e:
+                write_debug(f"STAGE_CAPTURE raw upload failed for candidate {i}: {e}")
+
     # Phase-2 pass-through: no Quality Gate yet — every candidate becomes a winner (accepted).
     winners = [
         Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),

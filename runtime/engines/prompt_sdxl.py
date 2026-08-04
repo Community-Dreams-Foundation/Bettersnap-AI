@@ -57,6 +57,15 @@ class SdxlPromptEngine:
 
         _negative = os.environ.get("NEGATIVE_PROMPT", cfg.NEGATIVE_PROMPT)
 
+        # Expression control (experiments E1/E2). DEFAULT OFF ("" => baseline byte-identical).
+        # EXPRESSION_CLAUSE appends to the base txt2img positive ONLY (generation-level, E1).
+        # FACE_EXPRESSION_CLAUSE appends to the face-refine face_prompt ONLY (enhancement-level, E2).
+        # Isolated on purpose so the two stages are tested one at a time; neither touches the
+        # realism prompt or the negative.
+        _expr = os.environ.get("EXPRESSION_CLAUSE", "").strip()
+        _expr_suffix = f" {_expr}." if _expr else ""
+        _face_expr = os.environ.get("FACE_EXPRESSION_CLAUSE", "").strip()
+
         # Subject clause built ONCE from the user's REAL attributes (no beauty/idealization).
         subj = f"{cfg.IDENTITY_TRIGGER} {subject}" if cfg.IDENTITY_TRIGGER else f"a {subject}"
         if age_phrase:
@@ -79,7 +88,7 @@ class SdxlPromptEngine:
                 combo_label = "custom_scene"
                 lead = catalog.lead_phrase("custom_scene")
                 lighting = cfg.LIGHTING[i % len(cfg.LIGHTING)]
-                positive = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}"
+                positive = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}{_expr_suffix}"
             else:
                 attire_ref, bg_ref = combos[i % len(combos)]
                 attire = catalog.attire_phrase_ref(attire_ref, gkey)
@@ -88,7 +97,7 @@ class SdxlPromptEngine:
                 _lighting = catalog.lighting_for_background_ref(bg_ref, cfg.LIGHTING)
                 lighting = _lighting[(i // len(combos)) % len(_lighting)]
                 combo_label = f"{bg_ref} | {attire_ref}"
-                positive = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}"
+                positive = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}{_expr_suffix}"
             prompts.append(Prompt(positive=positive, negative=_negative, seed=seed,
                                   combo_label=combo_label, slot_id=i))
 
@@ -101,5 +110,6 @@ class SdxlPromptEngine:
             f"close-up portrait photograph of {subj}, face in sharp focus, highly "
             f"detailed eyes, natural realistic skin texture with visible pores and fine "
             f"detail, individual hair strands, {_tail}"
+            + (f" {_face_expr}." if _face_expr else "")
         )
         return PromptSet(tuple(prompts))
