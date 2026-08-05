@@ -212,13 +212,19 @@ class FakeCursor:
                 self._fetch = (self.cfg.get("subscription_type"),
                                self.cfg.get("stripe_subscription_id"))
         elif "select stripe_subscription_id, subscription_type" in s:
-            self._fetch = (
+            values = [
                 self.cfg.get("stripe_subscription_id"),
                 self.cfg.get("subscription_type"),
-            )
+            ]
+            if "subscription_renewed_at" in s:
+                values.append(self.cfg.get("subscription_renewed_at"))
+            self._fetch = tuple(values)
         elif "select stripe_customer_id from users" in s:
             customer_id = self.cfg.get("stripe_customer_id")
             self._fetch = (customer_id,) if customer_id else None
+        elif "select stripe_checkout_token from users" in s:
+            token = self.cfg.get("stripe_checkout_token")
+            self._fetch = (token,) if token else None
         elif ("select plan_name from users" in s
               and "subscription_type = 'monthly'" in s):
             self._fetch = (
@@ -773,6 +779,7 @@ class BillingGateTests(unittest.TestCase):
         self.assertEqual(body["monthly_quota"], body["credits_monthly_limit"])
         self.assertEqual(body["renewal_date"], body["next_renewal"])        # alias present
         self.assertEqual(body["one_time_credits_remaining"], 40)
+        self.assertEqual(body["add_on_credits_remaining"], 40)
         self.assertEqual(body["monthly_credits_remaining"], 120)
 
     def test_topup_requires_active_monthly(self):
@@ -889,6 +896,68 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             for sql, params in self._cfg["executed"]
         ))
 
+    def test_cancel_subscription_refreshes_sparse_stripe_response(self):
+        self._cfg.update(
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+        refreshed = {
+            "id": "sub_123",
+            "cancel_at_period_end": True,
+            "items": {"data": [{"current_period_end": 1_800_000_000}]},
+        }
+        with mock.patch.object(
+            function_app, "cancel_subscription", return_value={"id": "sub_123"}
+        ), mock.patch.object(
+            function_app, "get_subscription", return_value=refreshed
+        ) as retrieve:
+            response = function_app.cancel_user_subscription(self._req())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(json.loads(response.body)["cancel_at"])
+        retrieve.assert_called_once_with("sub_123")
+
+    def test_cancel_subscription_falls_back_to_stored_renewal(self):
+        renewed_at = function_app.datetime(2026, 8, 3, 17, 32, 29)
+        self._cfg.update(
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+            subscription_renewed_at=renewed_at,
+        )
+        with mock.patch.object(
+            function_app, "cancel_subscription", return_value={"id": "sub_123"}
+        ), mock.patch.object(
+            function_app, "get_subscription", return_value={"id": "sub_123"}
+        ):
+            response = function_app.cancel_user_subscription(self._req())
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertTrue(body["cancel_at"].startswith("2026-09-03T17:32:29"))
+
+    def test_subscription_update_accepts_explicit_cancel_at(self):
+        subscription = {
+            "id": "sub_123",
+            "status": "active",
+            "cancel_at": 1_800_000_000,
+            "cancel_at_period_end": False,
+            "items": {"data": [{
+                "price": {"id": "price_pro"},
+                "current_period_end": 1_800_000_000,
+            }]},
+        }
+        with mock.patch.object(
+            function_app, "monthly_plan_for_price_id", return_value="pro"
+        ):
+            function_app._handle_subscription_updated(subscription, "evt_cancel_at")
+
+        update_params = next(
+            params for sql, params in self._cfg["executed"]
+            if "subscription_cancel_at = ?" in sql.lower()
+            and "where stripe_subscription_id = ?" in sql.lower()
+        )
+        self.assertIsNotNone(update_params[3])
+
     def test_b2_active_subscription_update_syncs_plan_without_resetting_credits(self):
         subscription = {
             "id": "sub_123",
@@ -970,7 +1039,7 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         )
         self.assertNotIn("one_time_credits_remaining =", reset_sql.lower())
 
-    def test_pro_addon_grants_50_separate_one_time_credits(self):
+    def test_pro_addon_grants_250_separate_addon_credits(self):
         self._cfg["subscription_type"] = "monthly"
         function_app._handle_topup(
             {
@@ -990,15 +1059,16 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         sql, params = addon_updates[0]
         self.assertNotIn("credits_remaining = credits_remaining +", sql.lower())
         self.assertNotIn("monthly_credits_remaining", sql.lower())
-        self.assertEqual(params[0], 50)
+        self.assertEqual(params[0], 250)
         self.assertEqual(params[1], "pro")
+        self.assertEqual(params[2], "monthly_pro")
 
     def test_monthly_job_spends_monthly_then_addon_credits(self):
         from shared.job_reservation import reserve_job_slot
 
         self._cfg.update(
             credits=10,
-            one_time_credits=3,
+            one_time_credits=15,
             new_job_id=123,
         )
         with mock.patch(
@@ -1022,7 +1092,15 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             params for sql, params in self._cfg["executed"]
             if "monthly_credits_remaining = monthly_credits_remaining - ?" in sql.lower()
         )
-        self.assertEqual(debit[:3], (10, 3, 10))
+        self.assertEqual(debit[:4], (10, 15, 10, 15))
+
+        inserted_params = next(
+            params for sql, params in self._cfg["executed"]
+            if "insert into jobs" in sql.lower()
+        )
+        stored_job_params = json.loads(inserted_params[3])
+        self.assertEqual(stored_job_params["monthly_credit_cost"], 10)
+        self.assertEqual(stored_job_params["one_time_credit_cost"], 15)
 
     def test_b3_only_one_monthly_checkout_reservation_is_allowed(self):
         first_token, first_error = function_app._reserve_monthly_checkout("user-1")
@@ -1044,6 +1122,51 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertFalse(self._cfg["checkout_reserved"])
+
+    def test_b3_canceled_completed_checkout_releases_stale_reservation(self):
+        self._cfg.update(
+            subscription_type="one_time",
+            stripe_subscription_id=None,
+            checkout_reserved=True,
+            stripe_checkout_token="stale-token",
+        )
+        session = {
+            "status": "complete",
+            "subscription": "sub_canceled",
+            "metadata": {"checkout_token": "stale-token"},
+        }
+        with mock.patch.object(
+            function_app, "find_checkout_session_by_token", return_value=session
+        ), mock.patch.object(
+            function_app, "get_subscription", return_value={"status": "canceled"}
+        ), mock.patch.object(
+            function_app, "create_monthly_checkout",
+            return_value={"url": "https://checkout.stripe.test/new", "id": "cs_new"},
+        ):
+            response = function_app.create_subscription(
+                self._req({"plan": "pro", "type": "monthly"})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("https://checkout.stripe.test/new", response.body)
+        self.assertNotEqual(self._cfg["stripe_checkout_token"], "stale-token")
+
+    def test_expired_checkout_webhook_releases_reservation(self):
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_expired",
+            "type": "checkout.session.expired",
+            "data": {"object": {"metadata": {
+                "user_id": "user-1",
+                "checkout_token": "expired-token",
+            }}},
+        }), mock.patch.object(function_app, "_release_monthly_checkout") as release:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        release.assert_called_once_with("user-1", "expired-token")
 
 
 class RetentionBlobCaseTests(unittest.TestCase):

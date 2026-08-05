@@ -110,7 +110,8 @@ from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
-    cancel_subscription, reactivate_subscription, create_billing_portal,
+    cancel_subscription, find_checkout_session_by_token, get_subscription,
+    reactivate_subscription, create_billing_portal,
     monthly_plan_for_price_id, subscription_period_end, verify_webhook,
 )
 
@@ -965,9 +966,8 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     if plan.plan_type == "monthly":
         requested = int(body.get("image_count") or plan.min_session_images)
         max_by_credits = (
-            credits_remaining // plan.credits_per_image
-            + one_time_credits_remaining
-        )
+            credits_remaining + one_time_credits_remaining
+        ) // plan.credits_per_image
         # Honor the min-session floor normally, but NEVER floor above what the user's remaining
         # credits can pay for — otherwise a user with less than one full session's worth of
         # credits could never spend them (every submit asked for the floor and 402'd, stranding
@@ -2327,6 +2327,7 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "type": row[1],
             "credits_remaining": row[2],
             "one_time_credits_remaining": row[7],
+            "add_on_credits_remaining": row[7],
             "monthly_credits_remaining": row[8],
             "credits_monthly_limit": row[3],
             # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
@@ -2482,6 +2483,51 @@ def _release_monthly_checkout(user_id: str, checkout_token: str):
         conn.close()
 
 
+def _recover_stale_monthly_checkout(user_id: str) -> tuple[bool, str | None]:
+    """Clear an abandoned reservation, or identify a paid subscription still activating."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT stripe_checkout_token FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cur.fetchone()
+    checkout_token = row[0] if row else None
+    if not checkout_token:
+        return False, None
+
+    try:
+        session = find_checkout_session_by_token(checkout_token)
+    except Exception as e:
+        logging.warning(f"Could not inspect Stripe checkout token for user {user_id}: {e}")
+        return False, None
+    if not session:
+        return False, None
+
+    if session.get("status") == "expired":
+        _release_monthly_checkout(user_id, checkout_token)
+        return True, None
+
+    if session.get("status") != "complete":
+        return False, None
+
+    subscription_id = session.get("subscription")
+    if not subscription_id:
+        return False, None
+    try:
+        subscription = get_subscription(subscription_id)
+    except Exception as e:
+        logging.warning(f"Could not inspect Stripe subscription {subscription_id}: {e}")
+        return False, None
+
+    if subscription.get("status") in ("active", "trialing", "past_due"):
+        return False, "monthly_active"
+    if subscription.get("status") in ("canceled", "unpaid", "incomplete_expired"):
+        _release_monthly_checkout(user_id, checkout_token)
+        return True, None
+    return False, None
+
+
 # ── Subscriptions: Create Checkout ────────────────────────
 @app.route(route="subscriptions/create", methods=["POST"])
 def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
@@ -2577,6 +2623,12 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json", status_code=400,
             )
         checkout_token, reservation_error = _reserve_monthly_checkout(user_id)
+        if not checkout_token and reservation_error == "checkout_in_progress":
+            recovered, recovered_state = _recover_stale_monthly_checkout(user_id)
+            if recovered_state:
+                reservation_error = recovered_state
+            elif recovered:
+                checkout_token, reservation_error = _reserve_monthly_checkout(user_id)
         if not checkout_token:
             messages = {
                 "monthly_active": "You already have an active monthly subscription.",
@@ -2689,14 +2741,15 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT stripe_subscription_id, subscription_type FROM users WHERE user_id = ?",
+        "SELECT stripe_subscription_id, subscription_type, subscription_renewed_at "
+        "FROM users WHERE user_id = ?",
         user_id,
     )
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
-    stripe_sub_id, sub_type = row[0], row[1]
+    stripe_sub_id, sub_type, renewed_at = row[0], row[1], row[2]
     if sub_type != "monthly" or not stripe_sub_id:
         return func.HttpResponse(
             json.dumps({"error": "No active monthly subscription to cancel"}),
@@ -2716,12 +2769,35 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
     # UI can show "cancels on {date}" while the plan is still active, and so it can be undone.
     cancel_at = None
     ts = subscription_period_end(result)
+    if not ts:
+        try:
+            ts = subscription_period_end(get_subscription(stripe_sub_id))
+        except Exception as e:
+            logging.warning(
+                f"Stripe subscription refresh failed for user {user_id}: {e}"
+            )
     if ts:
         cancel_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
-        cursor.execute(
-            "UPDATE users SET subscription_cancel_at = ? WHERE user_id = ?",
-            cancel_at, user_id,
+    elif renewed_at:
+        cancel_at = _add_one_month(renewed_at)
+        logging.warning(
+            f"Stripe omitted period end for subscription {stripe_sub_id}; "
+            f"using stored renewal date {cancel_at}."
         )
+
+    if not cancel_at:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Cancellation was scheduled, but its effective date could not be determined."
+            }),
+            mimetype="application/json",
+            status_code=502,
+        )
+
+    cursor.execute(
+        "UPDATE users SET subscription_cancel_at = ? WHERE user_id = ?",
+        cancel_at, user_id,
+    )
 
     return func.HttpResponse(
         json.dumps({
@@ -2813,6 +2889,14 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
             _handle_monthly_checkout(session, event_id)
         elif payment_type == "topup":
             _handle_topup(session, event_id)
+
+    elif event_type == "checkout.session.expired":
+        session = event["data"]["object"]
+        metadata = session.get("metadata", {})
+        user_id = metadata.get("user_id")
+        checkout_token = metadata.get("checkout_token")
+        if user_id and checkout_token:
+            _release_monthly_checkout(user_id, checkout_token)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         _handle_invoice_paid(event["data"]["object"], event_id)
@@ -2992,18 +3076,20 @@ def _handle_topup(session: dict, event_id: str):
                 f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
                 f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
             return
+        monthly_plan = get_plan(prow[0])
+        add_on_credits = images * monthly_plan.credits_per_image
         cur.execute(
             """UPDATE users SET
                 one_time_credits_remaining = one_time_credits_remaining + ?,
                 one_time_plan = ?,
                 one_time_plan_name = ?
             WHERE user_id = ? AND subscription_type = 'monthly'""",
-            images, pack, plan_key_for(pack, "one_time"), user_id,
+            add_on_credits, pack, prow[0], user_id,
         )
         conn.commit()  # claim + grant commit atomically
         logging.info(
             f"Persistent add-on: user={user_id} pack={pack} "
-            f"+{images} one-time credits"
+            f"+{add_on_credits} add-on credits ({images} images)"
         )
     finally:
         conn.close()
@@ -3085,7 +3171,7 @@ def _handle_subscription_updated(sub: dict, event_id: str):
 
     cancel_at = None
     period_end = subscription_period_end(sub)
-    if sub.get("cancel_at_period_end") and period_end:
+    if (sub.get("cancel_at_period_end") or sub.get("cancel_at")) and period_end:
         cancel_at = datetime.fromtimestamp(
             period_end, tz=timezone.utc,
         ).replace(tzinfo=None)

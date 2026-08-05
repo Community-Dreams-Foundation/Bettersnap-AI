@@ -189,6 +189,23 @@ def cancel_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
+def get_subscription(stripe_subscription_id: str) -> dict:
+    """Retrieve the complete subscription after an update response omits period fields."""
+    return _get(f"subscriptions/{stripe_subscription_id}")
+
+
+def find_checkout_session_by_token(checkout_token: str) -> dict | None:
+    """Find a recent Checkout Session by the reservation token stored in its metadata."""
+    sessions = _get("checkout/sessions?limit=100").get("data", [])
+    return next(
+        (
+            session for session in sessions
+            if session.get("metadata", {}).get("checkout_token") == checkout_token
+        ),
+        None,
+    )
+
+
 def reactivate_subscription(stripe_subscription_id: str) -> dict:
     """Undo a pending period-end cancellation — the subscription keeps renewing."""
     return _post(f"subscriptions/{stripe_subscription_id}", {

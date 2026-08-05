@@ -6,6 +6,8 @@ concurrency integration tests. sp_getapplock is a SQL-server-wide exclusive lock
 held for the transaction, so concurrent submits across ALL scaled-out instances
 serialize here — no two can both pass the same cap (TOCTOU-safe).
 """
+import json
+
 from .db import new_connection
 from .outbox import outbox_add
 from .queue_client import INFERENCE_QUEUE
@@ -25,7 +27,8 @@ class ReserveResult:
 def reserve_job_slot(user_id, input_blob_path, job_params,
                      per_user_cap, global_cap, lock_timeout_ms=5000,
                      credit_cost=1, initial_status="queued",
-                     source_type=None) -> ReserveResult:
+                     source_type=None, image_count=None,
+                     credits_per_image=1) -> ReserveResult:
     """credit_cost = total credits this job consumes = image_count *
     plan.credits_per_image (resolved by the caller). One-time plans use
     credits_per_image=1 so credit_cost == number of images. The decrement and the
@@ -54,9 +57,38 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="busy")
 
-        cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
-        row = cur.fetchone()
-        if not row or row[0] < credit_cost:
+        monthly_debit = 0
+        one_time_debit = 0
+        if source_type == "monthly":
+            cur.execute(
+                "SELECT monthly_credits_remaining, one_time_credits_remaining "
+                "FROM users WHERE user_id = ?",
+                user_id,
+            )
+            row = cur.fetchone()
+            if row:
+                monthly_balance = int(row[0] or 0)
+                one_time_balance = int(row[1] or 0)
+                monthly_debit = min(monthly_balance, credit_cost)
+                one_time_debit = credit_cost - monthly_debit
+            if not row or one_time_debit > one_time_balance:
+                conn.rollback()
+                return ReserveResult(False, reason="credits")
+        elif source_type == "one_time":
+            cur.execute(
+                "SELECT one_time_credits_remaining FROM users WHERE user_id = ?",
+                user_id,
+            )
+            row = cur.fetchone()
+            if row:
+                one_time_debit = credit_cost
+            if not row or int(row[0] or 0) < credit_cost:
+                conn.rollback()
+                return ReserveResult(False, reason="credits")
+        else:
+            cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
+            row = cur.fetchone()
+        if source_type is None and (not row or row[0] < credit_cost):
             conn.rollback()
             return ReserveResult(False, reason="credits")
 
@@ -75,6 +107,15 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="global_cap")
 
+        if source_type in ("monthly", "one_time"):
+            try:
+                params = json.loads(job_params) if job_params else {}
+            except (TypeError, ValueError):
+                params = {}
+            params["monthly_credit_cost"] = monthly_debit
+            params["one_time_credit_cost"] = one_time_debit
+            job_params = json.dumps(params)
+
         cur.execute("""
             INSERT INTO jobs (user_id, status, input_blob_path, job_params, source_type)
             OUTPUT INSERTED.job_id
@@ -82,10 +123,28 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
         """, user_id, initial_status, input_blob_path, job_params, source_type)
         job_id = cur.fetchone()[0]
 
-        cur.execute(
-            "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
-            credit_cost, user_id,
-        )
+        if source_type == "monthly":
+            cur.execute(
+                "UPDATE users SET "
+                "monthly_credits_remaining = monthly_credits_remaining - ?, "
+                "one_time_credits_remaining = one_time_credits_remaining - ?, "
+                "credits_remaining = credits_remaining - ? - "
+                "CASE WHEN subscription_type = 'monthly' THEN 0 ELSE ? END "
+                "WHERE user_id = ?",
+                monthly_debit, one_time_debit, monthly_debit, one_time_debit, user_id,
+            )
+        elif source_type == "one_time":
+            cur.execute(
+                "UPDATE users SET "
+                "one_time_credits_remaining = one_time_credits_remaining - ?, "
+                "credits_remaining = credits_remaining - ? WHERE user_id = ?",
+                one_time_debit, one_time_debit, user_id,
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
+                credit_cost, user_id,
+            )
 
         # Transactional outbox: for a 'queued' job, write the queue message into the outbox
         # IN THIS SAME TRANSACTION as the row + credit charge, so the send can no longer be
