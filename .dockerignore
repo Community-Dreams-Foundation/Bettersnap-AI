@@ -4,7 +4,6 @@
 !Dockerfile.app
 !entrypoint.py
 !gpu_preflight.py
-!build_provenance.json
 !main.py
 !requirements.txt
 !rrdbnet.py

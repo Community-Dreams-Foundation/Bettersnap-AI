@@ -118,16 +118,16 @@ COPY training/trainer/run_training.py /workspace/run_training.py
 COPY gpu_preflight.py /gpu_preflight.py
 COPY entrypoint.py /entrypoint.py
 
-# Full build provenance captured by the GPU preflight for the durable diagnostic record.
-# BUILD_GIT_SHA is the BASE commit only; when the image is built from an uncommitted working
-# tree (mixed unrelated work that must not be committed — e.g. domain/identity_profile.py),
-# BUILD_DIRTY=true and BUILD_SOURCE_HASH (a deterministic sha256 over every baked source file)
-# identify the ACTUAL source in the image. build_provenance.json is baked in and lists every
-# file hash + the exact uncommitted files. Build with:
-#   BUILD_SOURCE_HASH=$(python gen_provenance.py); az acr build \
-#     --build-arg BUILD_GIT_SHA=$(git rev-parse HEAD) --build-arg BUILD_IMAGE_REF=<tag> \
-#     --build-arg BUILD_DIRTY=true --build-arg BUILD_SOURCE_HASH=$BUILD_SOURCE_HASH ...
-COPY build_provenance.json /build_provenance.json
+# Build provenance is carried via build-args -> env vars, read at runtime by gpu_preflight.py:
+#   BUILD_GIT_SHA      the commit built from
+#   BUILD_IMAGE_REF    the image tag/ref
+#   BUILD_DIRTY        "true" if built from an uncommitted working tree, else "false"
+#   BUILD_SOURCE_HASH  deterministic sha256 over every baked source file (identifies exact source)
+# There is intentionally NO build_provenance.json COPY: it had NO runtime consumer and its file +
+# generator were untracked, so it only broke clean/CI/fresh-clone builds. Provenance lives in the
+# args below. Build with:
+#   az acr build --build-arg BUILD_GIT_SHA=$(git rev-parse HEAD) --build-arg BUILD_IMAGE_REF=<tag> \
+#     --build-arg BUILD_DIRTY=false --build-arg BUILD_SOURCE_HASH=<sha256-of-baked-sources> ...
 ARG BUILD_GIT_SHA=unknown
 ARG BUILD_IMAGE_REF=unknown
 ARG BUILD_DIRTY=false
@@ -135,7 +135,6 @@ ARG BUILD_SOURCE_HASH=unknown
 ENV BUILD_GIT_SHA=${BUILD_GIT_SHA} \
     BUILD_IMAGE_REF=${BUILD_IMAGE_REF} \
     BUILD_DIRTY=${BUILD_DIRTY} \
-    BUILD_SOURCE_HASH=${BUILD_SOURCE_HASH} \
-    BUILD_PROVENANCE=/build_provenance.json
+    BUILD_SOURCE_HASH=${BUILD_SOURCE_HASH}
 
 CMD ["python3.11", "/entrypoint.py"]
