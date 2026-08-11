@@ -3,6 +3,7 @@ import os
 import hmac
 import json
 import logging
+import re
 from uuid import UUID
 from datetime import datetime, timedelta, timezone
 
@@ -50,6 +51,25 @@ def _route_job_id(req):
         return str(UUID(req.route_params.get("job_id", "")))
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+$")
+
+
+def _normalize_profile_email(value):
+    """Validate and canonicalize a client-supplied profile email."""
+    if not isinstance(value, str):
+        raise ValueError("email must be a string")
+    email = value.strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
+        raise ValueError("invalid email format")
+    return email
+
+
+def _is_duplicate_email_error(exc):
+    """Recognize SQL Server unique-index violations specifically involving email."""
+    detail = " ".join(str(arg) for arg in getattr(exc, "args", (exc,))).lower()
+    return ("2601" in detail or "2627" in detail) and "email" in detail
 # Head start for the FUSED train+generate path (MODE=train_infer, see _dispatch_training).
 # The dispatcher fuses only if the user's generation job is ALREADY parked in
 # 'waiting_lora' when it runs. The frontend calls /train first and /jobs/submit second, and
@@ -356,8 +376,14 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
         updates.append("full_name = ?")
         params.append(body.get("display_name"))
     if "email" in body:
+        try:
+            email = _normalize_profile_email(body.get("email"))
+        except ValueError as exc:
+            return func.HttpResponse(
+                json.dumps({"error": str(exc)}),
+                mimetype="application/json", status_code=400)
         updates.append("email = ?")
-        params.append(body.get("email"))
+        params.append(email)
 
     if not updates:
         return func.HttpResponse(
@@ -372,8 +398,16 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found — register first", status_code=404)
 
     params.append(user_id)
-    cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
-    conn.commit()
+    try:
+        cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        if _is_duplicate_email_error(exc):
+            return func.HttpResponse(
+                json.dumps({"error": "Email address is already in use"}),
+                mimetype="application/json", status_code=409)
+        raise
 
     cursor.execute(
         "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",

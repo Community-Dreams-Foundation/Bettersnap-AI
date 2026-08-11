@@ -176,6 +176,73 @@ class JobRouteIdTests(unittest.TestCase):
         )
 
 
+class ProfileEmailValidationTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self, update_error=None):
+            self.update_error = update_error
+            self._row = None
+
+        def execute(self, sql, *_params):
+            normalized = " ".join(sql.lower().split())
+            if normalized.startswith("select user_id from users"):
+                self._row = ("user-1",)
+            elif normalized.startswith("update users set") and self.update_error:
+                raise self.update_error
+            return self
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self, update_error=None):
+            self.cur = ProfileEmailValidationTests.Cursor(update_error)
+            self.rolled_back = False
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            self.rolled_back = True
+
+    @staticmethod
+    def _request(email):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.get_json = lambda: {"email": email}
+        return req
+
+    def test_invalid_email_returns_400_before_database_access(self):
+        with mock.patch.object(function_app, "get_db") as get_db:
+            response = function_app.update_profile(self._request("not-an-email"))
+
+        self.assertEqual(response.status_code, 400)
+        get_db.assert_not_called()
+
+    def test_duplicate_email_unique_violation_returns_409(self):
+        duplicate = RuntimeError(
+            "23000", "Cannot insert duplicate key row in unique index "
+            "'UX_users_email' (2601)"
+        )
+        conn = self.Connection(duplicate)
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.update_profile(self._request(" Used@Example.COM "))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already in use", response.body)
+        self.assertTrue(conn.rolled_back)
+
+    def test_unrelated_database_error_is_not_hidden_as_conflict(self):
+        conn = self.Connection(RuntimeError("database unavailable"))
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                function_app.update_profile(self._request("valid@example.com"))
+
+        self.assertTrue(conn.rolled_back)
+
+
 # ── A programmable fake DB connection/cursor ──────────────────────────────
 class FakeCursor:
     """Branches on SQL text to return per-test values. Tracks executed SQL."""
