@@ -4,7 +4,7 @@ import hmac
 import json
 import logging
 import re
-from uuid import UUID
+from uuid import UUID, uuid4
 from datetime import datetime, timedelta, timezone
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
@@ -486,14 +486,10 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     if not file:
         return func.HttpResponse("No photo provided", status_code=400)
 
-    ext = file.filename.split(".")[-1].lower()
-    if ext not in ["jpg", "jpeg", "png"]:
-        return func.HttpResponse("Invalid file type", status_code=400)
-
     # ── 0.6 upload validation ────────────────────────────────────────────────
     # Read ONCE, cap size before doing any decode work, then verify the bytes are a
-    # real image of an allowed type within sane dimensions. This is stronger than the
-    # extension/MIME check above (both client-controlled): a real decode cannot be spoofed.
+    # real image of an allowed type within sane dimensions. Client filename and MIME are
+    # deliberately ignored: both are client-controlled, while a real decode cannot be spoofed.
     import io as _io
     from PIL import Image as _Image, UnidentifiedImageError as _UnidentifiedImageError
 
@@ -532,7 +528,12 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"error": f"Image too small ({w}x{h}); min {MIN_UPLOAD_DIM}px per side."}),
             mimetype="application/json", status_code=400)
 
-    blob_name = f"{user_id}/input/{file.filename}"
+    # Never use the client filename as a storage key. Phones commonly upload every
+    # photo as image.jpg (silent overwrite), and slashes create nested paths that the
+    # training-photo scanner deliberately excludes. Derive the extension from the
+    # verified bytes and make every upload a distinct, flat leaf.
+    server_ext = "png" if fmt == "PNG" else "jpg"  # JPEG and MPO are JPEG-family
+    blob_name = f"{user_id}/input/{uuid4().hex}.{server_ext}"
     url = upload_blob("inputs", blob_name, data)
 
     # Canonical convention: input_blob_path is "<container>/<blob>" so the

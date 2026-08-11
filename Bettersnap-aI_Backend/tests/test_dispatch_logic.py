@@ -244,6 +244,61 @@ class ProfileEmailValidationTests(unittest.TestCase):
 
 
 # ── A programmable fake DB connection/cursor ──────────────────────────────
+class UploadServerNamingTests(unittest.TestCase):
+    class File:
+        def __init__(self, filename, data):
+            self.filename = filename
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    @staticmethod
+    def _image_bytes(fmt):
+        from io import BytesIO
+        from PIL import Image
+
+        output = BytesIO()
+        Image.new("RGB", (256, 256), "white").save(output, format=fmt)
+        return output.getvalue()
+
+    @classmethod
+    def _request(cls, filename, fmt="JPEG"):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.files = {"photo": cls.File(filename, cls._image_bytes(fmt))}
+        return req
+
+    def setUp(self):
+        function_app.upload_blob.reset_mock()
+        function_app.upload_blob.return_value = "https://storage/upload"
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+
+    def test_duplicate_client_filenames_get_distinct_server_blob_names(self):
+        first = function_app.upload_photo(self._request("image.jpg"))
+        second = function_app.upload_photo(self._request("image.jpg"))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        first_name = json.loads(first.body)["blob_name"]
+        second_name = json.loads(second.body)["blob_name"]
+        self.assertNotEqual(first_name, second_name)
+        for name in (first_name, second_name):
+            self.assertRegex(name, r"^user-1/input/[0-9a-f]{32}\.jpg$")
+            self.assertNotIn("image.jpg", name)
+
+    def test_slash_name_is_ignored_and_extension_comes_from_verified_bytes(self):
+        response = function_app.upload_photo(
+            self._request("nested/client/name.jpg", fmt="PNG"))
+
+        self.assertEqual(response.status_code, 200)
+        blob_name = json.loads(response.body)["blob_name"]
+        self.assertRegex(blob_name, r"^user-1/input/[0-9a-f]{32}\.png$")
+        relative_name = blob_name.removeprefix("user-1/input/")
+        self.assertNotIn("/", relative_name)
+        self.assertNotIn("nested", blob_name)
+
+
 class FakeCursor:
     """Branches on SQL text to return per-test values. Tracks executed SQL."""
     def __init__(self, cfg):
