@@ -86,8 +86,14 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
                 conn.rollback()
                 return ReserveResult(False, reason="lora_not_ready")
 
+        # A failed job has been refunded and a waiting_lora job has not reached the GPU,
+        # so neither may consume daily capacity. Keep queued in the reservation count:
+        # excluding it would let a burst of submissions all pass before dispatch starts.
+        cap_statuses = "('queued', 'dispatching', 'processing', 'completed')"
         cur.execute(
-            "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created_at >= CAST(GETUTCDATE() AS DATE)",
+            "SELECT COUNT(*) FROM jobs WHERE user_id = ? "
+            f"AND status IN {cap_statuses} "
+            "AND created_at >= CAST(GETUTCDATE() AS DATE)",
             user_id,
         )
         if cur.fetchone()[0] >= per_user_cap:
@@ -95,7 +101,9 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             return ReserveResult(False, reason="user_cap")
 
         cur.execute(
-            "SELECT COUNT(*) FROM jobs WHERE created_at >= CAST(GETUTCDATE() AS DATE)"
+            "SELECT COUNT(*) FROM jobs "
+            f"WHERE status IN {cap_statuses} "
+            "AND created_at >= CAST(GETUTCDATE() AS DATE)"
         )
         if cur.fetchone()[0] >= global_cap:
             conn.rollback()

@@ -204,7 +204,8 @@ class FakeCursor:
             self._fetch = (self.cfg.get("credits", 20),)
         # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
         # user-count branch, which the same "count(*) from jobs where user_id" would swallow.
-        elif "count(*) from jobs where user_id" in s and "status in" in s:
+        elif ("count(*) from jobs where user_id" in s and "status in" in s
+              and "created_at" not in s):
             self._fetch = (self.cfg.get("jobs_in_flight", 0),)
         elif "select subscription_type, stripe_subscription_id" in s:
             self._fetch = (self.cfg.get("subscription_type"),
@@ -217,7 +218,7 @@ class FakeCursor:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
-        elif "count(*) from jobs where created_at" in s:
+        elif "count(*) from jobs" in s and "user_id" not in s and "created_at" in s:
             self._fetch = (self.cfg.get("global_count", 0),)
         elif "insert into jobs" in s:
             self._fetch = (self.cfg.get("new_job_id", 999),)
@@ -522,6 +523,22 @@ class DailyCapTests(unittest.TestCase):
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 429)
         self.assertIn("global", resp.body)
+
+    def test_daily_caps_exclude_failed_and_waiting_lora_statuses(self):
+        self._cfg.update(user_count=0, global_count=0)
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+
+        cap_queries = [
+            sql.lower() for sql, _ in self._cfg["executed"]
+            if "count(*) from jobs" in sql.lower() and "created_at" in sql.lower()
+        ]
+        self.assertEqual(len(cap_queries), 2)
+        for sql in cap_queries:
+            self.assertIn(
+                "status in ('queued', 'dispatching', 'processing', 'completed')", sql)
+            self.assertNotIn("waiting_lora", sql)
+            self.assertNotIn("failed", sql)
 
     def test_no_credits_blocks(self):
         self._cfg["credits"] = 0
