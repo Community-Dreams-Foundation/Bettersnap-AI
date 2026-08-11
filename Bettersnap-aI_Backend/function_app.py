@@ -106,6 +106,7 @@ from shared.plans import (
     FREE_RETRAINS, RETRAIN_CREDITS, MAX_TRAININGS_PER_DAY, plan_key_for,
 )
 from shared import catalog
+from shared import exec_reconcile
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
@@ -852,7 +853,19 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    body = req.get_json()
+    # Guard the body parse: get_json() raises on an empty body / wrong Content-Type /
+    # malformed JSON, and a valid non-object (null, [], 3) would AttributeError on .get().
+    # This is the one body-handler that was missing the guard, so a bad request 500'd with a
+    # stack trace instead of a clean 400 on the most-hit endpoint.
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return func.HttpResponse(
+            json.dumps({"error": "Request body must be a JSON object"}),
+            mimetype="application/json", status_code=400)
+
     gender = body.get("gender")
     age_range = body.get("age_range")
     hair_color = body.get("hair_color")
@@ -885,6 +898,20 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
     credits_remaining = int(prow[2] or 0)
+
+    # ── Fetch the user's most-recent COMPLETED trained class_word (for Policy B fallback) ──
+    # The adapter blob at identity/<user_id>/adapter_model.safetensors is only written by
+    # status='completed' trainings (after the format gate, with overwrite=True). Failed trainings
+    # and in-progress trainings have no adapter in that path. To guarantee the class_word matches
+    # the actual loaded LoRA, filter by status='completed' and take the most recent.
+    # Legacy users with no completed lora_trainings row fall back to the generation-time gender (see main.py).
+    class_word_trained = None
+    cur0.execute(
+        "SELECT class_word FROM lora_trainings WHERE user_id = ? AND status = 'completed' ORDER BY created_at DESC",
+        user_id)
+    cw_row = cur0.fetchone()
+    if cw_row and cw_row[0]:
+        class_word_trained = cw_row[0]
 
     # ── Identity-LoRA gate ───────────────────────────────────────────────────
     # Without the user's adapter, txt2img has NOTHING carrying their identity and
@@ -946,7 +973,14 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # credit pool spreads across MANY generations: default to the plan's session size, let
     # the client request more, clamp to the monthly quota and to what credits can pay for.
     if plan.plan_type == "monthly":
-        requested = int(body.get("image_count") or plan.min_session_images)
+        # Coerce defensively: a non-numeric image_count ("abc") would raise ValueError and
+        # (absent the body guard above) surface as a 500. Fall back to a clean 400.
+        try:
+            requested = int(body.get("image_count") or plan.min_session_images)
+        except (TypeError, ValueError):
+            return func.HttpResponse(
+                json.dumps({"error": "image_count must be a number"}),
+                mimetype="application/json", status_code=400)
         max_by_credits = credits_remaining // plan.credits_per_image
         # Honor the min-session floor normally, but NEVER floor above what the user's remaining
         # credits can pay for — otherwise a user with less than one full session's worth of
@@ -961,6 +995,7 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
 
     job_params = json.dumps({
         "gender": gender,
+        "class_word": class_word_trained,  # Policy B: trained LoRA's class_word (may be None for legacy)
         "age_range": age_range,
         "hair_color": hair_color,
         "attire_ids": attire_ids,
@@ -988,6 +1023,7 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
         # 'one_time' | 'monthly'.
         source_type=plan.plan_type,
+        requires_lora=parked,  # B5: re-check LoRA status under lock
     )
     if not result.ok:
         if result.reason == "credits":
@@ -1000,6 +1036,11 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({"error": "Service busy, please retry"}),
                 mimetype="application/json", status_code=503,
             )
+        if result.reason == "lora_unavailable":
+            return func.HttpResponse(
+                json.dumps({"error": "Your model isn't trained yet. Upload your photos and start training first.",
+                            "lora_status": "invalid"}),
+                mimetype="application/json", status_code=409)
         scope = "user" if result.reason == "user_cap" else "global"
         limit = PER_USER_DAILY_CAP if scope == "user" else GLOBAL_DAILY_CAP
         msg = ("Daily limit reached for your account" if scope == "user"
@@ -1532,6 +1573,84 @@ def process_inference_job(msg: func.QueueMessage):
         release_dispatch_lease(owner)
 
 
+# ── B5 LoRA job recovery helpers ────────────────────────────────────────────
+def _extract_credit_cost(job_params_json: str) -> int:
+    """Extract credit_cost from job_params, default to 1. Same as _mark_failed."""
+    if job_params_json:
+        try:
+            return max(1, int(json.loads(job_params_json).get("credit_cost", 1)))
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def _wake_waiting_lora_jobs_txn(user_id: str, cur) -> list:
+    """Wake all waiting_lora jobs for user to 'queued'. Caller owns transaction.
+
+    Idempotent: WHERE status='waiting_lora' ensures only non-terminal jobs updated.
+    Returns list of (outbox_id, job_id) tuples for caller's fast-path send. Empty if no jobs.
+    """
+    cur.execute(
+        "SELECT job_id, job_params FROM jobs WHERE user_id = ? AND status = 'waiting_lora'",
+        user_id)
+    waiting_jobs = [(str(r[0]), r[1]) for r in cur.fetchall()]
+    if not waiting_jobs:
+        return []
+
+    # Atomically update to 'queued'
+    cur.execute(
+        "UPDATE jobs SET status = 'queued' WHERE user_id = ? AND status = 'waiting_lora'",
+        user_id)
+    woken = cur.rowcount
+
+    # Insert outbox messages (in same transaction), collect ids for fast-path send
+    released = []
+    for job_id, job_params in waiting_jobs:
+        msg = {"job_id": job_id, "user_id": str(user_id), "job_params": job_params}
+        outbox_id = outbox_add(cur, INFERENCE_QUEUE, msg)
+        released.append((outbox_id, msg))
+
+    return released
+
+
+def _fail_waiting_lora_jobs_txn(user_id: str, cur) -> tuple:
+    """Mark all waiting_lora jobs for user as 'failed' and refund credits.
+
+    Caller owns transaction. Idempotent: WHERE status='waiting_lora'.
+    Returns (num_jobs_failed, total_credits_refunded).
+    """
+    cur.execute(
+        "SELECT job_id, job_params FROM jobs WHERE user_id = ? AND status = 'waiting_lora'",
+        user_id)
+    waiting_jobs = [(str(r[0]), r[1]) for r in cur.fetchall()]
+    if not waiting_jobs:
+        return (0, 0)
+
+    total_refund = 0
+    jobs_failed = 0
+
+    for job_id, job_params in waiting_jobs:
+        # Atomically mark failed (guarded by status)
+        cur.execute(
+            "UPDATE jobs SET status = 'failed', completed_at = GETUTCDATE() "
+            "WHERE job_id = ? AND status = 'waiting_lora'",
+            job_id)
+
+        # Only refund if transition succeeded
+        if cur.rowcount == 1:
+            refund = _extract_credit_cost(job_params)
+            total_refund += refund
+            jobs_failed += 1
+
+    # Apply total refund (once per user)
+    if total_refund > 0:
+        cur.execute(
+            "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
+            total_refund, user_id)
+
+    return (jobs_failed, total_refund)
+
+
 def _mark_failed(job_id: str):
     """Fail a job and refund its credit — exactly once.
 
@@ -1581,6 +1700,86 @@ def _mark_failed(job_id: str):
         )
     finally:
         conn.close()
+
+
+def _stamp_failure_class(job_id, failure_class, reason, execution_id):
+    """Record WHY a job failed, idempotently, inside job_params JSON (no schema change).
+
+    This is what stops an infrastructure failure from being silently indistinguishable from
+    a customer/model failure: it preserves the diagnostic reason + the ACA execution id.
+    Idempotent — if a `_failure` stamp already exists it is left untouched, so reconciliation
+    retries never rewrite the first (authoritative) reason."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
+        row = cur.fetchone()
+        if not row:
+            return
+        try:
+            params = json.loads(row[0]) if row[0] else {}
+        except (TypeError, ValueError):
+            params = {}
+        if isinstance(params.get("_failure"), dict):
+            return  # already stamped
+        params["_failure"] = {
+            "class": failure_class,
+            "reason": reason,
+            "execution_id": execution_id,
+            "is_infra": failure_class in exec_reconcile.INFRA_CLASSES,
+        }
+        cur.execute("UPDATE jobs SET job_params = ? WHERE job_id = ?",
+                    json.dumps(params), job_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fetch_execution_outcome(job_id):
+    """Best-effort: recover a job's execution outcome for classification WITHOUT a new Azure
+    dependency, by reading the diagnostics blob the GPU preflight wrote before exiting
+    (gpu_preflight.write_diagnostic -> diagnostics/preflight/<execution_id>.json). The blob
+    carries the exact preflight exit_code + reason, which the ARM execution object does not
+    expose. Returns an exec_data dict or None (caller then uses the timeout safety net)."""
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT external_execution_id FROM jobs WHERE job_id = ?", job_id)
+            r = cur.fetchone()
+        finally:
+            conn.close()
+        exec_id = r[0] if r else None
+        if not exec_id:
+            return None
+        raw = download_blob("diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
+        diag = json.loads(raw)
+        result = diag.get("result") or {}
+        return {
+            "exit_code": result.get("exit_code"),
+            "reason": "ProcessExited",
+            "events": [],
+            "execution_id": diag.get("execution_id") or exec_id,
+            "diagnostic_reason": result.get("reason"),
+        }
+    except Exception:
+        return None
+
+
+def _reconcile_execution_outcome(job_id, exec_data, now, *,
+                                 mark_failed=None, stamp=None, classify=None):
+    """Classify one execution outcome and, when a refund is owed, stamp the class+reason and
+    fail+refund EXACTLY ONCE. The one-refund guarantee is _mark_failed's rowcount guard
+    (status NOT IN ('failed','completed')); stamping is separately idempotent. Deps are
+    injectable so this is unit-tested with no DB/Azure."""
+    mark_failed = mark_failed or _mark_failed
+    stamp = stamp or _stamp_failure_class
+    classify = classify or exec_reconcile.classify_execution
+    decision = classify(exec_data, now)
+    if decision["action"] == exec_reconcile.ACTION_REFUND:
+        stamp(job_id, decision["failure_class"], decision["reason"], decision["execution_id"])
+        mark_failed(job_id)   # idempotent; refunds only on the real state transition
+    return decision
 
 
 def _revert_claim(job_id: str):
@@ -1964,23 +2163,19 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         # what parked jobs actually depend on. Conflating the two would either strand the
         # user or log a failed run as "completed".
         usable = ok or recovered
-        cur.execute(
-            "SELECT job_id, job_params FROM jobs WHERE user_id = ? AND status = 'waiting_lora'",
-            user_id,
-        )
-        parked = [(str(r[0]), r[1]) for r in cur.fetchall()]
-        released = []   # (outbox_id, message) for the fast-path send after commit
-        if usable and parked:
-            cur.execute(
-                "UPDATE jobs SET status = 'queued' WHERE user_id = ? AND status = 'waiting_lora'",
-                user_id,
-            )
-            # Transactional outbox (finding #4): each waiting_lora -> queued release gets its
-            # queue message written IN THIS transaction, so a queue outage after commit can't
-            # leave a parked job stuck 'queued' with no message (the reaper won't recover it).
-            for job_id, job_params in parked:
-                msg = {"job_id": job_id, "user_id": str(user_id), "job_params": job_params}
-                released.append((outbox_add(cur, INFERENCE_QUEUE, msg), msg))
+
+        # B5: Wake or fail parked jobs using shared helpers (idempotent, transaction-neutral)
+        released = []  # (outbox_id, message) for fast-path send after commit
+        if usable:
+            released = _wake_waiting_lora_jobs_txn(user_id, cur)
+            logging.info(f"training_id={training_id} user={user_id}: "
+                        f"{'completed' if ok else 'recovered'}, woken {len(released)} waiting_lora jobs")
+            parked_count = len(released)
+        else:
+            failed_count, refunded = _fail_waiting_lora_jobs_txn(user_id, cur)
+            logging.info(f"training_id={training_id} user={user_id}: no usable adapter, "
+                        f"marked {failed_count} waiting_lora jobs failed, refunded {refunded} credits")
+            parked_count = failed_count
         conn.commit()
     finally:
         conn.close()
@@ -1988,20 +2183,14 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
     logging.info(
         f"training_id={training_id} user={user_id} -> {'completed' if ok else 'failed'}"
         f"{'' if ok else f' ({error})'}; lora_status={new_status} "
-        f"{'(RECOVERED: prior adapter intact) ' if recovered else ''}parked_jobs={len(parked)}"
+        f"{'(RECOVERED: prior adapter intact) ' if recovered else ''}parked_jobs={parked_count}"
     )
 
-    if usable:
-        # Fast-path each release (visibility 0, so the GPU picks them up at once); whatever
-        # doesn't send now, the outbox_dispatcher delivers on its next tick.
+    # Fast-path send for woken jobs (visibility 0, so GPU picks them up at once)
+    if released:
         for outbox_id, msg in released:
             outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
             logging.info(f"released parked job_id={msg['job_id']} for user={user_id}")
-    else:
-        # Never leave a user waiting on an adapter that will never exist.
-        # _mark_failed refunds their credits (guarded, once).
-        for job_id, _ in parked:
-            _mark_failed(job_id)
 
 
 def _fail_training(training_id: str, error: str):
@@ -2070,12 +2259,51 @@ def reaper(timer: func.TimerRequest):
             -REAPER_DISPATCHING_MINUTES,
         )
         stuck += [str(r[0]) for r in cur.fetchall()]
+
+        # B5: Reconcile orphaned waiting_lora jobs (whose LoRA is now ready but they weren't woken)
+        cur.execute("""
+            SELECT DISTINCT j.user_id
+            FROM jobs j
+            WHERE j.status = 'waiting_lora'
+            AND EXISTS (
+                SELECT 1 FROM users u
+                WHERE u.user_id = j.user_id AND u.lora_status = 'ready'
+            )
+        """)
+        orphaned_users = [str(r[0]) for r in cur.fetchall()]
+        all_released = []
+        for user_id in orphaned_users:
+            released = _wake_waiting_lora_jobs_txn(user_id, cur)
+            all_released.extend(released)
+
+        if all_released:
+            conn.commit()
+            logging.info(f"REAPER: reconciled {len(all_released)} orphaned waiting_lora jobs "
+                        f"across {len(orphaned_users)} users")
+            # Fast-path send for woken jobs
+            for outbox_id, msg in all_released:
+                outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
     finally:
         conn.close()
 
+    now_ts = datetime.now(timezone.utc).timestamp()
     for job_id in stuck:
-        logging.warning(f"REAPER: failing stuck job_id={job_id}")
-        _mark_failed(job_id)
+        logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
+        exec_data = _fetch_execution_outcome(job_id)   # best-effort (reads preflight diag blob)
+        if exec_data is not None:
+            # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, ...) and
+            # fail+refund exactly once with the class recorded. startup_stall + exec_reconcile
+            # are invoked here — this is the live control-plane path, not a dormant helper.
+            decision = _reconcile_execution_outcome(job_id, exec_data, now_ts)
+            logging.warning(f"REAPER: job_id={job_id} class={decision['failure_class']} "
+                            f"infra={decision['is_infra']} action={decision['action']}")
+        else:
+            # Safety net (unchanged behaviour + a class): stuck past timeout with no readable
+            # outcome -> fail+refund once, labelled as an unclassified infra timeout, never as
+            # a customer/model failure.
+            _stamp_failure_class(job_id, "infra_timeout",
+                                 "reaper timeout; execution outcome unavailable", None)
+            _mark_failed(job_id)
 
 
 # ── Outbox dispatcher ─────────────────────────────────────────────────────────
@@ -2494,6 +2722,33 @@ def topup_credits(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ── Subscriptions: Cancel ─────────────────────────────────
+def _subscription_cancel_ts(sub: dict):
+    """The effective date of a period-end cancellation, across Stripe API versions.
+
+    THE BUG THIS FIXES — CANCELLATION NOT PERSISTED (QA Issue 2)
+    -----------------------------------------------------------
+    Same field-relocation class as _invoice_subscription_id: the cancel handler read only the
+    legacy top-level `current_period_end`, which is None on current API versions (the period
+    fields moved to the subscription ITEM). So `if ts:` was skipped, subscription_cancel_at was
+    never written, and GET /subscriptions/status returned cancel_pending=false / cancel_at=null
+    even though Stripe accepted the cancel_at_period_end — the exact symptom QA reported.
+
+    When cancel_at_period_end is set, Stripe populates the subscription's top-level `cancel_at`
+    with the exact effective timestamp — prefer it; fall back to current_period_end (top-level,
+    then item-level) so it works whatever version the response arrives in.
+    """
+    ts = sub.get("cancel_at")
+    if ts:
+        return ts
+    ts = sub.get("current_period_end")
+    if ts:
+        return ts
+    for it in (sub.get("items", {}) or {}).get("data", []):
+        if it.get("current_period_end"):
+            return it["current_period_end"]
+    return None
+
+
 @app.route(route="subscriptions/cancel", methods=["POST"])
 def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -2528,16 +2783,25 @@ def cancel_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json", status_code=502,
         )
 
-    # Record the scheduled cancellation (exact date from Stripe's current_period_end) so the
-    # UI can show "cancels on {date}" while the plan is still active, and so it can be undone.
+    # Record the scheduled cancellation (exact date) so the UI can show "cancels on {date}"
+    # while the plan is still active, and so it can be undone. Read the timestamp via the
+    # version-robust helper — the raw current_period_end field moved and reading it directly
+    # silently no-op'd the persist (QA Issue 2).
     cancel_at = None
-    ts = result.get("current_period_end")
+    ts = _subscription_cancel_ts(result)
     if ts:
         cancel_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
         cursor.execute(
             "UPDATE users SET subscription_cancel_at = ? WHERE user_id = ?",
             cancel_at, user_id,
         )
+    else:
+        # Stripe accepted the cancel but we couldn't find the effective date on the object —
+        # log LOUDLY (don't silently drop it) so it's caught, not masked as before.
+        logging.error(
+            f"cancel: Stripe accepted cancel for user={user_id} sub={stripe_sub_id} but NO "
+            f"cancel timestamp on the subscription object; subscription_cancel_at NOT set. "
+            f"keys={list(result.keys())}")
 
     return func.HttpResponse(
         json.dumps({
