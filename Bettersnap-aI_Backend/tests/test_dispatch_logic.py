@@ -140,6 +140,42 @@ _mod("shared.gpu_lease",
 import function_app  # noqa: E402
 
 
+class JobRouteIdTests(unittest.TestCase):
+    def setUp(self):
+        self._db_patcher = mock.patch.object(function_app, "get_db")
+        self.get_db = self._db_patcher.start()
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+
+    def tearDown(self):
+        self._db_patcher.stop()
+
+    @staticmethod
+    def _request(job_id):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {"job_id": job_id}
+        return req
+
+    def test_malformed_id_returns_404_before_sql_for_all_job_routes(self):
+        for handler in (
+            function_app.job_status,
+            function_app.job_result_url,
+            function_app.delete_job,
+        ):
+            with self.subTest(handler=handler.__name__):
+                self.get_db.reset_mock()
+                response = handler(self._request("not-a-guid"))
+                self.assertEqual(response.status_code, 404)
+                self.get_db.assert_not_called()
+
+    def test_valid_id_is_canonicalized(self):
+        raw = "D85B1407-351D-4694-9392-03ACC5870EB1"
+        self.assertEqual(
+            function_app._route_job_id(self._request(raw)),
+            "d85b1407-351d-4694-9392-03acc5870eb1",
+        )
+
+
 # ── A programmable fake DB connection/cursor ──────────────────────────────
 class FakeCursor:
     """Branches on SQL text to return per-test values. Tracks executed SQL."""

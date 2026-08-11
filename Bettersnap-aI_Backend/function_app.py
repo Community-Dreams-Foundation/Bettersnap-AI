@@ -3,6 +3,7 @@ import os
 import hmac
 import json
 import logging
+from uuid import UUID
 from datetime import datetime, timedelta, timezone
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
@@ -41,6 +42,14 @@ def _utc_iso(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _route_job_id(req):
+    """Return a canonical GUID string, or None for a malformed/missing route id."""
+    try:
+        return str(UUID(req.route_params.get("job_id", "")))
+    except (AttributeError, TypeError, ValueError):
+        return None
 # Head start for the FUSED train+generate path (MODE=train_infer, see _dispatch_training).
 # The dispatcher fuses only if the user's generation job is ALREADY parked in
 # 'waiting_lora' when it runs. The frontend calls /train first and /jobs/submit second, and
@@ -1079,7 +1088,9 @@ def job_status(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -1105,7 +1116,9 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -1182,7 +1195,9 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
 
