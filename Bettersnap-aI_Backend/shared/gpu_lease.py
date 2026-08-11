@@ -109,6 +109,26 @@ def mark_dispatched(owner: str):
         conn.close()
 
 
+def clear_dispatch_pending(owner: str):
+    """Clear the temporary API-visibility reservation owned by this dispatcher.
+
+    Call after the execution id is durably recorded (the real executions API count
+    is now authoritative), or after a confirmed start failure. The owner predicate
+    prevents a stale caller from clearing a newer dispatcher's reservation.
+    """
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE GpuDispatchLease SET last_dispatch_at = NULL "
+            "WHERE lease_name = ? AND owner_id = ?",
+            LEASE_NAME, owner,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def recent_dispatch_pending() -> bool:
     """True if a job was dispatched within the grace window (executions API may
     not list it yet)."""

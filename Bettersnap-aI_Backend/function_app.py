@@ -1442,7 +1442,8 @@ def process_inference_job(msg: func.QueueMessage):
     from shared.queue_client import enqueue_job
     from shared.gpu_lease import (
         acquire_dispatch_lease, release_dispatch_lease,
-        mark_dispatched, recent_dispatch_pending, DispatchConfigError,
+        mark_dispatched, clear_dispatch_pending,
+        recent_dispatch_pending, DispatchConfigError,
     )
     # The host already base64-decodes the transport (messageEncoding=base64,
     # the extension-bundle default), so get_body() returns the raw JSON.
@@ -1512,6 +1513,10 @@ def process_inference_job(msg: func.QueueMessage):
                         f"job_id={job_id} recovered execution_id={exec_id} after dispatch commit gap"
                     )
             if exec_id or status in ("dispatching", "processing", "completed", "failed"):
+                # A prior attempt may have persisted the execution id and then crashed
+                # before clearing the short API-visibility reservation. Retries repair it.
+                if exec_id or status in ("processing", "completed", "failed"):
+                    clear_dispatch_pending(owner)
                 logging.info(
                     f"job_id={job_id} already dispatched/terminal "
                     f"(status={status}, execution_id={exec_id}); not starting again"
@@ -1559,9 +1564,11 @@ def process_inference_job(msg: func.QueueMessage):
         except Exception:
             logging.exception(f"start failed for job_id={job_id}; reverting claim to 'queued'")
             _revert_claim(job_id)
+            clear_dispatch_pending(owner)
             raise
 
         _record_execution_id(job_id, execution_id)
+        clear_dispatch_pending(owner)
         logging.info(f"Started job_id={job_id} execution_id={execution_id} (active before={active})")
     finally:
         release_dispatch_lease(owner)
@@ -1728,7 +1735,8 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
     from shared.queue_client import enqueue_training_job
     from shared.gpu_lease import (
         acquire_dispatch_lease, release_dispatch_lease,
-        mark_dispatched, recent_dispatch_pending, DispatchConfigError,
+        mark_dispatched, clear_dispatch_pending,
+        recent_dispatch_pending, DispatchConfigError,
     )
 
     if not _gpu_dispatch_enabled():
@@ -1767,6 +1775,8 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
                 return
             status, exec_id, files_json, class_word = row[0], row[1], row[2], row[3]
             if exec_id or status in ("dispatching", "training", "completed", "failed"):
+                if exec_id or status in ("training", "completed", "failed"):
+                    clear_dispatch_pending(owner)
                 logging.info(
                     f"training_id={training_id} already dispatched/terminal "
                     f"(status={status}, execution_id={exec_id}); not starting again"
@@ -1888,6 +1898,7 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
                 conn3.commit()
             finally:
                 conn3.close()
+            clear_dispatch_pending(owner)
             raise
 
         conn4 = new_connection()
@@ -1901,6 +1912,7 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             conn4.commit()
         finally:
             conn4.close()
+        clear_dispatch_pending(owner)
         logging.info(
             f"Started training_id={training_id} user={user_id} "
             f"execution_id={execution_id} (active before={active})"

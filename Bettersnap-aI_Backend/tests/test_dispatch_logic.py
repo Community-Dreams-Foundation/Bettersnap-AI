@@ -133,6 +133,7 @@ _mod("shared.gpu_lease",
      acquire_dispatch_lease=mock.Mock(return_value="owner-1"),
      release_dispatch_lease=mock.Mock(),
      mark_dispatched=mock.Mock(),
+     clear_dispatch_pending=mock.Mock(),
      recent_dispatch_pending=mock.Mock(return_value=False),
      DispatchConfigError=_DispatchConfigError)
 
@@ -270,6 +271,7 @@ class DispatchTests(unittest.TestCase):
         qt = sys.modules["shared.queue_trigger"]
         qc = sys.modules["shared.queue_client"]
         for m in (gl.acquire_dispatch_lease, gl.release_dispatch_lease, gl.mark_dispatched,
+                  gl.clear_dispatch_pending,
                   gl.recent_dispatch_pending, qt.trigger_container_job,
                   qt.count_active_job_executions, qt.find_execution_for_job, qc.enqueue_job):
             m.reset_mock(); m.side_effect = None
@@ -316,10 +318,12 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.assert_not_called()
 
     def test_existing_execution_id_skips_even_if_queued(self):
+        gl = sys.modules["shared.gpu_lease"]
         qt = sys.modules["shared.queue_trigger"]
         self._cfg["job_row"] = ("queued", "exec-existing")  # has exec id -> skip
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_not_called()
+        gl.clear_dispatch_pending.assert_called_once_with("owner-1")
 
     # 3) happy path -> starts exactly once, records execution id, releases lease
     def test_happy_path_starts_once(self):
@@ -328,6 +332,7 @@ class DispatchTests(unittest.TestCase):
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_called_once()
         gl.mark_dispatched.assert_called_once()
+        gl.clear_dispatch_pending.assert_called_once_with("owner-1")
         gl.release_dispatch_lease.assert_called_once()
         # #5A: the queued->dispatching claim stamps dispatched_at, so the reaper can measure
         # the processing deadline from GPU-run start instead of submit time.
@@ -399,6 +404,8 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.side_effect = RuntimeError("ACA 500")
         with self.assertRaises(RuntimeError):
             function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
+        sys.modules["shared.gpu_lease"].clear_dispatch_pending.assert_called_once_with(
+            "owner-1")
         self.assertTrue(any("status = 'queued'" in sql and "dispatching" in sql
                             for sql, _ in self._cfg["executed"]))
 
