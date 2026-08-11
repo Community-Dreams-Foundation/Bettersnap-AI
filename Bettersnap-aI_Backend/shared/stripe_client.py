@@ -162,9 +162,21 @@ def reactivate_subscription(stripe_subscription_id: str) -> dict:
 def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
     webhook_secret = get_secret("stripe-webhook-secret")
 
-    parts = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(","))}
-    timestamp = parts.get("t", "")
-    signatures = [v for k, v in parts.items() if k == "v1"]
+    # Preserve repeated v1 fields. During webhook-secret rotation Stripe can send
+    # more than one; a dict comprehension silently kept only the final signature.
+    timestamp = ""
+    signatures = []
+    for part in (sig_header or "").split(","):
+        key, separator, value = part.strip().partition("=")
+        if not separator:
+            continue
+        if key == "t" and not timestamp:
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+
+    if not timestamp or not signatures:
+        raise ValueError("Invalid Stripe-Signature header")
 
     if abs(time.time() - int(timestamp)) > 300:
         raise ValueError("Webhook timestamp too old")

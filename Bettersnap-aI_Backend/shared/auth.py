@@ -73,7 +73,6 @@ def validate_token(token: str) -> dict:
                 "verify_iss": True,
             },
         )
-        logging.info(f"Token validated: oid={payload.get('oid')}")
         return payload
     except Exception as e:
         logging.warning(f"Token validation failed: {e}")
