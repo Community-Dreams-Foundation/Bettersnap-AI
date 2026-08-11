@@ -88,6 +88,10 @@ MIN_UPLOAD_DIM    = int(os.environ.get("MIN_UPLOAD_DIM", "256"))                
 MAX_UPLOAD_DIM    = int(os.environ.get("MAX_UPLOAD_DIM", "8192"))                    # px
 MAX_UPLOAD_PIXELS = int(os.environ.get("MAX_UPLOAD_PIXELS", str(40_000_000)))        # 40 MP
 _ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "MPO"}   # MPO = multi-frame JPEG from phones
+# User profile attributes are persisted in job_params and interpolated into the
+# generation prompt. Bound them before either happens; they remain free text for
+# compatibility with existing clients and internationalized hair descriptions.
+MAX_PROFILE_ATTRIBUTE_CHARS = 40
 # Measured training wall-time is ~51 min (17.6 class-image gen + 28.1 train + startup).
 # The watcher fails a run that blows past this, releasing any jobs parked behind it.
 TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
@@ -887,6 +891,28 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     if not all([gender, age_range, hair_color]):
         return func.HttpResponse(
             json.dumps({"error": "gender, age_range and hair_color are required"}),
+            mimetype="application/json", status_code=400)
+    if not isinstance(age_range, str) or not isinstance(hair_color, str):
+        return func.HttpResponse(
+            json.dumps({"error": "age_range and hair_color must be strings"}),
+            mimetype="application/json", status_code=400)
+    age_range = age_range.strip()
+    hair_color = hair_color.strip()
+    if not age_range or not hair_color:
+        return func.HttpResponse(
+            json.dumps({"error": "age_range and hair_color cannot be blank"}),
+            mimetype="application/json", status_code=400)
+    too_long = [
+        name for name, value in (("age_range", age_range), ("hair_color", hair_color))
+        if len(value) > MAX_PROFILE_ATTRIBUTE_CHARS
+    ]
+    if too_long:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Profile attribute too long",
+                "fields": too_long,
+                "max_length": MAX_PROFILE_ATTRIBUTE_CHARS,
+            }),
             mimetype="application/json", status_code=400)
     input_blob_path = input_blob_path or ""
 

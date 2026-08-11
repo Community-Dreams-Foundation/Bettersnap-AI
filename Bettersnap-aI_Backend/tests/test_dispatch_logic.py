@@ -552,6 +552,45 @@ class DailyCapTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("invalid JSON body", resp.body)
 
+    def test_oversized_age_range_is_rejected_before_database_access(self):
+        req = self._req()
+        body = req.get_json()
+        body["age_range"] = "2" * (function_app.MAX_PROFILE_ATTRIBUTE_CHARS + 1)
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("age_range", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
+    def test_oversized_hair_color_is_rejected_before_database_access(self):
+        req = self._req()
+        body = req.get_json()
+        body["hair_color"] = "x" * (function_app.MAX_PROFILE_ATTRIBUTE_CHARS + 1)
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("hair_color", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
+    def test_non_string_profile_attributes_are_rejected(self):
+        req = self._req()
+        body = req.get_json()
+        body["age_range"] = ["25-29"]
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must be strings", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
 
     def test_per_user_cap_blocks_at_limit(self):
         self._cfg["user_count"] = function_app.PER_USER_DAILY_CAP
