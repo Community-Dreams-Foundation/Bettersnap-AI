@@ -128,8 +128,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
                 "UPDATE users SET "
                 "monthly_credits_remaining = monthly_credits_remaining - ?, "
                 "one_time_credits_remaining = one_time_credits_remaining - ?, "
-                "credits_remaining = credits_remaining - ? - "
-                "CASE WHEN subscription_type = 'monthly' THEN 0 ELSE ? END "
+                "credits_remaining = credits_remaining - ? - ? "
                 "WHERE user_id = ?",
                 monthly_debit, one_time_debit, monthly_debit, one_time_debit, user_id,
             )

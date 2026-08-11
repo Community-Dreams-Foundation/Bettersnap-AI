@@ -1611,8 +1611,7 @@ def _mark_failed(job_id: str):
                     "monthly_credits_remaining = monthly_credits_remaining + "
                     "CASE WHEN subscription_type = 'monthly' THEN ? ELSE 0 END, "
                     "one_time_credits_remaining = one_time_credits_remaining + ?, "
-                    "credits_remaining = credits_remaining + "
-                    "CASE WHEN subscription_type = 'monthly' THEN ? ELSE ? END "
+                    "credits_remaining = credits_remaining + ? + ? "
                     "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
                     monthly_refund, one_time_refund,
                     monthly_refund, one_time_refund, job_id,
@@ -2898,8 +2897,16 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         if user_id and checkout_token:
             _release_monthly_checkout(user_id, checkout_token)
 
-    elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
+    # invoice.paid is the single source of truth for successful renewal grants.
+    # Stripe may emit invoice.payment_succeeded for the same invoice; handling both
+    # would make correctness depend on two distinct event IDs being deduplicated.
+    elif event_type == "invoice.paid":
         _handle_invoice_paid(event["data"]["object"], event_id)
+
+    elif event_type == "invoice.payment_succeeded":
+        logging.info(
+            f"Stripe event {event_id} ignored; invoice.paid owns renewal credit grants."
+        )
 
     elif event_type == "invoice.payment_failed":
         _handle_payment_failed(event["data"]["object"], event_id)
@@ -3002,7 +3009,9 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 plan_name               = ?,
                 stripe_customer_id      = ?,
                 stripe_subscription_id  = ?,
-                credits_remaining       = ?,
+                credits_remaining       = ? +
+                    CASE WHEN subscription_type = 'monthly'
+                         THEN one_time_credits_remaining ELSE credits_remaining END,
                 monthly_credits_remaining = ?,
                 one_time_credits_remaining =
                     CASE WHEN subscription_type = 'monthly'
@@ -3080,11 +3089,12 @@ def _handle_topup(session: dict, event_id: str):
         add_on_credits = images * monthly_plan.credits_per_image
         cur.execute(
             """UPDATE users SET
+                credits_remaining = credits_remaining + ?,
                 one_time_credits_remaining = one_time_credits_remaining + ?,
                 one_time_plan = ?,
                 one_time_plan_name = ?
             WHERE user_id = ? AND subscription_type = 'monthly'""",
-            add_on_credits, pack, prow[0], user_id,
+            add_on_credits, add_on_credits, pack, prow[0], user_id,
         )
         conn.commit()  # claim + grant commit atomically
         logging.info(
@@ -3110,7 +3120,7 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             return
         cur.execute(
             """UPDATE users SET
-                credits_remaining       = credits_monthly_limit,
+                credits_remaining       = credits_monthly_limit + one_time_credits_remaining,
                 monthly_credits_remaining = credits_monthly_limit,
                 subscription_renewed_at = GETUTCDATE(),
                 payment_failed_at       = NULL

@@ -60,6 +60,11 @@ partially provisioned environment must have every one applied.
    `GPU_DISPATCH_ENABLED=true`, `ADMIN_API_KEY` (long random; Key Vault ref), and the
    Stripe settings (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, price IDs). See
    `.env.example` for the full list.
+   Configure the Stripe webhook at `/api/webhooks/stripe` for exactly these events:
+   `checkout.session.completed`, `checkout.session.expired`, `invoice.paid`,
+   `invoice.payment_failed`, `customer.subscription.updated`, and
+   `customer.subscription.deleted`. Do not enable `invoice.payment_succeeded` for renewal
+   grants; `invoice.paid` is the single successful-invoice event handled by the backend.
 3. **Test gates** (see COST_CONTROLS.md → Validation):
    - `python -m unittest tests.test_dispatch_logic tests.test_prompt_planning` (no Azure needed)
    - `TEST_SQL_CONN=… python -m unittest tests.test_concurrency_integration` against a

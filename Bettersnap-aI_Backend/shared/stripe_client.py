@@ -226,9 +226,24 @@ def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
     if not webhook_secret:
         webhook_secret = get_secret("stripe-webhook-secret")
 
-    parts = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(","))}
-    timestamp = parts.get("t", "")
-    signatures = [v for k, v in parts.items() if k == "v1"]
+    # Stripe can include more than one v1 signature while rotating a webhook secret.
+    # A dict would collapse duplicate v1 keys and could discard the only valid signature,
+    # so preserve every v1 value exactly as sent.
+    timestamp = ""
+    signatures = []
+    for part in sig_header.split(","):
+        key, separator, value = part.strip().partition("=")
+        if not separator:
+            continue
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+
+    if not timestamp:
+        raise ValueError("Missing webhook timestamp")
+    if not signatures:
+        raise ValueError("Missing webhook v1 signature")
 
     if abs(time.time() - int(timestamp)) > 300:
         raise ValueError("Webhook timestamp too old")

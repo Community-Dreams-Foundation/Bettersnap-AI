@@ -868,6 +868,25 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(event["id"], "evt_local")
         get_secret.assert_not_called()
 
+    def test_webhook_accepts_any_valid_v1_signature_during_rotation(self):
+        from shared import stripe_client
+
+        payload = b'{"id":"evt_rotating","type":"invoice.payment_failed"}'
+        timestamp = str(int(stripe_client.time.time()))
+        valid_signature = stripe_client.hmac.new(
+            b"whsec_rotating",
+            f"{timestamp}.{payload.decode()}".encode(),
+            stripe_client.hashlib.sha256,
+        ).hexdigest()
+        header = f"t={timestamp},v1={valid_signature},v1=invalid-new-signature"
+
+        with mock.patch.dict(
+            os.environ, {"STRIPE_WEBHOOK_SECRET": "whsec_rotating"}, clear=False
+        ):
+            event = stripe_client.verify_webhook(payload, header)
+
+        self.assertEqual(event["id"], "evt_rotating")
+
     def test_cancel_subscription_reads_period_end_from_stripe_items(self):
         self._cfg.update(
             subscription_type="monthly",
@@ -1006,6 +1025,10 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             activation_sql.lower(),
         )
         self.assertIn("else credits_remaining end", activation_sql.lower())
+        self.assertIn(
+            "credits_remaining = ? +",
+            activation_sql.lower(),
+        )
 
     def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
         function_app._handle_subscription_ended(
@@ -1038,6 +1061,10 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             if "monthly_credits_remaining = credits_monthly_limit" in sql.lower()
         )
         self.assertNotIn("one_time_credits_remaining =", reset_sql.lower())
+        self.assertIn(
+            "credits_remaining = credits_monthly_limit + one_time_credits_remaining",
+            reset_sql.lower(),
+        )
 
     def test_pro_addon_grants_250_separate_addon_credits(self):
         self._cfg["subscription_type"] = "monthly"
@@ -1057,11 +1084,12 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         ]
         self.assertEqual(len(addon_updates), 1)
         sql, params = addon_updates[0]
-        self.assertNotIn("credits_remaining = credits_remaining +", sql.lower())
+        self.assertIn("credits_remaining = credits_remaining + ?", sql.lower())
         self.assertNotIn("monthly_credits_remaining", sql.lower())
         self.assertEqual(params[0], 250)
-        self.assertEqual(params[1], "pro")
-        self.assertEqual(params[2], "monthly_pro")
+        self.assertEqual(params[1], 250)
+        self.assertEqual(params[2], "pro")
+        self.assertEqual(params[3], "monthly_pro")
 
     def test_monthly_job_spends_monthly_then_addon_credits(self):
         from shared.job_reservation import reserve_job_slot
@@ -1093,6 +1121,11 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             if "monthly_credits_remaining = monthly_credits_remaining - ?" in sql.lower()
         )
         self.assertEqual(debit[:4], (10, 15, 10, 15))
+        debit_sql = next(
+            sql for sql, _ in self._cfg["executed"]
+            if "monthly_credits_remaining = monthly_credits_remaining - ?" in sql.lower()
+        )
+        self.assertIn("credits_remaining = credits_remaining - ? - ?", debit_sql.lower())
 
         inserted_params = next(
             params for sql, params in self._cfg["executed"]
@@ -1167,6 +1200,35 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         release.assert_called_once_with("user-1", "expired-token")
+
+    def test_invoice_payment_succeeded_does_not_grant_renewal_credits(self):
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_payment_succeeded",
+            "type": "invoice.payment_succeeded",
+            "data": {"object": {"subscription": "sub_123"}},
+        }), mock.patch.object(function_app, "_handle_invoice_paid") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_not_called()
+
+    def test_invoice_paid_is_the_single_renewal_grant_event(self):
+        invoice = {"subscription": "sub_123"}
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_invoice_paid",
+            "type": "invoice.paid",
+            "data": {"object": invoice},
+        }), mock.patch.object(function_app, "_handle_invoice_paid") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_called_once_with(invoice, "evt_invoice_paid")
 
 
 class RetentionBlobCaseTests(unittest.TestCase):
