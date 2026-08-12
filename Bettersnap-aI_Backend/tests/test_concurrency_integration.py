@@ -72,7 +72,9 @@ class ConcurrencyIntegrationTests(unittest.TestCase):
         self._exec("""
             CREATE TABLE dbo.users (
                 user_id VARCHAR(128) PRIMARY KEY,
-                credits_remaining INT NOT NULL
+                credits_remaining INT NOT NULL,
+                one_time_credits_remaining INT NOT NULL DEFAULT 0,
+                monthly_credits_remaining INT NOT NULL DEFAULT 0
             );""")
         self._exec("""
             CREATE TABLE dbo.jobs (
