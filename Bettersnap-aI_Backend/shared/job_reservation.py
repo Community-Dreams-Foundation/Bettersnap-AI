@@ -25,7 +25,7 @@ class ReserveResult:
 def reserve_job_slot(user_id, input_blob_path, job_params,
                      per_user_cap, global_cap, lock_timeout_ms=5000,
                      credit_cost=1, initial_status="queued",
-                     source_type=None) -> ReserveResult:
+                     source_type=None, requires_lora: bool = False) -> ReserveResult:
     """credit_cost = total credits this job consumes = image_count *
     plan.credits_per_image (resolved by the caller). One-time plans use
     credits_per_image=1 so credit_cost == number of images. The decrement and the
@@ -54,6 +54,23 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="busy")
 
+        # B5: Re-check LoRA readiness under lock if this job depends on it
+        final_initial_status = initial_status
+        if requires_lora:
+            cur.execute("SELECT lora_status FROM users WHERE user_id = ?", user_id)
+            row = cur.fetchone()
+            locked_lora_status = row[0] if row else None
+
+            # Decide final status based on locked value, not preliminary read
+            if locked_lora_status == "ready":
+                final_initial_status = "queued"
+            elif locked_lora_status == "training":
+                final_initial_status = "waiting_lora"
+            else:
+                # Terminal or invalid state: do not park indefinitely
+                conn.rollback()
+                return ReserveResult(False, reason="lora_unavailable")
+
         cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
         row = cur.fetchone()
         if not row or row[0] < credit_cost:
@@ -79,7 +96,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             INSERT INTO jobs (user_id, status, input_blob_path, job_params, source_type)
             OUTPUT INSERTED.job_id
             VALUES (?, ?, ?, ?, ?)
-        """, user_id, initial_status, input_blob_path, job_params, source_type)
+        """, user_id, final_initial_status, input_blob_path, job_params, source_type)
         job_id = cur.fetchone()[0]
 
         cur.execute(
@@ -92,7 +109,7 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
         # lost after commit (finding #4). 'waiting_lora' rows are deliberately NOT enqueued
         # — the training watcher releases them — so they get no outbox row here.
         outbox_id = None
-        if initial_status == "queued":
+        if final_initial_status == "queued":
             outbox_id = outbox_add(
                 cur, INFERENCE_QUEUE,
                 {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},

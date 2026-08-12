@@ -628,13 +628,36 @@ def lighting_for_background_ref(ref: str, default: list) -> list:
     return lighting_options(cat, default)
 
 
+def _valid_unique(refs: list, validator) -> list:
+    """Validated refs, de-duplicated, original order preserved. A duplicate selection would
+    otherwise waste a combo slot (and coverage)."""
+    seen, out = set(), []
+    for r in (refs or []):
+        if r not in seen and validator(r):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
 def build_combos_global(attire_refs: list, background_refs: list) -> list:
-    """Cartesian product of the user's SELECTED attire refs × background refs,
-    spanning any categories. Invalid refs are dropped. Returns (attire_ref,
-    background_ref) tuples."""
-    a_sel = [r for r in (attire_refs or []) if valid_attire_ref(r)]
-    b_sel = [r for r in (background_refs or []) if valid_background_ref(r)]
-    return [(a, b) for a in a_sel for b in b_sel]
+    """Coverage-first ordering of the SELECTED attire × background product (spanning any
+    categories). Invalid refs are dropped and duplicates removed.
+
+    The generation loop takes combos[i % len(combos)] for i in range(image_count), so the
+    ORDER decides what a short session shows. A naive attire-major product
+    ([(a, b) for a in attires for b in backgrounds]) front-loads all of the FIRST attire's
+    combos, so when image_count < len(combos) the later attires render ZERO images (bug B1).
+    Instead we emit a diagonal-shifted permutation: the attire index advances every step and
+    shifts each round. Every prefix therefore covers as many distinct attires + backgrounds as
+    the count allows — all attires by pick n_attires, all backgrounds by pick n_backgrounds —
+    while the FULL list is still the complete product, so a large image_count cycles through
+    every combo exactly as before. Returns (attire_ref, background_ref) tuples."""
+    a_sel = _valid_unique(attire_refs, valid_attire_ref)
+    b_sel = _valid_unique(background_refs, valid_background_ref)
+    n_a, n_b = len(a_sel), len(b_sel)
+    if n_a == 0 or n_b == 0:
+        return []
+    return [(a_sel[(b + r) % n_a], b_sel[b]) for r in range(n_a) for b in range(n_b)]
 
 
 def attire_phrase(category: str, attire_id: str, gender_key: str) -> str:

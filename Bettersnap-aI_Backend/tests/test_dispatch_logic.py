@@ -179,6 +179,9 @@ class FakeCursor:
             self._fetch = (self.cfg.get("plan_name", "basic"),
                            self.cfg.get("lora_status", "ready"),
                            self.cfg.get("credits", 20))
+        # B5: atomic re-check of lora_status under lock in reserve_job_slot
+        elif "select lora_status from users" in s:
+            self._fetch = (self.cfg.get("lora_status", "ready"),)
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
         elif "select job_params, user_id from jobs" in s:
             self._fetch = (self.cfg.get("job_params",
@@ -589,8 +592,8 @@ class IdentityLoraGateTests(unittest.TestCase):
     # FIRST training FAILS (no prior adapter) -> parked jobs must NOT hang forever waiting
     # on an adapter that will never exist. They are failed and refunded instead.
     def test_training_failure_fails_and_refunds_parked_jobs(self):
-        self._cfg["parked_jobs"] = [("job-a", "{}")]
-        self._cfg["job_params"] = json.dumps({"credit_cost": 30})
+        # Job params must include credit_cost for refund extraction
+        self._cfg["parked_jobs"] = [("job-a", json.dumps({"credit_cost": 30}))]
         with mock.patch.object(function_app, "_identity_adapter_exists", return_value=False):
             function_app._finish_training("t-1", "user-1", ok=False, error="boom")
         sys.modules["shared.queue_client"]._send.assert_not_called()
