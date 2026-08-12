@@ -9,6 +9,7 @@ serialize here — no two can both pass the same cap (TOCTOU-safe).
 from .db import new_connection
 from .outbox import outbox_add
 from .queue_client import INFERENCE_QUEUE
+from . import credit_ledger
 
 
 class ReserveResult:
@@ -103,6 +104,8 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
             credit_cost, user_id,
         )
+        # Ledger: record the spend in the SAME transaction as the charge + job insert.
+        credit_ledger.record(cur, user_id, -credit_cost, credit_ledger.REASON_JOB_RESERVE, job_id)
 
         # Transactional outbox: for a 'queued' job, write the queue message into the outbox
         # IN THIS SAME TRANSACTION as the row + credit charge, so the send can no longer be

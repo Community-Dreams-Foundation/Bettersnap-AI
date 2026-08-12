@@ -107,6 +107,7 @@ from shared.plans import (
 )
 from shared import catalog
 from shared import exec_reconcile
+from shared import credit_ledger
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
@@ -778,6 +779,7 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
                 "credits_remaining = credits_remaining - ? WHERE user_id = ?",
                 retrain_cost, user_id,
             )
+            credit_ledger.record(cur2, user_id, -retrain_cost, credit_ledger.REASON_RETRAIN_CHARGE)
         else:
             cur2.execute(
                 "UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
@@ -1647,6 +1649,7 @@ def _fail_waiting_lora_jobs_txn(user_id: str, cur) -> tuple:
         cur.execute(
             "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
             total_refund, user_id)
+        credit_ledger.record(cur, user_id, total_refund, credit_ledger.REASON_JOB_REFUND_WAITING)
 
     return (jobs_failed, total_refund)
 
@@ -1693,6 +1696,9 @@ def _mark_failed(job_id: str):
                 "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
                 refund, job_id,
             )
+            # Ledger the refund in the same txn as the credit + status transition. r[1] is the
+            # job's user_id (SELECTed above); tie the row to job_id for a full per-job trail.
+            credit_ledger.record(cur, r[1], refund, credit_ledger.REASON_JOB_REFUND, job_id)
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
@@ -2884,18 +2890,21 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Stripe event has no id; skipping to stay idempotent: type={event_type}")
         return func.HttpResponse("OK", status_code=200)
 
+    # ok stays True unless a grant handler signals it could not apply yet (e.g. the paid
+    # user's row didn't exist). Handlers that don't grant credits leave ok True.
+    ok = True
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
         payment_type = session.get("metadata", {}).get("payment_type")
         if payment_type == "one_time":
-            _handle_onetime_payment(session, event_id)
+            ok = _handle_onetime_payment(session, event_id)
         elif payment_type == "monthly":
-            _handle_monthly_checkout(session, event_id)
+            ok = _handle_monthly_checkout(session, event_id)
         elif payment_type == "topup":
-            _handle_topup(session, event_id)
+            ok = _handle_topup(session, event_id)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
-        _handle_invoice_paid(event["data"]["object"], event_id)
+        ok = _handle_invoice_paid(event["data"]["object"], event_id)
 
     elif event_type == "invoice.payment_failed":
         _handle_payment_failed(event["data"]["object"], event_id)
@@ -2903,6 +2912,14 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
     elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
         _handle_subscription_ended(event["data"]["object"], event_id)
 
+    if ok is False:
+        # A paid grant couldn't be applied yet (typically the user row didn't exist when they
+        # paid). The handler rolled back WITHOUT recording the event, so return 500 to make
+        # Stripe RETRY with backoff — by the next attempt registration has usually completed
+        # and the grant lands. Previously we returned 200 here, which told Stripe "delivered"
+        # and the paid credits were silently lost.
+        logging.error(f"Stripe event {event_id} ({event_type}) not applied; 500 → Stripe will retry.")
+        return func.HttpResponse("Not yet applicable; retry", status_code=500)
     return func.HttpResponse("OK", status_code=200)
 
 
@@ -2925,7 +2942,7 @@ def _handle_onetime_payment(session: dict, event_id: str):
     plan    = session.get("metadata", {}).get("plan")
     if not user_id or plan not in ONE_TIME_PLANS:
         logging.error(f"one_time payment missing metadata: {session}")
-        return
+        return True  # malformed event — ack it (retrying can't fix bad metadata)
 
     credits = ONE_TIME_PLANS[plan]["credits"]
     conn = new_connection()
@@ -2935,7 +2952,7 @@ def _handle_onetime_payment(session: dict, event_id: str):
         if not _claim_event(cur, event_id):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping one_time grant.")
-            return
+            return True
         cur.execute(
             """UPDATE users SET
                 subscription_plan = ?,
@@ -2953,13 +2970,15 @@ def _handle_onetime_payment(session: dict, event_id: str):
             conn.rollback()
             logging.error(
                 f"PAYMENT NOT APPLIED (one_time): user_id={user_id} plan={plan} "
-                f"credits={credits} matched 0 user rows — user not registered. "
-                f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
+                f"credits={credits} matched 0 user rows — user not registered yet. "
+                f"Returning for Stripe retry (registration usually completes before the next attempt)."
             )
-            return
+            return False  # rolled back → not recorded → Stripe retry reprocesses cleanly
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_ONE_TIME)
+        conn.commit()  # claim + grant + ledger commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
+        return True
     finally:
         conn.close()
 
@@ -2972,7 +2991,7 @@ def _handle_monthly_checkout(session: dict, event_id: str):
 
     if not all([user_id, plan, customer, sub_id]) or plan not in MONTHLY_PLANS:
         logging.error(f"monthly checkout missing fields: {session}")
-        return
+        return True  # malformed event — ack it (retrying can't fix missing fields)
 
     credits = MONTHLY_PLANS[plan]["credits"]
     conn = new_connection()
@@ -2982,7 +3001,7 @@ def _handle_monthly_checkout(session: dict, event_id: str):
         if not _claim_event(cur, event_id):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping monthly activation.")
-            return
+            return True
         cur.execute(
             """UPDATE users SET
                 subscription_plan       = ?,
@@ -3005,13 +3024,15 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             conn.rollback()
             logging.error(
                 f"PAYMENT NOT APPLIED (monthly): user_id={user_id} plan={plan} "
-                f"credits={credits} sub={sub_id} matched 0 user rows — user not registered. "
-                f"MANUAL RECONCILIATION REQUIRED."
+                f"credits={credits} sub={sub_id} matched 0 user rows — user not registered yet. "
+                f"Returning for Stripe retry (registration usually completes before the next attempt)."
             )
-            return
+            return False  # rolled back → not recorded → Stripe retry reprocesses cleanly
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + activation commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
+        conn.commit()  # claim + activation + ledger commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+        return True
     finally:
         conn.close()
 
@@ -3025,7 +3046,7 @@ def _handle_topup(session: dict, event_id: str):
     pack    = session.get("metadata", {}).get("plan")
     if not user_id or pack not in ONE_TIME_PLANS:
         logging.error(f"topup missing/invalid metadata: {session}")
-        return
+        return True  # malformed event — ack it
     images = ONE_TIME_PLANS[pack]["images"]
     conn = new_connection()
     try:
@@ -3033,7 +3054,7 @@ def _handle_topup(session: dict, event_id: str):
         if not _claim_event(cur, event_id):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping topup.")
-            return
+            return True
         # Only an active monthly account can receive a top-up; read its plan to get the credit
         # rate so we add the right number of credits for `images` images.
         cur.execute(
@@ -3044,15 +3065,17 @@ def _handle_topup(session: dict, event_id: str):
             conn.rollback()
             logging.error(
                 f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
-                f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
-            return
+                f"account yet. Returning for Stripe retry (activation may still be in flight).")
+            return False  # rolled back → not recorded → Stripe retry reprocesses cleanly
         rate = max(1, get_plan(prow[0]).credits_per_image)
         grant = images * rate
         cur.execute(
             "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
             grant, user_id)
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, grant, credit_ledger.REASON_TOPUP)
+        conn.commit()  # claim + grant + ledger commit atomically
         logging.info(f"Top-up: user={user_id} pack={pack} +{grant} credits ({images} images)")
+        return True
     finally:
         conn.close()
 
@@ -3094,7 +3117,7 @@ def _invoice_subscription_id(invoice: dict):
 def _handle_invoice_paid(invoice: dict, event_id: str):
     sub_id = _invoice_subscription_id(invoice)
     if not sub_id:
-        return
+        return True  # can't identify the subscription — nothing to retry
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -3103,7 +3126,22 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
         if not _claim_event(cur, event_id):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping credit reset.")
-            return
+            return True
+        # Read BEFORE the reset so the ledger records the true signed delta (new quota minus
+        # whatever was left this cycle), keeping the ledger consistent with the balance.
+        cur.execute(
+            "SELECT user_id, credits_remaining, credits_monthly_limit "
+            "FROM users WHERE stripe_subscription_id = ?",
+            sub_id,
+        )
+        urow = cur.fetchone()
+        if not urow:
+            conn.rollback()
+            logging.error(
+                f"invoice.paid: no user with stripe_subscription_id={sub_id} yet — "
+                f"returning for Stripe retry (activation may still be in flight).")
+            return False  # rolled back → not recorded → retry reprocesses cleanly
+        delta = (urow[2] or 0) - (urow[1] or 0)
         cur.execute(
             """UPDATE users SET
                 credits_remaining       = credits_monthly_limit,
@@ -3112,8 +3150,10 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             WHERE stripe_subscription_id = ?""",
             sub_id,
         )
-        conn.commit()  # claim + reset commit atomically
+        credit_ledger.record(cur, urow[0], delta, credit_ledger.REASON_RENEWAL)
+        conn.commit()  # claim + reset + ledger commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
+        return True
     finally:
         conn.close()
 
