@@ -866,12 +866,23 @@ def run_inference(job: dict) -> list:
             except Exception as e:
                 write_debug(f"STAGE_CAPTURE raw upload failed for candidate {i}: {e}")
 
-    # Phase-2 pass-through: no Quality Gate yet — every candidate becomes a winner (accepted).
-    winners = [
-        Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
-               slot_id=(c.slot_id if c.slot_id is not None else i))
-        for i, c in enumerate(candidates)
-    ]
+    # ── Phase-6 Quality Gate (DEFAULT OFF) ────────────────────────────────────────────
+    # QUALITY_GATE=1 scores candidates with a commercial-safe embedder, keeps the best per slot
+    # above threshold, and retries failed slots within candidate_budget BEFORE enhancement.
+    # DEFAULT OFF -> the historical pass-through below, so prod behavior is UNCHANGED until this
+    # is validated on an A100. (The commercial embedder is not integrated yet, so with the flag
+    # ON it raises NotImplementedError by design — the gate can never silently ship an
+    # unlicensed scorer.)
+    if os.environ.get("QUALITY_GATE", "0").strip() == "1":
+        from runtime.quality_gate import run_quality_gate_for_job
+        winners = run_quality_gate_for_job(
+            candidates, plan, ctx, ref_faces, prompt_engine, gen_engine, write_debug)
+    else:
+        winners = [
+            Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
+                   slot_id=(c.slot_id if c.slot_id is not None else i))
+            for i, c in enumerate(candidates)
+        ]
     finals = enh_engine.enhance(winners)
 
     # delivered_size read from the actual last final image (parity with legacy).
