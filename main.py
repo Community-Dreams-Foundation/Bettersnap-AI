@@ -821,6 +821,7 @@ def run_inference(job: dict) -> list:
         gender=gen_gender,
         age_range=(job_params.get("age_range") or ""),
         hair_color=(job_params.get("hair_color") or ""),
+        body_type=(job_params.get("body_type") or ""),
         attire_refs=tuple(attire_refs), background_refs=tuple(background_refs),
         custom_prompt=custom_prompt,
     )

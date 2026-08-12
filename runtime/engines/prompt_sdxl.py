@@ -71,6 +71,22 @@ class SdxlPromptEngine:
         if age_phrase:
             subj += f" {age_phrase}"
         subj += cfg.hair_phrase(hair_color)
+        # Body build (DEFAULT OFF — byte-identical to baseline until validated on GPU, same
+        # discipline as EXPRESSION_CLAUSE). Two sources, in order:
+        #   1. plan.body_type (slim|average|athletic|heavy) — PER-PERSON, when we can source a
+        #      real build. Renders the actual physique, so a real gym-goer stays muscular and a
+        #      slim person stays slim (NOT a global negative-prompt suppressor, which mis-sizes).
+        #   2. BODY_BUILD_CLAUSE env — a global neutral nudge (e.g. "with a natural, realistic
+        #      body build") for A/B testing the anti-"gym-bulk" effect before making it a default.
+        # Neither set => no body clause => prompt unchanged.
+        _body = (plan.body_type or "").strip().lower()
+        if _body in ("slim", "average", "athletic", "heavy"):
+            article = "an" if _body[0] in "aeiou" else "a"
+            subj += f", with {article} {_body} build"
+        else:
+            _body_default = os.environ.get("BODY_BUILD_CLAUSE", "").strip()
+            if _body_default:
+                subj += f", {_body_default}"
         _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
                  "skin texture, shot on a DSLR with an 85mm portrait lens.")
 

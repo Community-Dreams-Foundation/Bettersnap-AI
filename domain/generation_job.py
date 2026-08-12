@@ -47,6 +47,7 @@ class GenerationPlan:
     gender: str = ""
     age_range: str = ""
     hair_color: str = ""
+    body_type: str = ""          # slim|average|athletic|heavy — per-person build; "" => neutral default
     attire_refs: tuple[str, ...] = ()
     background_refs: tuple[str, ...] = ()
     custom_prompt: str = ""
