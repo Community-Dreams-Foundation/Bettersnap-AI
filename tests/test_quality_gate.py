@@ -59,6 +59,18 @@ def _plan(threshold=0.5, retry=0, budget=4, slots=(0,)):
         slots=tuple(OutputSlot(s) for s in slots))
 
 
+# ── embedder guardrail ───────────────────────────────────────────────────────
+def test_load_default_embedder_raises_without_model(monkeypatch):
+    """The gate stays inert (no unlicensed scorer can ship) until the Apache-2.0 ArcFace ONNX
+    is actually present. Real-image separation (~+0.55 same-vs-different) is validated manually
+    with the model + held-out subjects — it needs the 250MB model and faces, so it isn't a CI test."""
+    import pytest
+    from runtime.engines.embedder import load_default_embedder
+    monkeypatch.delenv("ARCFACE_ONNX_PATH", raising=False)
+    with pytest.raises(NotImplementedError):
+        load_default_embedder()
+
+
 # ── embedder math ────────────────────────────────────────────────────────────
 def test_cosine_and_centroid():
     assert cosine([1, 0, 0], [1, 0, 0]) == 1.0

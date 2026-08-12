@@ -56,6 +56,23 @@ Implement `FaceEmbedder.embed(image)` in `runtime/engines/embedder.py`:
 The identity centroid is then the mean of the user's reference-crop embeddings (already wired
 in `runtime/quality_gate.py::run_quality_gate_for_job`).
 
+## ✅ Integrated & validated (CPU, no GPU)
+
+`ArcFaceOnnxEmbedder` is implemented in `runtime/engines/embedder.py`. The preprocessing was
+**non-obvious and had to be found empirically** — record it so no one re-derives it:
+
+- **Alignment:** YuNet 5-point → order landmarks **geometrically by x** (robust to naming) →
+  **umeyama** similarity transform (SVD), **not** `cv2.estimateAffinePartial2D`/LMEDS (which is
+  unstable on 5 points and mangles the crop).
+- **Preprocessing:** **RAW [0,255] RGB** (`scale=1.0`, no mean, `swapRB=True`). This specific
+  ONNX export bakes its own normalization in, so the usual insightface `(x-127.5)/127.5`
+  **collapses** it (every embedding ~parallel, ~0 separation).
+
+**Validation (held-out subjects, CPU):** same-person cosine **0.79**, different-person **0.22**
+→ **separation +0.55**. Full `EvaluationEngine` scores the 20 seeded generated headshots at
+**0.72–0.87** identity vs the user's real-crop centroid. Model: `ARCFACE_ONNX_PATH` (248 MB,
+[onnxmodelzoo/arcfaceresnet100-8](https://huggingface.co/onnxmodelzoo/arcfaceresnet100-8)).
+
 ## Then (GPU-gated)
 
 Re-run the v49 baseline once with the chosen embedder to set `acceptance_threshold` and
