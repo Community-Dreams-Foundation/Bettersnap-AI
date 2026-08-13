@@ -144,6 +144,48 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
+# Tables whose user_id FKs to users.user_id. A returning user's whole history/credits/
+# subscriptions hang off these, so an identity migration MUST move them too or it strands
+# the data (and leaves FK-orphan rows). Keep in sync with the schema (sys.foreign_keys).
+_USER_CHILD_TABLES = ("jobs", "lora_models", "credit_transactions", "subscriptions")
+
+
+def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
+    """Supabase→Entra split-identity self-heal.
+
+    A returning user signs in under a NEW Entra oid, but their account row already exists under
+    an OLD id keyed to the same email (created pre-migration). A plain INSERT then 500s on the
+    UX_users_email_real unique index and locks them out forever (measured: 4 users, 29 failed
+    logins). Instead, MOVE the account row AND every child row to the new oid so future oid
+    lookups match and their history/credits follow them.
+
+    FK-safe order, one transaction: free the old email → copy the row under the new id
+    (preserving credits/plan/subscription/stripe state) → repoint children → delete old row.
+    """
+    cursor.execute("UPDATE users SET email = NULL WHERE user_id = ?", old_user_id)
+    cursor.execute("""
+        INSERT INTO users (user_id, email, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name)
+        SELECT ?, ?, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name
+        FROM users WHERE user_id = ?
+    """, new_oid, email, old_user_id)
+    for tbl in _USER_CHILD_TABLES:
+        cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE user_id = ?", new_oid, old_user_id)
+    cursor.execute("DELETE FROM users WHERE user_id = ?", old_user_id)
+    conn.commit()
+
+
 @app.route(route="users/register", methods=["POST"])
 def register_user(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -182,6 +224,25 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
+
+    # Not found by oid. Before INSERTing, check for a RETURNING user whose auth id changed
+    # (Supabase→Entra migration): the SAME email already exists under a DIFFERENT (old) user_id.
+    # A blind INSERT here 500s on UX_users_email_real and permanently locks them out — the
+    # split-identity bug measured on real users. Migrate their account to this oid instead.
+    if email:
+        cursor.execute("SELECT user_id FROM users WHERE email = ?", email)
+        prior = cursor.fetchone()
+        if prior and str(prior[0]).lower() != str(user_id).lower():
+            logging.warning(
+                f"Identity migration: email already under old id={prior[0]}; moving account to "
+                f"Entra oid={user_id} (returning user, auth id changed)."
+            )
+            _migrate_identity(conn, cursor, prior[0], user_id, email)
+            return func.HttpResponse(
+                json.dumps({"message": "User migrated to current identity"}),
+                mimetype="application/json",
+                status_code=200
+            )
 
     logging.info(
         f"First registration for oid={user_id}; token claim keys="
