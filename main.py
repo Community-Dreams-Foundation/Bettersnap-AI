@@ -164,6 +164,8 @@ upscaler = None   # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause) — 2K post-process
 ip_adapter_ok = False   # IP-Adapter Plus-Face loaded successfully?
 img2img_pipe = None     # SDXL img2img (shares pipe's UNet/LoRA/IP-Adapter) for face refine
 _face_cascade = None    # cv2 Haar cascade for locating the face to refine
+cn_pipe = None          # SDXL depth-ControlNet pipe (shares pipe.components) — pose reference, default off
+depth_estimator = None  # {"model":DPT, "proc":DPTImageProcessor} for depth maps — pose reference, default off
 
 # Per-stage init outcome for the run manifest: name -> {enabled, initialized, reason[, error]}.
 # Populated by load_base_model via stage_runtime.run_stage. SINGLE-JOB INVARIANT: the GPU
@@ -255,6 +257,26 @@ DEFAULT_WIDTH         = int(os.environ.get("GEN_WIDTH", "1024"))
 DEFAULT_HEIGHT        = int(os.environ.get("GEN_HEIGHT", "1024"))
 # How many (background, attire) tuples one job spans (product wants ~4-6 for range).
 DEFAULT_NUM_OUTPUTS   = int(os.environ.get("NUM_OUTPUTS", "6"))
+
+# ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────────
+# Opt-in pose guidance: condition generation on the DEPTH of a set of reference photos
+# so outputs adopt those poses (head/shoulder position, framing, posture) while identity
+# still comes from the LoRA + IP-Adapter. The depth ControlNet (xinsir, Apache-2.0) + DPT
+# depth estimator are already BAKED into the image; this wires them, off by default.
+#   * A SINGLE reference would force ALL images into one pose (why ControlNet was left off).
+#     So we take a SET of refs (POSE_REF_PREFIX) and CYCLE them: image i uses ref[i % N].
+#     N good poses -> N varied professional poses, not N clones.
+#   * POSE_REF_SCALE is controlnet_conditioning_scale: how hard the depth forces the pose.
+#     ~0.5 guides pose without overpowering the attire/scene; 1.0 locks the pose harder.
+# DEFAULT OFF => the plain txt2img path runs UNCHANGED (byte-identical) until validated on GPU,
+# same discipline as EXPRESSION_CLAUSE / BODY_BUILD_CLAUSE / COMPOSITION_CONTROL.
+POSE_REF_ENABLE       = os.environ.get("POSE_REF_ENABLE", "0").strip() != "0"
+# Blob folder (in POSE_REF_CONTAINER) holding the pose-reference images (img0.jpg, img1.jpg, ...).
+POSE_REF_CONTAINER    = os.environ.get("POSE_REF_CONTAINER", "inputs")
+POSE_REF_PREFIX       = os.environ.get("POSE_REF_PREFIX", "").strip()
+POSE_REF_SCALE        = float(os.environ.get("POSE_REF_SCALE", "0.5"))
+# How many refs to try to fetch (img0..img{N-1}); the set is cycled across the output images.
+POSE_REF_FETCH_N      = int(os.environ.get("POSE_REF_FETCH_N", "12"))
 
 # DreamBooth trigger token baked into EVERY prompt as "ohwx <class>" so the
 # per-user identity LoRA actually FIRES. Every per-user LoRA is trained with this
@@ -443,6 +465,33 @@ def load_base_model():
             _init_shared_img2img()
             write_debug("Realism img2img pipe ready")
 
+        def _init_pose_ref():
+            # Pose reference (depth-ControlNet) — DEFAULT OFF. Loads the baked depth ControlNet
+            # (xinsir, Apache-2.0) + DPT depth estimator and builds an SDXL ControlNet pipe from
+            # the SAME components as the base pipe (shares UNet/LoRA/IP-Adapter — no second SDXL
+            # load), exactly like _init_shared_img2img. Only reached when POSE_REF_ENABLE.
+            global cn_pipe, depth_estimator
+            from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+            from transformers import DPTForDepthEstimation, DPTImageProcessor
+            cn = ControlNetModel.from_pretrained(
+                "/models/controlnet-depth-sdxl",
+                torch_dtype=torch.float16, use_safetensors=True).to("cuda")
+            # ControlNet pipe shares every base component; controlnet is the only addition.
+            cn_pipe = StableDiffusionXLControlNetPipeline(**pipe.components, controlnet=cn)
+            if IP_ADAPTER_SCALE > 0 and ip_adapter_ok:
+                # The IP-Adapter scale lives on the shared UNet attn processors, but set it on
+                # this pipe handle too so cn_pipe(ip_adapter_image=...) conditions identically.
+                try:
+                    cn_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+                except Exception as e:
+                    write_debug(f"pose_ref: set_ip_adapter_scale on cn_pipe failed (non-fatal): {e}")
+            depth_estimator = {
+                "model": DPTForDepthEstimation.from_pretrained(
+                    "/models/dpt-hybrid-midas", torch_dtype=torch.float16).to("cuda").eval(),
+                "proc": DPTImageProcessor.from_pretrained("/models/dpt-hybrid-midas"),
+            }
+            write_debug(f"pose_ref: depth ControlNet + DPT loaded (scale={POSE_REF_SCALE})")
+
         def _stage(name, enabled, init_fn, **kw):
             return run_stage(name, enabled, init_fn, STAGE_STATUS, log=write_debug, **kw)
 
@@ -451,6 +500,7 @@ def load_base_model():
                fatal=False, degraded_reason="degraded_to_1024")
         _stage("face_refine", FACE_REFINE_ENABLE,   _init_face_refine)
         _stage("realism",     REALISM_PASS_ENABLE,  _init_realism)
+        _stage("pose_ref",    POSE_REF_ENABLE,      _init_pose_ref)
 
         try:
             props = torch.cuda.get_device_properties(0)
@@ -710,6 +760,53 @@ def _get_ref_faces(user_id: str, n: int = None):
     return refs, ids
 
 
+def _depth_map(pil_img, size: int = 1024):
+    """DPT depth map of `pil_img` as a size×size RGB PIL image (the ControlNet control input).
+    Normalized to full 0-255 range so near/far contrast is consistent regardless of the source
+    scene. Only called on the pose-reference path (POSE_REF_ENABLE); depth_estimator is loaded."""
+    import numpy as np
+    from PIL import Image
+    proc = depth_estimator["proc"]
+    model = depth_estimator["model"]
+    inputs = proc(images=pil_img, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to("cuda", dtype=torch.float16)
+    with torch.no_grad():
+        depth = model(pixel_values=pixel_values).predicted_depth  # (1, H, W)
+    depth = torch.nn.functional.interpolate(
+        depth.unsqueeze(1).float(), size=(size, size), mode="bicubic", align_corners=False)
+    lo, hi = depth.min(), depth.max()
+    depth = (depth - lo) / (hi - lo + 1e-8)
+    arr = (depth.squeeze().cpu().numpy() * 255.0).astype("uint8")
+    return Image.fromarray(np.stack([arr, arr, arr], axis=-1))  # 3-channel depth
+
+
+def _get_pose_ref_depths(n: int = None):
+    """Fetch the pose-reference images from POSE_REF_CONTAINER/POSE_REF_PREFIX (img0.jpg,
+    img1.jpg, ...) and return their DEPTH maps as a list of PIL images, in order. The caller
+    CYCLES this list across the output images so N refs give N varied poses. Empty POSE_REF_PREFIX
+    or no images -> [] (caller then falls back to the plain txt2img path). Only the pose-ref path
+    calls this."""
+    import io
+    from PIL import Image
+    if n is None:
+        n = POSE_REF_FETCH_N
+    if not POSE_REF_PREFIX:
+        write_debug("pose_ref: POSE_REF_PREFIX unset -> no pose references")
+        return []
+    prefix = POSE_REF_PREFIX.rstrip("/")
+    depths = []
+    for i in range(n):
+        blob_name = f"{prefix}/img{i}.jpg"
+        try:
+            data = _read_blob(POSE_REF_CONTAINER, blob_name)
+            src = Image.open(io.BytesIO(data)).convert("RGB")
+            depths.append(_depth_map(src, size=DEFAULT_WIDTH))
+        except Exception as e:
+            write_debug(f"pose_ref img{i} unavailable: {e}")
+    write_debug(f"pose_ref: computed {len(depths)} depth map(s) from {POSE_REF_CONTAINER}/{prefix}/")
+    return depths
+
+
 # ─────────────────────────────────────────────────────────
 # Core inference
 # ─────────────────────────────────────────────────────────
@@ -836,6 +933,21 @@ def run_inference(job: dict) -> list:
     ctx.work["use_ip_adapter"] = use_ip_adapter
     ctx.work["ip_adapter_image"] = _ref
     ctx.work["ref_face"] = _ref
+
+    # ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────
+    # When enabled AND the ControlNet pipe initialized AND we actually fetched depth maps,
+    # hand the generation engine the ControlNet pipe + the (cycled) depth maps. If ANY of
+    # those is missing, we leave these unset and the engine runs the plain txt2img path —
+    # so a misconfigured pose-ref run degrades to normal generation, never crashes.
+    if POSE_REF_ENABLE and cn_pipe is not None:
+        _pose_depths = _get_pose_ref_depths()
+        if _pose_depths:
+            ctx.models["cn_pipe"] = cn_pipe
+            ctx.work["pose_ref_depths"] = _pose_depths
+            ctx.work["pose_ref_scale"] = POSE_REF_SCALE
+            write_debug(f"pose_ref ACTIVE: {len(_pose_depths)} depth map(s), scale={POSE_REF_SCALE}")
+        else:
+            write_debug("pose_ref enabled but no depth maps fetched -> plain txt2img path")
 
     # ── run: prompt -> generate -> [Phase-6 wrap] -> enhance -> deliver ───────
     _gen_t0 = time.time()

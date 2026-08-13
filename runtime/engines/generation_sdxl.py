@@ -31,6 +31,13 @@ class SdxlGenerationEngine:
         import torch
         use_ip_adapter = bool(self.ctx.work.get("use_ip_adapter", False))
         ip_adapter_image = self.ctx.work.get("ip_adapter_image")
+        # Pose reference (depth-ControlNet) — DEFAULT OFF. The orchestrator only sets these
+        # when POSE_REF_ENABLE + the ControlNet pipe initialized + depth maps were fetched;
+        # otherwise cn_pipe is None and the plain txt2img path below runs UNCHANGED.
+        cn_pipe = self.ctx.models.get("cn_pipe")
+        pose_depths = self.ctx.work.get("pose_ref_depths") or []
+        pose_scale = self.ctx.work.get("pose_ref_scale", 0.5)
+        use_pose_ref = bool(cn_pipe is not None and pose_depths)
         candidates: list[Candidate] = []
         for i, p in enumerate(prompts.prompts):
             _pipe_kwargs = dict(
@@ -44,7 +51,14 @@ class SdxlGenerationEngine:
             )
             if use_ip_adapter:
                 _pipe_kwargs["ip_adapter_image"] = ip_adapter_image
-            output = self.pipe(**_pipe_kwargs).images[0]
+            if use_pose_ref:
+                # CYCLE the pose refs across images: image i adopts ref[i % N]'s pose. The
+                # depth map is the ControlNet control input; scale = how hard it forces pose.
+                _pipe_kwargs["image"] = pose_depths[i % len(pose_depths)]
+                _pipe_kwargs["controlnet_conditioning_scale"] = float(pose_scale)
+                output = cn_pipe(**_pipe_kwargs).images[0]
+            else:
+                output = self.pipe(**_pipe_kwargs).images[0]
 
             # Real inference VRAM peak on the first output — verbatim metric side-effect.
             if i == 0:
