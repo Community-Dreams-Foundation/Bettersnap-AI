@@ -1,95 +1,117 @@
--- 021: Teams layer, part 1 — organizations and organization_payments.
+-- 021: Teams layer, part 1 — organizations, organization_payments, and the org link on jobs.
 --
--- Part 2 (invitations, organization_members) is 022 and carries FKs to
--- dbo.organizations (organization_id), so this file MUST create it first — the runner
--- applies files in filename order. (022's own header calls out this dependency.)
+-- RECOVERED from the original single-file Teams migration (Features_team 015_teams_schema.sql,
+-- commit 8ba1e55), which was dropped when Features_team merged into development (its 015 number
+-- collided with development's 015_dispatched_at). Part 2 — invitations + organization_members —
+-- survives as 022_teams_invitations_members.sql, whose FKs reference dbo.organizations, so this
+-- file (which creates it) MUST keep a lower number. These two files are DISJOINT: 021 creates
+-- organizations/organization_payments/jobs.organization_id; 022 creates invitations/members.
 --
--- MODEL (matches 022's header): an admin creates an organization, buys a plan covering
--- N seats (organizations.seats_purchased), and invites employees. Each seat is still a
--- normal users row with its own login and identity LoRA; the organization is the billing
--- + membership wrapper. organizations holds the org-level Stripe subscription; per-seat
--- credit accounting lives on organization_members (022).
+-- MODEL: an admin buys a one-time plan covering N employees, emails each an invite link, and
+-- each invitee (the admin included) logs in and gets their own credits. Employees are ordinary
+-- users rows, so the existing per-user identity/LoRA and generation paths work unchanged.
 --
--- Idempotent and safe to re-run. GO separators required between batches (see 003).
--- Text types follow the existing files: VARCHAR for machine values (status, Stripe ids),
--- NVARCHAR for anything a human types (org name).
+-- ISOLATION: individual-user data is untouched. The only change to an existing table is a
+-- NULLABLE jobs.organization_id — NULL means "ordinary individual job", exactly as today.
+--
+-- Idempotent and safe to re-run. GO separators are REQUIRED (see 003's note): the ALTER on
+-- jobs and the index that references the new column must compile in separate batches.
+--
+-- Text types follow the existing files: VARCHAR for machine-ish values (status, Stripe ids,
+-- tokens) and NVARCHAR for anything a human types — company names can contain non-ASCII.
 
--- ── organizations ─────────────────────────────────────────────────────────
--- One row per organization. seats_purchased mirrors the Stripe subscription quantity and
--- is the seat cap 022's accept handler counts active members against (022 note #1).
+-- ── 1. organizations ──────────────────────────────────────────────────────
+-- One row per company. Phase 1 is single-admin, so the admin lives here as a column
+-- rather than being derived from organization_members.
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID('dbo.organizations'))
     CREATE TABLE dbo.organizations (
-        organization_id        UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
-        name                   NVARCHAR(255)    NOT NULL,
-        owner_user_id          UNIQUEIDENTIFIER NOT NULL,   -- Entra oid of the admin who created the org
-        seats_purchased        INT              NOT NULL CONSTRAINT DF_org_seats DEFAULT 0,
-        seat_plan_key          VARCHAR(32)      NULL,       -- shared/plans.py key for the per-seat plan
-        status                 VARCHAR(16)      NOT NULL CONSTRAINT DF_org_status DEFAULT 'active',
-        stripe_customer_id     VARCHAR(64)      NULL,
-        stripe_subscription_id VARCHAR(64)      NULL,
-        created_at             DATETIME2        NOT NULL CONSTRAINT DF_org_created_at DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT UQ_org_owner UNIQUE (owner_user_id)      -- one org per owner (v1); a member belongs to one org (022 UQ_member_user)
+        organization_id   UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+        name              NVARCHAR(255)    NOT NULL,
+        admin_user_id     UNIQUEIDENTIFIER NOT NULL,  -- Entra oid; matches users.user_id
+        seats_purchased   INT              NOT NULL,
+        credits_per_seat  INT              NOT NULL CONSTRAINT DF_org_credits_per_seat DEFAULT 10,
+        status            VARCHAR(16)      NOT NULL CONSTRAINT DF_org_status DEFAULT 'active',
+        created_at        DATETIME2        NOT NULL CONSTRAINT DF_org_created_at DEFAULT SYSUTCDATETIME(),
+        updated_at        DATETIME2        NOT NULL CONSTRAINT DF_org_updated_at DEFAULT SYSUTCDATETIME()
     );
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_org_status')
-    ALTER TABLE dbo.organizations ADD CONSTRAINT CK_org_status
-        CHECK (status IN ('active', 'past_due', 'canceled'));
-GO
-
--- Stripe webhooks resolve an org by its subscription id; index that lookup.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_org_stripe_sub'
+-- Every Teams request resolves the caller's org, so this is on the hot path.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_organizations_admin'
                AND object_id = OBJECT_ID('dbo.organizations'))
-    CREATE INDEX IX_org_stripe_sub ON dbo.organizations (stripe_subscription_id);
+    CREATE INDEX IX_organizations_admin ON dbo.organizations (admin_user_id);
 GO
 
--- ── organization_payments ─────────────────────────────────────────────────
--- Append-only record of org-level Stripe payment events (seat purchases, renewals) and
--- the idempotency guard for the org billing webhooks — parallels
--- 010_stripe_webhook_idempotency for individual accounts.
+-- ── 2. organization_payments ──────────────────────────────────────────────
+-- One row per Stripe payment. stripe_event_id is UNIQUE so a replayed webhook
+-- (Stripe retries) can only ever insert once — the duplicate insert fails and the
+-- handler treats it as an already-processed no-op.
+--
+-- OPEN: migration 010 already added dbo.processed_stripe_events for exactly this
+-- purpose on the individual-user side. Two mechanisms now guard the same problem.
+-- Confirm with whoever owns the Stripe workstream which one Teams should use before
+-- the webhook handler is written; this table is harmless either way.
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID('dbo.organization_payments'))
     CREATE TABLE dbo.organization_payments (
-        payment_id       UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
-        organization_id  UNIQUEIDENTIFIER NOT NULL,
-        stripe_event_id  VARCHAR(128)     NULL,       -- Stripe event id, for idempotent webhook handling
-        event_type       VARCHAR(64)      NULL,       -- e.g. invoice.paid, customer.subscription.updated
-        amount_cents     INT              NULL,
-        seats            INT              NULL,        -- seat quantity this event settled
-        status           VARCHAR(16)      NULL,
-        created_at       DATETIME2        NOT NULL CONSTRAINT DF_org_pay_created_at DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT FK_org_pay_org FOREIGN KEY (organization_id)
-            REFERENCES dbo.organizations (organization_id)
+        payment_id               UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+        organization_id          UNIQUEIDENTIFIER NOT NULL,
+        stripe_payment_intent_id VARCHAR(255)     NOT NULL,
+        stripe_event_id          VARCHAR(255)     NOT NULL,
+        amount_cents             INT              NOT NULL,
+        currency                 VARCHAR(8)       NOT NULL CONSTRAINT DF_orgpay_currency DEFAULT 'usd',
+        status                   VARCHAR(16)      NOT NULL,
+        created_at               DATETIME2        NOT NULL CONSTRAINT DF_orgpay_created_at DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_orgpay_org FOREIGN KEY (organization_id)
+            REFERENCES dbo.organizations (organization_id),
+        CONSTRAINT UQ_orgpay_stripe_event UNIQUE (stripe_event_id)
     );
 GO
 
--- At most one row per Stripe event id (filtered — the column is nullable, many NULLs allowed).
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_org_pay_event'
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_orgpay_org'
                AND object_id = OBJECT_ID('dbo.organization_payments'))
-    CREATE UNIQUE INDEX UX_org_pay_event ON dbo.organization_payments (stripe_event_id)
-        WHERE stripe_event_id IS NOT NULL;
+    CREATE INDEX IX_orgpay_org ON dbo.organization_payments (organization_id);
 GO
 
--- Org billing-history view.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_org_pay_org'
-               AND object_id = OBJECT_ID('dbo.organization_payments'))
-    CREATE INDEX IX_org_pay_org ON dbo.organization_payments (organization_id, created_at);
+-- ── 3. jobs.organization_id (existing table) ──────────────────────────────
+-- NULL = ordinary individual job, unchanged. Non-NULL = this job belongs to a Teams
+-- seat and spends from organization_members.credits_remaining (created in 022).
+-- Nullable add-only column: backfills as NULL, online, no data migration.
+IF COL_LENGTH('dbo.jobs', 'organization_id') IS NULL
+    ALTER TABLE dbo.jobs ADD organization_id UNIQUEIDENTIFIER NULL;
+GO
+
+-- Separate batch: the column must exist at compile time (see 003's GO note).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_jobs_org'
+               AND object_id = OBJECT_ID('dbo.jobs'))
+    CREATE INDEX IX_jobs_org ON dbo.jobs (organization_id) WHERE organization_id IS NOT NULL;
+GO
+
+-- ── Status vocabularies ───────────────────────────────────────────────────
+-- Guarded at the DB level so a typo in application code can't park a row in a state
+-- no query filters on. (invitations/organization_members CHECKs live with their tables in 022.)
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_org_status')
+    ALTER TABLE dbo.organizations ADD CONSTRAINT CK_org_status
+        CHECK (status IN ('active', 'suspended', 'closed'));
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_orgpay_status')
+    ALTER TABLE dbo.organization_payments ADD CONSTRAINT CK_orgpay_status
+        CHECK (status IN ('succeeded', 'failed'));
 GO
 
 -- ── Notes for the API layer (not enforced here) ───────────────────────────
--- 1. owner_user_id (and the member user ids in 022) hold users.user_id (Entra oid) values
---    but carry NO FK, matching 022 and lora_trainings (004). Validate in application code.
--- 2. Seat cap: the invite-accept handler must count active organization_members against
---    organizations.seats_purchased inside one transaction (see 022 note #1).
--- 3. TEAMS.md envisions a later redesign (a nullable users.org_id column, per-user seat
---    credits instead of an org pool, owner/admin/member roles). This file deliberately
---    matches the ALREADY-SHIPPED 022 migration's contract (organization_id PK,
---    seats_purchased) so its FKs resolve today; reconcile with TEAMS.md when the teams
---    API is actually built.
+-- 1. admin_user_id (and the member/inviter user ids in 022) hold users.user_id (Entra oid)
+--    values but carry NO FK, matching lora_trainings (004). Validate in application code.
+-- 2. Seat cap: the invite-accept handler (022) must count active organization_members against
+--    organizations.seats_purchased inside one transaction.
 --
 -- ── Verify ────────────────────────────────────────────────────────────────
 --   SELECT COUNT(*) FROM dbo.organizations;          -- exists, 0 rows
 --   SELECT COUNT(*) FROM dbo.organization_payments;  -- exists, 0 rows
+--   SELECT COUNT(*) FROM dbo.jobs WHERE organization_id IS NOT NULL;  -- 0
 --
 -- ── Rollback ──────────────────────────────────────────────────────────────
+--   DROP INDEX IX_jobs_org ON dbo.jobs;
+--   ALTER TABLE dbo.jobs DROP COLUMN organization_id;
 --   DROP TABLE dbo.organization_payments;   -- FK to organizations, drop first
 --   DROP TABLE dbo.organizations;
