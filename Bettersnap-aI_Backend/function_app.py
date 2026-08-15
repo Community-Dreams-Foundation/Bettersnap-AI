@@ -179,6 +179,48 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
+# Tables whose user_id FKs to users.user_id. A returning user's whole history/credits/
+# subscriptions hang off these, so an identity migration MUST move them too or it strands
+# the data (and leaves FK-orphan rows). Keep in sync with the schema (sys.foreign_keys).
+_USER_CHILD_TABLES = ("jobs", "lora_models", "credit_transactions", "subscriptions")
+
+
+def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
+    """Supabase→Entra split-identity self-heal.
+
+    A returning user signs in under a NEW Entra oid, but their account row already exists under
+    an OLD id keyed to the same email (created pre-migration). A plain INSERT then 500s on the
+    UX_users_email_real unique index and locks them out forever (measured: 4 users, 29 failed
+    logins). Instead, MOVE the account row AND every child row to the new oid so future oid
+    lookups match and their history/credits follow them.
+
+    FK-safe order, one transaction: free the old email → copy the row under the new id
+    (preserving credits/plan/subscription/stripe state) → repoint children → delete old row.
+    """
+    cursor.execute("UPDATE users SET email = NULL WHERE user_id = ?", old_user_id)
+    cursor.execute("""
+        INSERT INTO users (user_id, email, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name)
+        SELECT ?, ?, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name
+        FROM users WHERE user_id = ?
+    """, new_oid, email, old_user_id)
+    for tbl in _USER_CHILD_TABLES:
+        cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE user_id = ?", new_oid, old_user_id)
+    cursor.execute("DELETE FROM users WHERE user_id = ?", old_user_id)
+    conn.commit()
+
+
 @app.route(route="users/register", methods=["POST"])
 def register_user(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -217,6 +259,25 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
+
+    # Not found by oid. Before INSERTing, check for a RETURNING user whose auth id changed
+    # (Supabase→Entra migration): the SAME email already exists under a DIFFERENT (old) user_id.
+    # A blind INSERT here 500s on UX_users_email_real and permanently locks them out — the
+    # split-identity bug measured on real users. Migrate their account to this oid instead.
+    if email:
+        cursor.execute("SELECT user_id FROM users WHERE email = ?", email)
+        prior = cursor.fetchone()
+        if prior and str(prior[0]).lower() != str(user_id).lower():
+            logging.warning(
+                f"Identity migration: email already under old id={prior[0]}; moving account to "
+                f"Entra oid={user_id} (returning user, auth id changed)."
+            )
+            _migrate_identity(conn, cursor, prior[0], user_id, email)
+            return func.HttpResponse(
+                json.dumps({"message": "User migrated to current identity"}),
+                mimetype="application/json",
+                status_code=200
+            )
 
     logging.info(
         f"First registration for oid={user_id}; token claim keys="
@@ -1038,7 +1099,15 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # credit pool spreads across MANY generations: default to the plan's session size, let
     # the client request more, clamp to the monthly quota and to what credits can pay for.
     if plan.plan_type == "monthly":
-        requested = int(body.get("image_count") or plan.min_session_images)
+        # Coerce defensively: a non-numeric image_count ("abc") or wrong type ([1]) would
+        # raise on int() and — past the body guard — surface as a 500 on the most-hit
+        # endpoint. Fall back to a clean 400 instead.
+        try:
+            requested = int(body.get("image_count") or plan.min_session_images)
+        except (TypeError, ValueError):
+            return func.HttpResponse(
+                json.dumps({"error": "image_count must be a number"}),
+                mimetype="application/json", status_code=400)
         max_by_credits = (
             credits_remaining + one_time_credits_remaining
         ) // plan.credits_per_image
@@ -3263,8 +3332,38 @@ def _handle_topup(session: dict, event_id: str):
         conn.close()
 
 
+def _invoice_subscription_id(invoice: dict):
+    """The subscription id on an invoice, across Stripe API versions.
+
+    THE BUG THIS FIXES — SILENT RENEWAL FAILURE
+    -------------------------------------------
+    Stripe removed the top-level invoice.subscription field. As of the version this account
+    now sends events in (2026-05-27.dahlia), the top-level invoice.subscription is None, and
+    the id lives at invoice.parent.subscription_details.subscription. Both invoice handlers
+    read the old field, hit `if not sub_id: return`, and no-op — so EVERY monthly renewal's
+    invoice.paid (billing_reason=subscription_cycle) silently failed to reset credits, and
+    every invoice.payment_failed silently failed to flag dunning. Only the FIRST month
+    worked, because activation goes through checkout.session.completed, a different handler.
+
+    Checks the legacy top-level field first, then the new nested location, then the line
+    item — so it works whatever version an event arrives in.
+    """
+    sub = invoice.get("subscription")
+    if sub:
+        return sub
+    parent = invoice.get("parent") or {}
+    sub = (parent.get("subscription_details") or {}).get("subscription")
+    if sub:
+        return sub
+    for line in (invoice.get("lines", {}) or {}).get("data", []):
+        lp = (line.get("parent") or {}).get("subscription_item_details") or {}
+        if lp.get("subscription"):
+            return lp["subscription"]
+    return None
+
+
 def _handle_invoice_paid(invoice: dict, event_id: str):
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)
     if not sub_id:
         return
     conn = new_connection()
@@ -3310,7 +3409,7 @@ def _handle_payment_failed(invoice: dict, event_id: str):
     (dunning) for days, and the terminal canceled/unpaid is handled by
     _handle_subscription_ended. The flag is cleared automatically by the next successful
     invoice.paid (recovery)."""
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)   # see _invoice_subscription_id: the id moved
     if not sub_id:
         return
     conn = new_connection()

@@ -7,6 +7,8 @@ non-training image once already (built Dockerfile instead of Dockerfile.unified)
 """
 import os
 import runpy
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -29,8 +31,16 @@ class Routing(unittest.TestCase):
             calls.append((cmd, kw.get("cwd")))
             return mock.Mock(returncode=train_rc)
 
+        # entrypoint now runs a mandatory GPU preflight before routing. These tests exercise
+        # the ROUTING logic, i.e. the case where the preflight PASSED, so neutralise it with a
+        # no-op module. (The gating behaviour on preflight FAILURE is proven live in
+        # test_preflight_ordering.)
+        fake_preflight = types.ModuleType("gpu_preflight")
+        fake_preflight.run_preflight = lambda **k: None
+
         code = None
         with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.dict(sys.modules, {"gpu_preflight": fake_preflight}), \
              mock.patch("os.execvp", fake_exec), \
              mock.patch("os.chdir", chdirs.append), \
              mock.patch("subprocess.run", fake_run):
@@ -92,6 +102,21 @@ class Routing(unittest.TestCase):
             {"MODE": "train_infer", "JOB_ID": "j1", "USER_ID": "u1"})
         self.assertNotEqual(script, "run_training.py")
         self.assertEqual(script, "main.py")
+
+    # ── preflight-only diagnostic mode ────────────────────────────────────────
+    def test_preflight_only_exits_before_any_dispatch(self):
+        # infer mode + PREFLIGHT_ONLY: preflight passes (stubbed), then exit 0, no dispatch.
+        script, calls, code = self._run({"MODE": "infer", "PREFLIGHT_ONLY": "1"})
+        self.assertIsNone(script, "preflight-only must not exec any script")
+        self.assertEqual(calls, [], "preflight-only must not start training")
+        self.assertEqual(code, 0)
+
+    def test_preflight_only_blocks_training_in_fused_mode(self):
+        script, calls, code = self._run(
+            {"MODE": "train_infer", "JOB_ID": "j1", "USER_ID": "u1", "PREFLIGHT_ONLY": "true"})
+        self.assertIsNone(script, "must not generate")
+        self.assertEqual(calls, [], "must NOT start the ~35-min training phase")
+        self.assertEqual(code, 0)
 
     def test_alias_spellings_and_whitespace_and_case(self):
         for m in ("train+infer", "train_and_infer", "fused",

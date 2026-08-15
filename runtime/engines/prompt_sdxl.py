@@ -57,11 +57,36 @@ class SdxlPromptEngine:
 
         _negative = os.environ.get("NEGATIVE_PROMPT", cfg.NEGATIVE_PROMPT)
 
+        # Expression control (experiments E1/E2). DEFAULT OFF ("" => baseline byte-identical).
+        # EXPRESSION_CLAUSE appends to the base txt2img positive ONLY (generation-level, E1).
+        # FACE_EXPRESSION_CLAUSE appends to the face-refine face_prompt ONLY (enhancement-level, E2).
+        # Isolated on purpose so the two stages are tested one at a time; neither touches the
+        # realism prompt or the negative.
+        _expr = os.environ.get("EXPRESSION_CLAUSE", "").strip()
+        _expr_suffix = f" {_expr}." if _expr else ""
+        _face_expr = os.environ.get("FACE_EXPRESSION_CLAUSE", "").strip()
+
         # Subject clause built ONCE from the user's REAL attributes (no beauty/idealization).
         subj = f"{cfg.IDENTITY_TRIGGER} {subject}" if cfg.IDENTITY_TRIGGER else f"a {subject}"
         if age_phrase:
             subj += f" {age_phrase}"
         subj += cfg.hair_phrase(hair_color)
+        # Body build (DEFAULT OFF — byte-identical to baseline until validated on GPU, same
+        # discipline as EXPRESSION_CLAUSE). Two sources, in order:
+        #   1. plan.body_type (slim|average|athletic|heavy) — PER-PERSON, when we can source a
+        #      real build. Renders the actual physique, so a real gym-goer stays muscular and a
+        #      slim person stays slim (NOT a global negative-prompt suppressor, which mis-sizes).
+        #   2. BODY_BUILD_CLAUSE env — a global neutral nudge (e.g. "with a natural, realistic
+        #      body build") for A/B testing the anti-"gym-bulk" effect before making it a default.
+        # Neither set => no body clause => prompt unchanged.
+        _body = (plan.body_type or "").strip().lower()
+        if _body in ("slim", "average", "athletic", "heavy"):
+            article = "an" if _body[0] in "aeiou" else "a"
+            subj += f", with {article} {_body} build"
+        else:
+            _body_default = os.environ.get("BODY_BUILD_CLAUSE", "").strip()
+            if _body_default:
+                subj += f", {_body_default}"
         _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
                  "skin texture, shot on a DSLR with an 85mm portrait lens.")
 
@@ -79,7 +104,7 @@ class SdxlPromptEngine:
                 combo_label = "custom_scene"
                 lead = catalog.lead_phrase("custom_scene")
                 lighting = cfg.LIGHTING[i % len(cfg.LIGHTING)]
-                positive = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}"
+                positive = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}{_expr_suffix}"
             else:
                 attire_ref, bg_ref = combos[i % len(combos)]
                 attire = catalog.attire_phrase_ref(attire_ref, gkey)
@@ -88,7 +113,7 @@ class SdxlPromptEngine:
                 _lighting = catalog.lighting_for_background_ref(bg_ref, cfg.LIGHTING)
                 lighting = _lighting[(i // len(combos)) % len(_lighting)]
                 combo_label = f"{bg_ref} | {attire_ref}"
-                positive = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}"
+                positive = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}{_expr_suffix}"
             prompts.append(Prompt(positive=positive, negative=_negative, seed=seed,
                                   combo_label=combo_label, slot_id=i))
 
@@ -101,5 +126,6 @@ class SdxlPromptEngine:
             f"close-up portrait photograph of {subj}, face in sharp focus, highly "
             f"detailed eyes, natural realistic skin texture with visible pores and fine "
             f"detail, individual hair strands, {_tail}"
+            + (f" {_face_expr}." if _face_expr else "")
         )
         return PromptSet(tuple(prompts))

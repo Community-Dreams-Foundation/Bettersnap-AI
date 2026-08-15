@@ -62,6 +62,11 @@ properties:
             value: bettersnap-srv.database.windows.net
           - name: SQL_DATABASE
             value: bettersnap-db
+          # Pin the FROZEN identity-strength value (DECISIONS.md A1). An A/B (female + male)
+          # rejected 0.6 (reference bleed, fights the attire/scene prompt). main.py defaults
+          # to 0.2 already, but pinning it here stops a deploy from ever silently reverting.
+          - name: IP_ADAPTER_SCALE
+            value: "0.2"
         # No volumeMounts: the model is baked into the image, so the /models
         # AzureFile mount (and the top-level `volumes:` block) is gone. The
         # 'models' Azure File share can be decommissioned once SDXL is validated.
