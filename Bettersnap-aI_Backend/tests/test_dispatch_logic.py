@@ -1809,6 +1809,10 @@ class StripePaidGrantTests(unittest.TestCase):
                 self.rowcount = 1
                 return self
 
+            def fetchone(self):
+                # Feeds the post-reset renewal-ledger lookup (user_id, credits_monthly_limit).
+                return ("u-renew", 100)
+
         class Conn:
             def __init__(self):
                 self.cur = Cursor()

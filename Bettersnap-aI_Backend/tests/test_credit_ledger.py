@@ -18,13 +18,11 @@ if BACKEND_DIR not in sys.path:
 
 from shared import credit_ledger  # noqa: E402
 
-# credit_ledger merged as a LATENT module (shared/credit_ledger.py + migration 022_credit_ledger)
-# whose unit tests below pass, but the dev-trunk billing this branch merged into does NOT yet
-# write to the ledger. Wiring credit_ledger.record() into _handle_onetime_payment ALONE would
-# produce a misleading PARTIAL audit trail (reserves/refunds/monthly renewals unrecorded); a
-# correct ledger records EVERY credit write, which is a deliberate follow-up across all billing
-# paths. These two integration tests are skipped until that wiring lands — re-enable them then.
-_LEDGER_NOT_WIRED = "credit_ledger present but not yet wired into dev-trunk billing (deferred follow-up)"
+# credit_ledger is now WIRED into dev-trunk billing: reserve_job_slot (spend), the retrain
+# charge, and every Stripe grant/renewal/topup + the refund path each append a signed ledger
+# row in their own transaction. The two integration tests below exercise the one-time grant
+# path against dev's ACTUAL handler (which returns None and RAISES for Stripe-retry on a
+# missing user, rather than returning a bool).
 
 
 class RecordingCursor:
@@ -104,18 +102,21 @@ def _run_onetime(monkeypatch, user_exists):
     return result, conn
 
 
-@pytest.mark.skip(reason=_LEDGER_NOT_WIRED)
 def test_onetime_grants_and_ledgers_when_user_exists(monkeypatch):
-    ok, conn = _run_onetime(monkeypatch, user_exists=True)
-    assert ok is True                      # webhook will 200
+    _, conn = _run_onetime(monkeypatch, user_exists=True)  # dev's handler returns None
     assert conn.committed is True
     assert len(conn._cur.ledger_rows) == 1  # exactly one grant row
     assert conn._cur.ledger_rows[0][2] == "purchase_one_time"
 
 
-@pytest.mark.skip(reason=_LEDGER_NOT_WIRED)
-def test_onetime_returns_false_and_no_ledger_when_user_missing(monkeypatch):
-    ok, conn = _run_onetime(monkeypatch, user_exists=False)
-    assert ok is False                     # webhook will 500 → Stripe retries
-    assert conn.rolled_back is True        # event NOT recorded → retry reprocesses
+def test_onetime_raises_and_no_ledger_when_user_missing(monkeypatch):
+    import function_app
+    conn = RecordingConn(user_exists=False)
+    monkeypatch.setattr(function_app, "new_connection", lambda: conn)
+    plan = next(iter(function_app.ONE_TIME_PLANS))
+    session = {"metadata": {"user_id": "u-123", "plan": plan, "payment_type": "one_time"}}
+    # Dev raises for a non-2xx Stripe retry (not a return-False) when the user row is absent.
+    with pytest.raises(function_app.RetryableStripeWebhookError):
+        function_app._handle_onetime_payment(session, "evt_test_1")
+    assert conn.rolled_back is True        # event NOT recorded → Stripe retry reprocesses
     assert conn._cur.ledger_rows == []     # nothing granted, nothing ledgered

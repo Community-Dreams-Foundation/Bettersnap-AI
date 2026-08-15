@@ -39,9 +39,9 @@ class FakeCursor:
                 self.rowcount = 1
             else:
                 self.rowcount = 0
-        elif "select job_params, user_id from jobs" in s:
+        elif "select job_params, user_id, source_type from jobs" in s:
             jid = params[0]
-            self._fetch = (J[jid]["job_params"], J[jid]["user_id"])
+            self._fetch = (J[jid]["job_params"], J[jid]["user_id"], J[jid].get("source_type"))
         elif "update users set credits_remaining" in s:
             refund, jid = params[0], params[1]
             uid = J[jid]["user_id"]
@@ -136,16 +136,9 @@ def _preflight_blob(exec_id, exit_code, reason):
                        "result": {"ok": False, "exit_code": exit_code, "reason": reason}}).encode()
 
 
-# exec_reconcile merged as a LATENT module (shared/exec_reconcile.py, unit-tested by
-# test_exec_reconcile.py which passes). Its function_app.py reaper wiring
-# (_fetch_execution_outcome / _reconcile_execution_outcome, and the reaper calling them) was
-# NOT ported: dev's trunk reaper (find_execution_for_job + guarded _mark_failed refund) won the
-# function_app.py merge. Integrating exec_reconcile's infra-failure-aware refund into dev's
-# reaper is a deliberate follow-up on the refund path; these wiring tests are skipped until then.
-_RECONCILE_NOT_WIRED = "exec_reconcile present but not wired into dev-trunk reaper (deferred follow-up)"
-
-
-@unittest.skip(_RECONCILE_NOT_WIRED)
+# exec_reconcile is now WIRED into dev's reaper: for each stuck job the reaper calls
+# _fetch_execution_outcome -> _reconcile_execution_outcome (classify -> stamp + _mark_failed on
+# ACTION_REFUND), falling back to a labelled fail+refund when no execution outcome is readable.
 class InfraRefundIntegrationTests(unittest.TestCase):
     def setUp(self):
         STATE["jobs"].clear(); STATE["users"].clear(); STATE["blobs"].clear()
@@ -209,7 +202,6 @@ class InfraRefundIntegrationTests(unittest.TestCase):
         self.assertIsNone(function_app._fetch_execution_outcome("J1"))
 
 
-@unittest.skip(_RECONCILE_NOT_WIRED)
 class ReaperWiringTests(unittest.TestCase):
     """Prove the classifier is actually invoked from the live reaper path (not dormant)."""
     def setUp(self):

@@ -132,6 +132,8 @@ from shared.auth import validate_token, get_user_id
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
 from shared.training_reservation import reserve_training_slot
+from shared import credit_ledger
+from shared import exec_reconcile
 from shared.queue_client import enqueue_job, INFERENCE_QUEUE, TRAINING_QUEUE
 from shared.outbox import outbox_add, outbox_try_send_now
 from shared.blob import upload_blob, download_blob, get_blob_client
@@ -1816,6 +1818,12 @@ def _mark_failed(job_id: str):
                     "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
                     refund, job_id,
                 )
+            # Ledger the refund (positive), in the SAME transaction as the state transition +
+            # balance restore so it can never double-count. r[1] is the job's user_id (guard
+            # the read: if the row is unexpectedly gone we still refund via the subquery UPDATE
+            # above, we just can't attribute a ledger row).
+            if r and len(r) > 1 and r[1]:
+                credit_ledger.record(cur, r[1], refund, credit_ledger.REASON_JOB_REFUND, job_id)
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
@@ -1823,6 +1831,86 @@ def _mark_failed(job_id: str):
         )
     finally:
         conn.close()
+
+
+def _stamp_failure_class(job_id, failure_class, reason, execution_id):
+    """Record WHY a job failed, idempotently, inside job_params JSON (no schema change).
+
+    This is what stops an infrastructure failure from being silently indistinguishable from
+    a customer/model failure: it preserves the diagnostic reason + the ACA execution id.
+    Idempotent — if a `_failure` stamp already exists it is left untouched, so reconciliation
+    retries never rewrite the first (authoritative) reason."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
+        row = cur.fetchone()
+        if not row:
+            return
+        try:
+            params = json.loads(row[0]) if row[0] else {}
+        except (TypeError, ValueError):
+            params = {}
+        if isinstance(params.get("_failure"), dict):
+            return  # already stamped
+        params["_failure"] = {
+            "class": failure_class,
+            "reason": reason,
+            "execution_id": execution_id,
+            "is_infra": failure_class in exec_reconcile.INFRA_CLASSES,
+        }
+        cur.execute("UPDATE jobs SET job_params = ? WHERE job_id = ?",
+                    json.dumps(params), job_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fetch_execution_outcome(job_id):
+    """Best-effort: recover a job's execution outcome for classification WITHOUT a new Azure
+    dependency, by reading the diagnostics blob the GPU preflight wrote before exiting
+    (gpu_preflight.write_diagnostic -> diagnostics/preflight/<execution_id>.json). The blob
+    carries the exact preflight exit_code + reason, which the ARM execution object does not
+    expose. Returns an exec_data dict or None (caller then uses the timeout safety net)."""
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT external_execution_id FROM jobs WHERE job_id = ?", job_id)
+            r = cur.fetchone()
+        finally:
+            conn.close()
+        exec_id = r[0] if r else None
+        if not exec_id:
+            return None
+        raw = download_blob("diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
+        diag = json.loads(raw)
+        result = diag.get("result") or {}
+        return {
+            "exit_code": result.get("exit_code"),
+            "reason": "ProcessExited",
+            "events": [],
+            "execution_id": diag.get("execution_id") or exec_id,
+            "diagnostic_reason": result.get("reason"),
+        }
+    except Exception:
+        return None
+
+
+def _reconcile_execution_outcome(job_id, exec_data, now, *,
+                                 mark_failed=None, stamp=None, classify=None):
+    """Classify one execution outcome and, when a refund is owed, stamp the class+reason and
+    fail+refund EXACTLY ONCE. The one-refund guarantee is _mark_failed's rowcount guard
+    (status NOT IN ('failed','completed')); stamping is separately idempotent. Deps are
+    injectable so this is unit-tested with no DB/Azure."""
+    mark_failed = mark_failed or _mark_failed
+    stamp = stamp or _stamp_failure_class
+    classify = classify or exec_reconcile.classify_execution
+    decision = classify(exec_data, now)
+    if decision["action"] == exec_reconcile.ACTION_REFUND:
+        stamp(job_id, decision["failure_class"], decision["reason"], decision["execution_id"])
+        mark_failed(job_id)   # idempotent; refunds only on the real state transition
+    return decision
 
 
 def _revert_claim(job_id: str):
@@ -2340,9 +2428,24 @@ def reaper(timer: func.TimerRequest):
                 continue
         stuck.append(job_id)
 
+    now_ts = datetime.now(timezone.utc).timestamp()
     for job_id in stuck:
-        logging.warning(f"REAPER: failing stuck job_id={job_id}")
-        _mark_failed(job_id)
+        logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
+        exec_data = _fetch_execution_outcome(job_id)   # best-effort (reads preflight diag blob)
+        if exec_data is not None:
+            # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, operator stop,
+            # or a genuinely-complete/pending job) and fail+refund EXACTLY ONCE with the class
+            # recorded — so an infra failure is never mislabelled as a customer/model failure,
+            # and a job whose container actually delivered (exit 0) is not spuriously refunded.
+            decision = _reconcile_execution_outcome(job_id, exec_data, now_ts)
+            logging.warning(f"REAPER: job_id={job_id} class={decision['failure_class']} "
+                            f"infra={decision['is_infra']} action={decision['action']}")
+        else:
+            # Safety net (dev's original fail+refund behaviour + a class): stuck past the timeout
+            # with no readable outcome -> fail+refund once, labelled an unclassified infra timeout.
+            _stamp_failure_class(job_id, "infra_timeout",
+                                 "reaper timeout; execution outcome unavailable", None)
+            _mark_failed(job_id)
 
 
 # ── Outbox dispatcher ─────────────────────────────────────────────────────────
@@ -3201,7 +3304,8 @@ def _handle_onetime_payment(session: dict, event_id: str):
             raise RetryableStripeWebhookError(
                 f"one_time grant matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_ONE_TIME)
+        conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
     finally:
         conn.close()
@@ -3275,7 +3379,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             raise RetryableStripeWebhookError(
                 f"monthly activation matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + activation commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
+        conn.commit()  # claim + activation + ledger row commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
     finally:
         conn.close()
@@ -3323,7 +3428,8 @@ def _handle_topup(session: dict, event_id: str):
             WHERE user_id = ? AND subscription_type = 'monthly'""",
             add_on_credits, add_on_credits, pack, prow[0], user_id,
         )
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, add_on_credits, credit_ledger.REASON_TOPUP)
+        conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(
             f"Persistent add-on: user={user_id} pack={pack} "
             f"+{add_on_credits} add-on credits ({images} images)"
@@ -3397,7 +3503,15 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             )
             raise RetryableStripeWebhookError(
                 f"invoice grant matched no subscription: subscription={sub_id}")
-        conn.commit()  # claim + reset commit atomically
+        # Ledger the renewal grant: the monthly allowance granted this cycle (monthly credits
+        # reset to the limit rather than rolling over, so the grant is the full limit).
+        cur.execute(
+            "SELECT user_id, credits_monthly_limit FROM users WHERE stripe_subscription_id = ?",
+            sub_id)
+        urow = cur.fetchone()  # stripe_subscription_id is unique per user → at most one row
+        if urow:
+            credit_ledger.record(cur, urow[0], int(urow[1] or 0), credit_ledger.REASON_RENEWAL)
+        conn.commit()  # claim + reset + ledger row commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
     finally:
         conn.close()

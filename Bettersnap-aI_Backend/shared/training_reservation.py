@@ -4,6 +4,7 @@ from .db import new_connection
 from .outbox import outbox_add
 from .queue_client import TRAINING_QUEUE
 from .plans import get_plan
+from . import credit_ledger
 
 
 class TrainingReserveResult:
@@ -85,6 +86,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
                 "credits_remaining = credits_remaining - ? WHERE user_id = ?",
                 charge, user_id,
             )
+            # Ledger the retrain spend (record() no-ops when charge==0, i.e. a free retrain).
+            credit_ledger.record(cur, user_id, -charge, credit_ledger.REASON_RETRAIN_CHARGE)
         else:
             cur.execute("UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
 
