@@ -111,7 +111,7 @@ from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_topup_checkout,
     cancel_subscription, find_checkout_session_by_token, get_subscription,
-    reactivate_subscription, create_billing_portal,
+    reactivate_subscription, create_billing_portal, upgrade_subscription,
     monthly_plan_for_price_id, subscription_period_end, verify_webhook,
 )
 
@@ -2324,16 +2324,16 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
             "subscription_type": row[1],
             "plan": row[0],
             "type": row[1],
-            "credits_remaining": row[2],
+            "credits_remaining": row[2] if row[1] == "monthly" else row[7],
             "one_time_credits_remaining": row[7],
             "add_on_credits_remaining": row[7],
-            "monthly_credits_remaining": row[8],
-            "credits_monthly_limit": row[3],
+            "monthly_credits_remaining": row[8] if row[1] == "monthly" else 0,
+            "credits_monthly_limit": row[3] if row[1] == "monthly" else None,
             # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
             # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
             # UI works with no coordinated frontend release.
-            "monthly_quota": row[3],
-            "subscription_renewed_at": _utc_iso(row[4]),
+            "monthly_quota": row[3] if row[1] == "monthly" else None,
+            "subscription_renewed_at": _utc_iso(row[4]) if row[1] == "monthly" else None,
             "next_renewal": next_renewal,
             # ALIAS: Dashboard.tsx / Onboarding.tsx read `renewal_date` — same drift, which is
             # why "renews on {date}" never appeared.
@@ -2672,6 +2672,113 @@ def create_subscription(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+# ── Subscriptions: Upgrade active monthly plan ─────────────
+@app.route(route="subscriptions/upgrade", methods=["POST"])
+def upgrade_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+    target_plan = body.get("plan", "")
+    if target_plan not in MONTHLY_PLANS:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid monthly plan. Choose: basic, pro, expert"}),
+            mimetype="application/json",
+            status_code=400,
+        )
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT subscription_plan, subscription_type, stripe_subscription_id, "
+        "subscription_cancel_at FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cur.fetchone()
+    if not row or row[1] != "monthly" or not row[2]:
+        return func.HttpResponse(
+            json.dumps({"error": "No active monthly subscription to upgrade"}),
+            mimetype="application/json",
+            status_code=409,
+        )
+
+    current_plan = str(row[0] or "").removeprefix("monthly_")
+    plan_order = tuple(MONTHLY_PLANS)
+    if current_plan not in plan_order:
+        return func.HttpResponse(
+            json.dumps({"error": "Current monthly plan could not be identified"}),
+            mimetype="application/json",
+            status_code=409,
+        )
+    if plan_order.index(target_plan) <= plan_order.index(current_plan):
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Choose a higher monthly plan to upgrade",
+                "billing_state": "not_an_upgrade",
+            }),
+            mimetype="application/json",
+            status_code=409,
+        )
+    if row[3]:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Resume the subscription before upgrading it",
+                "billing_state": "cancel_pending",
+            }),
+            mimetype="application/json",
+            status_code=409,
+        )
+
+    stripe_subscription_id = row[2]
+    try:
+        subscription = get_subscription(stripe_subscription_id)
+        items = subscription.get("items", {}).get("data", [])
+        subscription_item_id = items[0].get("id") if items else None
+        if not subscription_item_id:
+            raise ValueError("Stripe subscription has no subscription item")
+        result = upgrade_subscription(
+            stripe_subscription_id,
+            subscription_item_id,
+            target_plan,
+        )
+    except Exception as e:
+        logging.error(
+            f"Stripe monthly upgrade failed: user={user_id} "
+            f"subscription={stripe_subscription_id} target={target_plan}: {e}"
+        )
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error while upgrading the plan"}),
+            mimetype="application/json",
+            status_code=502,
+        )
+
+    if result.get("pending_update"):
+        return func.HttpResponse(
+            json.dumps({
+                "error": "The prorated upgrade payment needs attention. Update your payment method and try again.",
+                "billing_state": "payment_required",
+            }),
+            mimetype="application/json",
+            status_code=409,
+        )
+
+    return func.HttpResponse(
+        json.dumps({
+            "message": "Plan upgraded; Stripe charged the prorated difference",
+            "plan": target_plan,
+            "billing_state": "upgrade_processing",
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
 # ── Subscriptions: Add credits (top-up for an active monthly plan) ──
 # The counterpart to the create_subscription gate (finding #6): while a monthly plan is
 # active, the user does NOT buy another plan — they add credits, generated from their
@@ -2955,11 +3062,17 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 subscription_plan = ?,
                 subscription_type = 'one_time',
                 plan_name         = ?,
-                credits_remaining = credits_remaining + ?,
+                credits_remaining = one_time_credits_remaining + ?,
                 one_time_credits_remaining = one_time_credits_remaining + ?,
+                monthly_credits_remaining = 0,
+                credits_monthly_limit = NULL,
+                subscription_renewed_at = NULL,
+                subscription_cancel_at = NULL,
+                payment_failed_at = NULL,
                 one_time_plan     = ?,
                 one_time_plan_name = ?
-            WHERE user_id = ?""",
+            WHERE user_id = ?
+              AND NOT (subscription_type = 'monthly' AND stripe_subscription_id IS NOT NULL)""",
             plan, plan_key_for(plan, "one_time"), credits, credits,
             plan, plan_key_for(plan, "one_time"), user_id,
         )
@@ -3118,6 +3231,18 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping credit reset.")
             return
+        if invoice.get("billing_reason") == "subscription_update":
+            cur.execute(
+                "UPDATE users SET payment_failed_at = NULL "
+                "WHERE stripe_subscription_id = ?",
+                sub_id,
+            )
+            conn.commit()
+            logging.info(
+                f"Prorated upgrade invoice paid for subscription={sub_id}; "
+                "credit delta is handled by customer.subscription.updated."
+            )
+            return
         cur.execute(
             """UPDATE users SET
                 credits_remaining       = credits_monthly_limit + one_time_credits_remaining,
@@ -3195,15 +3320,36 @@ def _handle_subscription_updated(sub: dict, event_id: str):
             return
         credits = MONTHLY_PLANS[plan]["credits"]
         cur.execute(
+            "SELECT credits_monthly_limit, monthly_credits_remaining, "
+            "one_time_credits_remaining FROM users WHERE stripe_subscription_id = ?",
+            sub_id,
+        )
+        balance_row = cur.fetchone()
+        if not balance_row:
+            conn.rollback()
+            logging.error(f"Subscription update matched no user: subscription={sub_id}")
+            return
+        old_limit = int(balance_row[0] or 0)
+        monthly_remaining = int(balance_row[1] or 0)
+        add_on_remaining = int(balance_row[2] or 0)
+        if credits > old_limit:
+            monthly_remaining += credits - old_limit
+        elif credits < old_limit:
+            monthly_remaining = min(monthly_remaining, credits)
+        total_remaining = monthly_remaining + add_on_remaining
+        cur.execute(
             """UPDATE users SET
                 subscription_plan      = ?,
                 subscription_type      = 'monthly',
                 plan_name              = ?,
+                credits_remaining      = ?,
+                monthly_credits_remaining = ?,
                 credits_monthly_limit  = ?,
                 subscription_cancel_at = ?,
                 retention_expires_at   = NULL
             WHERE stripe_subscription_id = ?""",
-            plan, plan_key_for(plan, "monthly"), credits, cancel_at, sub_id,
+            plan, plan_key_for(plan, "monthly"), total_remaining,
+            monthly_remaining, credits, cancel_at, sub_id,
         )
         if cur.rowcount == 0:
             conn.rollback()

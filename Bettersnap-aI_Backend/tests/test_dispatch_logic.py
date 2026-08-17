@@ -219,6 +219,20 @@ class FakeCursor:
             if "subscription_renewed_at" in s:
                 values.append(self.cfg.get("subscription_renewed_at"))
             self._fetch = tuple(values)
+        elif "select subscription_plan, subscription_type, stripe_subscription_id" in s:
+            self._fetch = (
+                self.cfg.get("subscription_plan", "pro"),
+                self.cfg.get("subscription_type"),
+                self.cfg.get("stripe_subscription_id"),
+                self.cfg.get("subscription_cancel_at"),
+            )
+        elif ("select credits_monthly_limit, monthly_credits_remaining" in s
+              and "one_time_credits_remaining" in s):
+            self._fetch = (
+                self.cfg.get("credits_monthly_limit", 200),
+                self.cfg.get("monthly_credits", 20),
+                self.cfg.get("one_time_credits", 0),
+            )
         elif "select stripe_customer_id from users" in s:
             customer_id = self.cfg.get("stripe_customer_id")
             self._fetch = (customer_id,) if customer_id else None
@@ -252,6 +266,10 @@ class FakeCursor:
             self.rowcount = self.cfg.get("subscription_update_rowcount", 1)
         elif "stripe_checkout_token   = null" in s and "update users set" in s:
             self.rowcount = self.cfg.get("monthly_activation_rowcount", 1)
+        elif ("subscription_type = 'one_time'" in s
+              and "one_time_credits_remaining" in s
+              and "update users set" in s):
+            self.rowcount = self.cfg.get("one_time_payment_rowcount", 1)
         # subscription_status: plan/type/credits/quota/renewed/failed/cancel_at
         elif "select subscription_plan, subscription_type" in s:
             self._fetch = self.cfg.get(
@@ -782,6 +800,22 @@ class BillingGateTests(unittest.TestCase):
         self.assertEqual(body["add_on_credits_remaining"], 40)
         self.assertEqual(body["monthly_credits_remaining"], 120)
 
+    def test_one_time_status_hides_stale_monthly_fields(self):
+        self._cfg["sub_status_row"] = (
+            "basic", "one_time", 230, 20,
+            function_app.datetime(2026, 8, 10), None, None, 250, 200,
+        )
+
+        response = function_app.subscription_status(self._req())
+        body = json.loads(response.body)
+
+        self.assertEqual(body["credits_remaining"], 250)
+        self.assertEqual(body["one_time_credits_remaining"], 250)
+        self.assertEqual(body["monthly_credits_remaining"], 0)
+        self.assertIsNone(body["credits_monthly_limit"])
+        self.assertIsNone(body["monthly_quota"])
+        self.assertIsNone(body["subscription_renewed_at"])
+
     def test_topup_requires_active_monthly(self):
         # A non-subscriber cannot buy loose credits — they buy a plan.
         self._cfg.update(subscription_type=None, stripe_subscription_id=None)
@@ -887,6 +921,24 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         self.assertEqual(event["id"], "evt_rotating")
 
+    def test_stripe_upgrade_invoices_proration_and_preserves_cycle_anchor(self):
+        from shared import stripe_client
+
+        with mock.patch.object(
+            stripe_client, "_price_id", return_value="price_monthly_pro",
+        ), mock.patch.object(
+            stripe_client, "_post", return_value={"id": "sub_123"},
+        ) as post:
+            stripe_client.upgrade_subscription("sub_123", "si_123", "pro")
+
+        path, params = post.call_args.args[:2]
+        self.assertEqual(path, "subscriptions/sub_123")
+        self.assertEqual(params["items[0][id]"], "si_123")
+        self.assertEqual(params["items[0][price]"], "price_monthly_pro")
+        self.assertEqual(params["proration_behavior"], "always_invoice")
+        self.assertEqual(params["payment_behavior"], "pending_if_incomplete")
+        self.assertNotIn("billing_cycle_anchor", params)
+
     def test_cancel_subscription_reads_period_end_from_stripe_items(self):
         self._cfg.update(
             subscription_type="monthly",
@@ -977,7 +1029,12 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         )
         self.assertIsNotNone(update_params[3])
 
-    def test_b2_active_subscription_update_syncs_plan_without_resetting_credits(self):
+    def test_active_subscription_upgrade_adds_only_plan_credit_delta(self):
+        self._cfg.update(
+            credits_monthly_limit=200,
+            monthly_credits=75,
+            one_time_credits=250,
+        )
         subscription = {
             "id": "sub_123",
             "status": "active",
@@ -992,13 +1049,71 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         updates = [
             (sql, params) for sql, params in self._cfg["executed"]
             if "credits_monthly_limit" in sql.lower()
+            and "update users set" in sql.lower()
             and "where stripe_subscription_id = ?" in sql.lower()
         ]
         self.assertEqual(len(updates), 1)
         sql, params = updates[0]
-        self.assertNotIn("credits_remaining", sql.lower())
+        self.assertIn("credits_remaining", sql.lower())
         self.assertEqual(params[0], "expert")
+        self.assertEqual(params[2], 425)
+        self.assertEqual(params[3], 175)
+        self.assertEqual(params[4], 300)
         self.assertEqual(params[-1], "sub_123")
+
+    def test_prorated_upgrade_invoice_does_not_reset_spent_credits(self):
+        function_app._handle_invoice_paid(
+            {
+                "subscription": "sub_123",
+                "billing_reason": "subscription_update",
+            },
+            "evt_upgrade_invoice",
+        )
+
+        sqls = [sql.lower() for sql, _ in self._cfg["executed"]]
+        self.assertFalse(any(
+            "monthly_credits_remaining = credits_monthly_limit" in sql
+            for sql in sqls
+        ))
+        self.assertTrue(any("payment_failed_at = null" in sql for sql in sqls))
+
+    def test_upgrade_endpoint_prorates_existing_subscription(self):
+        self._cfg.update(
+            subscription_plan="basic",
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+        stripe_subscription = {
+            "id": "sub_123",
+            "items": {"data": [{"id": "si_123"}]},
+        }
+        with mock.patch.object(
+            function_app, "get_subscription", return_value=stripe_subscription,
+        ), mock.patch.object(
+            function_app,
+            "upgrade_subscription",
+            return_value={"id": "sub_123", "pending_update": None},
+        ) as upgrade:
+            response = function_app.upgrade_user_subscription(
+                self._req({"plan": "pro"})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upgrade.assert_called_once_with("sub_123", "si_123", "pro")
+
+    def test_upgrade_endpoint_rejects_same_or_lower_plan(self):
+        self._cfg.update(
+            subscription_plan="pro",
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+
+        response = function_app.upgrade_user_subscription(
+            self._req({"plan": "basic"})
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("not_an_upgrade", response.body)
 
     def test_monthly_checkout_parks_existing_one_time_balance(self):
         function_app._handle_monthly_checkout(
@@ -1029,6 +1144,29 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             "credits_remaining = ? +",
             activation_sql.lower(),
         )
+
+    def test_repeated_one_time_purchase_rebuilds_total_and_clears_monthly_state(self):
+        function_app._handle_onetime_payment(
+            {"metadata": {"user_id": "user-1", "plan": "basic"}},
+            "evt_one_time_again",
+        )
+
+        sql, params = next(
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "subscription_type = 'one_time'" in sql.lower()
+            and "one_time_credits_remaining" in sql.lower()
+            and "update users set" in sql.lower()
+        )
+        normalized = sql.lower()
+        self.assertIn(
+            "credits_remaining = one_time_credits_remaining + ?",
+            normalized,
+        )
+        self.assertIn("monthly_credits_remaining = 0", normalized)
+        self.assertIn("credits_monthly_limit = null", normalized)
+        self.assertIn("subscription_renewed_at = null", normalized)
+        self.assertEqual(params[2], 30)
+        self.assertEqual(params[3], 30)
 
     def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
         function_app._handle_subscription_ended(
