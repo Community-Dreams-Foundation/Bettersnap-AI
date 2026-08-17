@@ -241,30 +241,25 @@ def create_billing_portal(stripe_customer_id: str, return_url: str) -> dict:
         "return_url": return_url,
     })
 
-
 def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    if not webhook_secret:
-        webhook_secret = get_secret("stripe-webhook-secret")
+    # env override first (features-stripe), then Key Vault (dev) — either source works.
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET") or get_secret("stripe-webhook-secret")
 
-    # Stripe can include more than one v1 signature while rotating a webhook secret.
-    # A dict would collapse duplicate v1 keys and could discard the only valid signature,
-    # so preserve every v1 value exactly as sent.
+    # Preserve repeated v1 fields. During webhook-secret rotation Stripe can send more than
+    # one v1 signature; a dict would silently keep only the last and could drop the valid one.
     timestamp = ""
     signatures = []
-    for part in sig_header.split(","):
+    for part in (sig_header or "").split(","):
         key, separator, value = part.strip().partition("=")
         if not separator:
             continue
-        if key == "t":
+        if key == "t" and not timestamp:
             timestamp = value
         elif key == "v1":
             signatures.append(value)
 
-    if not timestamp:
-        raise ValueError("Missing webhook timestamp")
-    if not signatures:
-        raise ValueError("Missing webhook v1 signature")
+    if not timestamp or not signatures:
+        raise ValueError("Invalid Stripe-Signature header")
 
     if abs(time.time() - int(timestamp)) > 300:
         raise ValueError("Webhook timestamp too old")

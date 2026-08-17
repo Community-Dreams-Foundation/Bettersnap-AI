@@ -1,4 +1,5 @@
 import os
+import hmac
 import jwt
 import logging
 from jwt import PyJWKClient
@@ -42,6 +43,29 @@ def _get_jwks_client() -> PyJWKClient:
 
 
 def validate_token(token: str) -> dict:
+    # ── QA-ONLY TEST-AUTH PATH — env-gated, NON-PRODUCTION ONLY ───────────────────
+    # Lets a single designated test account authenticate for end-to-end testing WITHOUT
+    # the Entra email-OTP flow (no real inbox needed). It is COMPLETELY INERT unless BOTH
+    # gates below are set on the Function App — which must ONLY ever be done on a sandbox /
+    # test app, NEVER in production:
+    #     TEST_AUTH_ENABLED = "1"
+    #     TEST_AUTH_SECRET  = <a long random secret>     (token must equal "test:<secret>")
+    # Optional identity overrides: TEST_AUTH_OID, TEST_AUTH_EMAIL.
+    # Testers send   Authorization: Bearer test:<secret>   and get a session as the test user.
+    # In production TEST_AUTH_ENABLED is unset, so this block is skipped entirely and the real
+    # Entra validation below is the only path. If this warning ever appears in prod logs,
+    # UNSET TEST_AUTH_ENABLED immediately.
+    if os.environ.get("TEST_AUTH_ENABLED") == "1":
+        secret = os.environ.get("TEST_AUTH_SECRET") or ""
+        if secret and hmac.compare_digest(token, f"test:{secret}"):
+            oid = os.environ.get("TEST_AUTH_OID", "11111111-1111-4111-8111-111111111111")
+            email = os.environ.get("TEST_AUTH_EMAIL", "kumar-test@bettersnap.ai")
+            logging.warning(
+                "TEST-AUTH bypass used (non-prod only): oid=%s email=%s — if this is "
+                "production, UNSET TEST_AUTH_ENABLED now.", oid, email)
+            return {"oid": oid, "email": email, "preferred_username": email,
+                    "name": "Kumar Test", "iss": "test-auth", "aud": "test-auth"}
+
     try:
         aud = os.environ.get("ENTRA_AUD")
         iss = os.environ.get("ENTRA_ISSUER")
@@ -73,7 +97,6 @@ def validate_token(token: str) -> dict:
                 "verify_iss": True,
             },
         )
-        logging.info(f"Token validated: oid={payload.get('oid')}")
         return payload
     except Exception as e:
         logging.warning(f"Token validation failed: {e}")

@@ -3,7 +3,9 @@ import os
 import hmac
 import json
 import logging
+import re
 import uuid
+from uuid import UUID, uuid4
 from datetime import datetime, timedelta, timezone
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
@@ -42,6 +44,33 @@ def _utc_iso(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _route_job_id(req):
+    """Return a canonical GUID string, or None for a malformed/missing route id."""
+    try:
+        return str(UUID(req.route_params.get("job_id", "")))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+$")
+
+
+def _normalize_profile_email(value):
+    """Validate and canonicalize a client-supplied profile email."""
+    if not isinstance(value, str):
+        raise ValueError("email must be a string")
+    email = value.strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
+        raise ValueError("invalid email format")
+    return email
+
+
+def _is_duplicate_email_error(exc):
+    """Recognize SQL Server unique-index violations specifically involving email."""
+    detail = " ".join(str(arg) for arg in getattr(exc, "args", (exc,))).lower()
+    return ("2601" in detail or "2627" in detail) and "email" in detail
 # Head start for the FUSED train+generate path (MODE=train_infer, see _dispatch_training).
 # The dispatcher fuses only if the user's generation job is ALREADY parked in
 # 'waiting_lora' when it runs. The frontend calls /train first and /jobs/submit second, and
@@ -80,6 +109,10 @@ MIN_UPLOAD_DIM    = int(os.environ.get("MIN_UPLOAD_DIM", "256"))                
 MAX_UPLOAD_DIM    = int(os.environ.get("MAX_UPLOAD_DIM", "8192"))                    # px
 MAX_UPLOAD_PIXELS = int(os.environ.get("MAX_UPLOAD_PIXELS", str(40_000_000)))        # 40 MP
 _ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "MPO"}   # MPO = multi-frame JPEG from phones
+# User profile attributes are persisted in job_params and interpolated into the
+# generation prompt. Bound them before either happens; they remain free text for
+# compatibility with existing clients and internationalized hair descriptions.
+MAX_PROFILE_ATTRIBUTE_CHARS = 40
 # Measured training wall-time is ~51 min (17.6 class-image gen + 28.1 train + startup).
 # The watcher fails a run that blows past this, releasing any jobs parked behind it.
 TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
@@ -98,6 +131,9 @@ from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 from shared.auth import validate_token, get_user_id
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
+from shared.training_reservation import reserve_training_slot
+from shared import credit_ledger
+from shared import exec_reconcile
 from shared.queue_client import enqueue_job, INFERENCE_QUEUE, TRAINING_QUEUE
 from shared.outbox import outbox_add, outbox_try_send_now
 from shared.blob import upload_blob, download_blob, get_blob_client
@@ -145,6 +181,48 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
+# Tables whose user_id FKs to users.user_id. A returning user's whole history/credits/
+# subscriptions hang off these, so an identity migration MUST move them too or it strands
+# the data (and leaves FK-orphan rows). Keep in sync with the schema (sys.foreign_keys).
+_USER_CHILD_TABLES = ("jobs", "lora_models", "credit_transactions", "subscriptions")
+
+
+def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
+    """Supabase→Entra split-identity self-heal.
+
+    A returning user signs in under a NEW Entra oid, but their account row already exists under
+    an OLD id keyed to the same email (created pre-migration). A plain INSERT then 500s on the
+    UX_users_email_real unique index and locks them out forever (measured: 4 users, 29 failed
+    logins). Instead, MOVE the account row AND every child row to the new oid so future oid
+    lookups match and their history/credits follow them.
+
+    FK-safe order, one transaction: free the old email → copy the row under the new id
+    (preserving credits/plan/subscription/stripe state) → repoint children → delete old row.
+    """
+    cursor.execute("UPDATE users SET email = NULL WHERE user_id = ?", old_user_id)
+    cursor.execute("""
+        INSERT INTO users (user_id, email, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name)
+        SELECT ?, ?, full_name, auth_provider, subscription_tier,
+            subscription_start, subscription_end, grace_period_end, credits_remaining, created_at,
+            plan_name, lora_status, retrain_count, retention_expires_at, subscription_plan,
+            subscription_type, stripe_customer_id, stripe_subscription_id, credits_monthly_limit,
+            subscription_renewed_at, terms_accepted_at, payment_failed_at, subscription_cancel_at,
+            stripe_checkout_token, stripe_checkout_expires_at, one_time_credits_remaining,
+            monthly_credits_remaining, one_time_plan, one_time_plan_name
+        FROM users WHERE user_id = ?
+    """, new_oid, email, old_user_id)
+    for tbl in _USER_CHILD_TABLES:
+        cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE user_id = ?", new_oid, old_user_id)
+    cursor.execute("DELETE FROM users WHERE user_id = ?", old_user_id)
+    conn.commit()
+
+
 @app.route(route="users/register", methods=["POST"])
 def register_user(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -183,6 +261,25 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
+
+    # Not found by oid. Before INSERTing, check for a RETURNING user whose auth id changed
+    # (Supabase→Entra migration): the SAME email already exists under a DIFFERENT (old) user_id.
+    # A blind INSERT here 500s on UX_users_email_real and permanently locks them out — the
+    # split-identity bug measured on real users. Migrate their account to this oid instead.
+    if email:
+        cursor.execute("SELECT user_id FROM users WHERE email = ?", email)
+        prior = cursor.fetchone()
+        if prior and str(prior[0]).lower() != str(user_id).lower():
+            logging.warning(
+                f"Identity migration: email already under old id={prior[0]}; moving account to "
+                f"Entra oid={user_id} (returning user, auth id changed)."
+            )
+            _migrate_identity(conn, cursor, prior[0], user_id, email)
+            return func.HttpResponse(
+                json.dumps({"message": "User migrated to current identity"}),
+                mimetype="application/json",
+                status_code=200
+            )
 
     logging.info(
         f"First registration for oid={user_id}; token claim keys="
@@ -349,8 +446,14 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
         updates.append("full_name = ?")
         params.append(body.get("display_name"))
     if "email" in body:
+        try:
+            email = _normalize_profile_email(body.get("email"))
+        except ValueError as exc:
+            return func.HttpResponse(
+                json.dumps({"error": str(exc)}),
+                mimetype="application/json", status_code=400)
         updates.append("email = ?")
-        params.append(body.get("email"))
+        params.append(email)
 
     if not updates:
         return func.HttpResponse(
@@ -365,8 +468,16 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found — register first", status_code=404)
 
     params.append(user_id)
-    cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
-    conn.commit()
+    try:
+        cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", params)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        if _is_duplicate_email_error(exc):
+            return func.HttpResponse(
+                json.dumps({"error": "Email address is already in use"}),
+                mimetype="application/json", status_code=409)
+        raise
 
     cursor.execute(
         "SELECT user_id, email, full_name, credits_remaining FROM users WHERE user_id = ?",
@@ -415,19 +526,16 @@ def accept_terms(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    try:
-        body = req.get_json()
-        accepted_at = body.get("accepted_at")
-    except Exception:
-        accepted_at = None
-
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET terms_accepted_at = ? WHERE user_id = ?",
-        accepted_at, user_id,
+        "UPDATE users SET terms_accepted_at = GETUTCDATE() WHERE user_id = ?",
+        user_id,
     )
     conn.commit()
+    cursor.execute("SELECT terms_accepted_at FROM users WHERE user_id = ?", user_id)
+    row = cursor.fetchone()
+    accepted_at = _utc_iso(row[0]) if row else None
 
     return func.HttpResponse(
         json.dumps({"terms_accepted_at": accepted_at}),
@@ -448,14 +556,10 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     if not file:
         return func.HttpResponse("No photo provided", status_code=400)
 
-    ext = file.filename.split(".")[-1].lower()
-    if ext not in ["jpg", "jpeg", "png"]:
-        return func.HttpResponse("Invalid file type", status_code=400)
-
     # ── 0.6 upload validation ────────────────────────────────────────────────
     # Read ONCE, cap size before doing any decode work, then verify the bytes are a
-    # real image of an allowed type within sane dimensions. This is stronger than the
-    # extension/MIME check above (both client-controlled): a real decode cannot be spoofed.
+    # real image of an allowed type within sane dimensions. Client filename and MIME are
+    # deliberately ignored: both are client-controlled, while a real decode cannot be spoofed.
     import io as _io
     from PIL import Image as _Image, UnidentifiedImageError as _UnidentifiedImageError
 
@@ -494,7 +598,12 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"error": f"Image too small ({w}x{h}); min {MIN_UPLOAD_DIM}px per side."}),
             mimetype="application/json", status_code=400)
 
-    blob_name = f"{user_id}/input/{file.filename}"
+    # Never use the client filename as a storage key. Phones commonly upload every
+    # photo as image.jpg (silent overwrite), and slashes create nested paths that the
+    # training-photo scanner deliberately excludes. Derive the extension from the
+    # verified bytes and make every upload a distinct, flat leaf.
+    server_ext = "png" if fmt == "PNG" else "jpg"  # JPEG and MPO are JPEG-family
+    blob_name = f"{user_id}/input/{uuid4().hex}.{server_ext}"
     url = upload_blob("inputs", blob_name, data)
 
     # Canonical convention: input_blob_path is "<container>/<blob>" so the
@@ -605,10 +714,6 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
     credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
-    # Product this training belongs to (finding #6 foundation) — drives per-product retention
-    # + LoRA lifecycle. get_plan maps plan_name -> plan_type ('one_time' | 'monthly').
-    train_source = get_plan(row[3]).plan_type
-
     if lora_status == "training":
         return func.HttpResponse(
             json.dumps({"status": "training", "message": "Training already in progress"}),
@@ -768,39 +873,42 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # Insert the run, flip the user to 'training', and CHARGE the retrain in ONE
     # transaction — so a crash between them can't take credits without starting a run,
     # or start a run without charging.
-    conn2 = new_connection()
-    try:
-        conn2.autocommit = False
-        cur2 = conn2.cursor()
-        cur2.execute("""
-            INSERT INTO lora_trainings (user_id, status, photo_count, class_word, files_json, source_type)
-            OUTPUT INSERTED.training_id
-            VALUES (?, 'queued', ?, ?, ?, ?)
-        """, user_id, len(files), cword, json.dumps(files), train_source)
-        training_id = cur2.fetchone()[0]
-        if is_retrain:
-            balance_column = (
-                "monthly_credits_remaining"
-                if train_source == "monthly"
-                else "one_time_credits_remaining"
-            )
-            cur2.execute(
-                "UPDATE users SET lora_status = 'training', retrain_count = retrain_count + 1, "
-                f"credits_remaining = credits_remaining - ?, "
-                f"{balance_column} = {balance_column} - ? WHERE user_id = ?",
-                retrain_cost, retrain_cost, user_id,
-            )
-        else:
-            cur2.execute(
-                "UPDATE users SET lora_status = 'training' WHERE user_id = ?", user_id)
-        # Transactional outbox (finding #4): the training enqueue commits WITH the row +
-        # lora_status + retrain charge, so a queue outage after commit can't strand the user
-        # in 'training' with no message. Fast-path the send below; outbox_dispatcher backstops.
-        train_msg = {"training_id": str(training_id), "user_id": str(user_id)}
-        outbox_tid = outbox_add(cur2, TRAINING_QUEUE, train_msg)
-        conn2.commit()
-    finally:
-        conn2.close()
+    # Serialized retrain reservation (dev's reserve_training_slot): insert + flip to
+    # 'training' + charge in one app-locked transaction. NOTE (follow-up): make the charge
+    # separate-balance-aware (monthly vs one_time) to fully match the features-stripe credit
+    # model — today it charges the combined credits_remaining.
+    reserved = reserve_training_slot(
+        user_id, files, cword, force, FREE_RETRAINS, RETRAIN_CREDITS,
+        MAX_TRAININGS_PER_DAY,
+    )
+    if not reserved.ok:
+        if reserved.reason == "busy":
+            return func.HttpResponse("Service busy, please retry", status_code=503)
+        if reserved.reason == "user_missing":
+            return func.HttpResponse("User not found", status_code=404)
+        if reserved.reason == "already_training":
+            return func.HttpResponse(
+                json.dumps({"status": "training", "message": "Training already in progress"}),
+                mimetype="application/json", status_code=409)
+        if reserved.reason == "force_required":
+            return func.HttpResponse(
+                json.dumps({"status": "ready", "message": "Pass force=true to retrain."}),
+                mimetype="application/json", status_code=409)
+        if reserved.reason == "credits":
+            return func.HttpResponse(
+                json.dumps({"error": "Not enough credits to retrain your model.",
+                            "required": RETRAIN_CREDITS}),
+                mimetype="application/json", status_code=402)
+        return func.HttpResponse(
+            json.dumps({"error": "Daily training limit reached. Try again tomorrow.",
+                        "limit": MAX_TRAININGS_PER_DAY}),
+            mimetype="application/json", status_code=429)
+
+    training_id = reserved.training_id
+    is_retrain = reserved.retrain
+    retrain_cost = reserved.credits_charged
+    train_msg = reserved.message
+    outbox_tid = reserved.outbox_id
 
     # Delayed on purpose — see TRAIN_FUSE_HEAD_START. Gives /jobs/submit time to park the
     # generation job so _dispatch_training can fuse it into this same container. The
@@ -865,7 +973,14 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    body = req.get_json()
+    try:
+        body = req.get_json()
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
+    except Exception:
+        return func.HttpResponse(
+            json.dumps({"error": "invalid JSON body"}),
+            mimetype="application/json", status_code=400)
     gender = body.get("gender")
     age_range = body.get("age_range")
     hair_color = body.get("hair_color")
@@ -885,6 +1000,28 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     if not all([gender, age_range, hair_color]):
         return func.HttpResponse(
             json.dumps({"error": "gender, age_range and hair_color are required"}),
+            mimetype="application/json", status_code=400)
+    if not isinstance(age_range, str) or not isinstance(hair_color, str):
+        return func.HttpResponse(
+            json.dumps({"error": "age_range and hair_color must be strings"}),
+            mimetype="application/json", status_code=400)
+    age_range = age_range.strip()
+    hair_color = hair_color.strip()
+    if not age_range or not hair_color:
+        return func.HttpResponse(
+            json.dumps({"error": "age_range and hair_color cannot be blank"}),
+            mimetype="application/json", status_code=400)
+    too_long = [
+        name for name, value in (("age_range", age_range), ("hair_color", hair_color))
+        if len(value) > MAX_PROFILE_ATTRIBUTE_CHARS
+    ]
+    if too_long:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Profile attribute too long",
+                "fields": too_long,
+                "max_length": MAX_PROFILE_ATTRIBUTE_CHARS,
+            }),
             mimetype="application/json", status_code=400)
     input_blob_path = input_blob_path or ""
 
@@ -964,7 +1101,15 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # credit pool spreads across MANY generations: default to the plan's session size, let
     # the client request more, clamp to the monthly quota and to what credits can pay for.
     if plan.plan_type == "monthly":
-        requested = int(body.get("image_count") or plan.min_session_images)
+        # Coerce defensively: a non-numeric image_count ("abc") or wrong type ([1]) would
+        # raise on int() and — past the body guard — surface as a 500 on the most-hit
+        # endpoint. Fall back to a clean 400 instead.
+        try:
+            requested = int(body.get("image_count") or plan.min_session_images)
+        except (TypeError, ValueError):
+            return func.HttpResponse(
+                json.dumps({"error": "image_count must be a number"}),
+                mimetype="application/json", status_code=400)
         max_by_credits = (
             credits_remaining + one_time_credits_remaining
         ) // plan.credits_per_image
@@ -999,19 +1144,31 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # image_count * plan.credits_per_image — the counter tracks images, not jobs.
     # 'waiting_lora' rows are reserved (credits taken, cap counted) but deliberately
     # NOT enqueued — see the identity-LoRA gate above.
-    parked = lora_status == "training"
     result = reserve_job_slot(
         user_id, input_blob_path, job_params, PER_USER_DAILY_CAP, GLOBAL_DAILY_CAP,
         credit_cost=cost,
+        # Resolve ready vs training AGAIN under the reservation transaction's UPDLOCK/HOLDLOCK
+        # (dev's race fix) — the earlier read is only for validation/prompt planning. With
+        # resolve_lora_status set, reserve_job_slot picks queued vs waiting_lora internally, so
+        # we do NOT pass initial_status. image_count/credits_per_image drive the separate-balance
+        # credit model (features-stripe).
+        resolve_lora_status=True,
         image_count=image_count,
         credits_per_image=plan.credits_per_image,
-        initial_status="waiting_lora" if parked else "queued",
         # Tag the job with the product it belongs to (finding #6 foundation): drives the
         # purchase gate, per-product retention, and LoRA lifecycle. plan.plan_type is
         # 'one_time' | 'monthly'.
         source_type=plan.plan_type,
     )
     if not result.ok:
+        if result.reason == "lora_not_ready":
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "Your model is no longer training or ready. Start training first.",
+                    "train_endpoint": "/api/train",
+                }),
+                mimetype="application/json", status_code=409,
+            )
         if result.reason == "credits":
             return func.HttpResponse(
                 json.dumps({"error": "Insufficient credits", "required": cost,
@@ -1032,6 +1189,7 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     job_id = result.job_id
+    parked = result.status == "waiting_lora"
 
     # One-time plans: (re)start the retention clock at each generation (last-gen + N days).
     # Monthly plans keep retention_expires_at NULL until the subscription ends. Best-effort
@@ -1084,7 +1242,9 @@ def job_status(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -1110,7 +1270,9 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -1187,7 +1349,9 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    job_id = req.route_params.get("job_id")
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
     conn = get_db()
     cursor = conn.cursor()
 
@@ -1279,11 +1443,11 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
 def get_attires(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT attire_id, name, category, blob_path FROM attires WHERE is_active = 1")
+    cursor.execute("SELECT attire_id, name, category FROM attires WHERE is_active = 1")
     rows = cursor.fetchall()
 
     attires = [
-        {"id": r[0], "name": r[1], "category": r[2], "blob_path": r[3]}
+        {"id": r[0], "name": r[1], "category": r[2]}
         for r in rows
     ]
 
@@ -1298,11 +1462,11 @@ def get_attires(req: func.HttpRequest) -> func.HttpResponse:
 def get_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT background_id, name, category, blob_path FROM backgrounds WHERE is_active = 1")
+    cursor.execute("SELECT background_id, name, category FROM backgrounds WHERE is_active = 1")
     rows = cursor.fetchall()
 
     backgrounds = [
-        {"id": r[0], "name": r[1], "category": r[2], "blob_path": r[3]}
+        {"id": r[0], "name": r[1], "category": r[2]}
         for r in rows
     ]
 
@@ -1441,15 +1605,23 @@ def admin_fail_job(req: func.HttpRequest) -> func.HttpResponse:
 # ── Queue Trigger ─────────────────────────────────────────
 @app.queue_trigger(arg_name="msg", queue_name="inference-jobs", connection="AzureWebJobsStorage")
 def process_inference_job(msg: func.QueueMessage):
-    from shared.queue_trigger import trigger_container_job, count_active_job_executions
+    from shared.queue_trigger import (
+        trigger_container_job, count_active_job_executions, find_execution_for_job,
+    )
     from shared.queue_client import enqueue_job
     from shared.gpu_lease import (
         acquire_dispatch_lease, release_dispatch_lease,
-        mark_dispatched, recent_dispatch_pending, DispatchConfigError,
+        mark_dispatched, clear_dispatch_pending,
+        recent_dispatch_pending, DispatchConfigError,
     )
     # The host already base64-decodes the transport (messageEncoding=base64,
     # the extension-bundle default), so get_body() returns the raw JSON.
     payload = json.loads(msg.get_body().decode("utf-8"))
+    if not isinstance(payload, dict) or not payload.get("job_id") or not payload.get("user_id"):
+        # Raising keeps the message retryable and ultimately visible in the poison
+        # queue; acknowledging it here would silently lose the associated job.
+        logging.error(f"malformed inference queue message: {payload!r}")
+        raise ValueError("inference queue message requires job_id and user_id")
     job_id = payload["job_id"]
     user_id = payload["user_id"]
 
@@ -1502,7 +1674,18 @@ def process_inference_job(msg: func.QueueMessage):
                 logging.error(f"job_id={job_id} not found in DB; dropping message")
                 return
             status, exec_id = row[0], row[1]
+            if status == "dispatching" and not exec_id:
+                exec_id = find_execution_for_job(job_id)
+                if exec_id:
+                    _record_execution_id(job_id, exec_id)
+                    logging.warning(
+                        f"job_id={job_id} recovered execution_id={exec_id} after dispatch commit gap"
+                    )
             if exec_id or status in ("dispatching", "processing", "completed", "failed"):
+                # A prior attempt may have persisted the execution id and then crashed
+                # before clearing the short API-visibility reservation. Retries repair it.
+                if exec_id or status in ("processing", "completed", "failed"):
+                    clear_dispatch_pending(owner)
                 logging.info(
                     f"job_id={job_id} already dispatched/terminal "
                     f"(status={status}, execution_id={exec_id}); not starting again"
@@ -1537,7 +1720,12 @@ def process_inference_job(msg: func.QueueMessage):
         finally:
             conn.close()
 
-        # 6) Start the GPU job. If the start fails, revert the claim so the job
+        # 6) Reserve capacity BEFORE the blocking Container Apps start call.
+        #    The short ownership lease may expire during A100 cold-start, but
+        #    last_dispatch_at remains visible to recent_dispatch_pending().
+        mark_dispatched(owner)
+
+        # Start the GPU job. If the start fails, revert the claim so the job
         #    can be retried (no A100 was started -> no double-spend), then
         #    re-raise so the queue retries the message.
         try:
@@ -1545,10 +1733,11 @@ def process_inference_job(msg: func.QueueMessage):
         except Exception:
             logging.exception(f"start failed for job_id={job_id}; reverting claim to 'queued'")
             _revert_claim(job_id)
+            clear_dispatch_pending(owner)
             raise
 
-        mark_dispatched(owner)
         _record_execution_id(job_id, execution_id)
+        clear_dispatch_pending(owner)
         logging.info(f"Started job_id={job_id} execution_id={execution_id} (active before={active})")
     finally:
         release_dispatch_lease(owner)
@@ -1629,6 +1818,12 @@ def _mark_failed(job_id: str):
                     "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
                     refund, job_id,
                 )
+            # Ledger the refund (positive), in the SAME transaction as the state transition +
+            # balance restore so it can never double-count. r[1] is the job's user_id (guard
+            # the read: if the row is unexpectedly gone we still refund via the subquery UPDATE
+            # above, we just can't attribute a ledger row).
+            if r and len(r) > 1 and r[1]:
+                credit_ledger.record(cur, r[1], refund, credit_ledger.REASON_JOB_REFUND, job_id)
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
@@ -1636,6 +1831,86 @@ def _mark_failed(job_id: str):
         )
     finally:
         conn.close()
+
+
+def _stamp_failure_class(job_id, failure_class, reason, execution_id):
+    """Record WHY a job failed, idempotently, inside job_params JSON (no schema change).
+
+    This is what stops an infrastructure failure from being silently indistinguishable from
+    a customer/model failure: it preserves the diagnostic reason + the ACA execution id.
+    Idempotent — if a `_failure` stamp already exists it is left untouched, so reconciliation
+    retries never rewrite the first (authoritative) reason."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
+        row = cur.fetchone()
+        if not row:
+            return
+        try:
+            params = json.loads(row[0]) if row[0] else {}
+        except (TypeError, ValueError):
+            params = {}
+        if isinstance(params.get("_failure"), dict):
+            return  # already stamped
+        params["_failure"] = {
+            "class": failure_class,
+            "reason": reason,
+            "execution_id": execution_id,
+            "is_infra": failure_class in exec_reconcile.INFRA_CLASSES,
+        }
+        cur.execute("UPDATE jobs SET job_params = ? WHERE job_id = ?",
+                    json.dumps(params), job_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fetch_execution_outcome(job_id):
+    """Best-effort: recover a job's execution outcome for classification WITHOUT a new Azure
+    dependency, by reading the diagnostics blob the GPU preflight wrote before exiting
+    (gpu_preflight.write_diagnostic -> diagnostics/preflight/<execution_id>.json). The blob
+    carries the exact preflight exit_code + reason, which the ARM execution object does not
+    expose. Returns an exec_data dict or None (caller then uses the timeout safety net)."""
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT external_execution_id FROM jobs WHERE job_id = ?", job_id)
+            r = cur.fetchone()
+        finally:
+            conn.close()
+        exec_id = r[0] if r else None
+        if not exec_id:
+            return None
+        raw = download_blob("diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
+        diag = json.loads(raw)
+        result = diag.get("result") or {}
+        return {
+            "exit_code": result.get("exit_code"),
+            "reason": "ProcessExited",
+            "events": [],
+            "execution_id": diag.get("execution_id") or exec_id,
+            "diagnostic_reason": result.get("reason"),
+        }
+    except Exception:
+        return None
+
+
+def _reconcile_execution_outcome(job_id, exec_data, now, *,
+                                 mark_failed=None, stamp=None, classify=None):
+    """Classify one execution outcome and, when a refund is owed, stamp the class+reason and
+    fail+refund EXACTLY ONCE. The one-refund guarantee is _mark_failed's rowcount guard
+    (status NOT IN ('failed','completed')); stamping is separately idempotent. Deps are
+    injectable so this is unit-tested with no DB/Azure."""
+    mark_failed = mark_failed or _mark_failed
+    stamp = stamp or _stamp_failure_class
+    classify = classify or exec_reconcile.classify_execution
+    decision = classify(exec_data, now)
+    if decision["action"] == exec_reconcile.ACTION_REFUND:
+        stamp(job_id, decision["failure_class"], decision["reason"], decision["execution_id"])
+        mark_failed(job_id)   # idempotent; refunds only on the real state transition
+    return decision
 
 
 def _revert_claim(job_id: str):
@@ -1748,7 +2023,8 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
     from shared.queue_client import enqueue_training_job
     from shared.gpu_lease import (
         acquire_dispatch_lease, release_dispatch_lease,
-        mark_dispatched, recent_dispatch_pending, DispatchConfigError,
+        mark_dispatched, clear_dispatch_pending,
+        recent_dispatch_pending, DispatchConfigError,
     )
 
     if not _gpu_dispatch_enabled():
@@ -1787,6 +2063,8 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
                 return
             status, exec_id, files_json, class_word = row[0], row[1], row[2], row[3]
             if exec_id or status in ("dispatching", "training", "completed", "failed"):
+                if exec_id or status in ("training", "completed", "failed"):
+                    clear_dispatch_pending(owner)
                 logging.info(
                     f"training_id={training_id} already dispatched/terminal "
                     f"(status={status}, execution_id={exec_id}); not starting again"
@@ -1859,6 +2137,9 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
         finally:
             conn.close()
 
+        # Training and inference share the same A100 cap, so training needs the
+        # same pre-start reservation across lease expiry and API visibility lag.
+        mark_dispatched(owner)
         try:
             # user_id is passed ONCE and drives both the input photo paths and the
             # adapter output path. trigger_training_job re-verifies every file lives
@@ -1905,9 +2186,9 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
                 conn3.commit()
             finally:
                 conn3.close()
+            clear_dispatch_pending(owner)
             raise
 
-        mark_dispatched(owner)
         conn4 = new_connection()
         try:
             c4 = conn4.cursor()
@@ -1919,6 +2200,7 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             conn4.commit()
         finally:
             conn4.close()
+        clear_dispatch_pending(owner)
         logging.info(
             f"Started training_id={training_id} user={user_id} "
             f"execution_id={execution_id} (active before={active})"
@@ -2084,6 +2366,12 @@ def handle_poison_job(msg: func.QueueMessage):
         logging.error(f"POISON: unparseable message dropped: {msg.get_body()!r}")
         return
 
+    if not job_id:
+        # There is no safe DB row to update without an identifier. Do not acknowledge
+        # and discard the evidence: fail this trigger so operators retain visibility.
+        logging.critical(f"POISON: message missing job_id: {payload!r}")
+        raise ValueError("poison inference message missing job_id")
+
     logging.error(
         f"POISON: job_id={job_id} exceeded retry limit (dequeue_count={msg.dequeue_count}); "
         f"marking failed"
@@ -2106,6 +2394,7 @@ def handle_poison_job(msg: func.QueueMessage):
 # is killed before it can write — this reaper is the ONLY thing that clears it.
 @app.timer_trigger(schedule="0 */10 * * * *", arg_name="timer", run_on_startup=False)
 def reaper(timer: func.TimerRequest):
+    from shared.queue_trigger import find_execution_for_job
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -2120,17 +2409,43 @@ def reaper(timer: func.TimerRequest):
         stuck = [str(r[0]) for r in cur.fetchall()]
 
         cur.execute(
-            "SELECT job_id FROM jobs WHERE status = 'dispatching' "
+            "SELECT job_id, external_execution_id FROM jobs WHERE status = 'dispatching' "
             "AND COALESCE(dispatched_at, created_at) < DATEADD(MINUTE, ?, GETUTCDATE())",
             -REAPER_DISPATCHING_MINUTES,
         )
-        stuck += [str(r[0]) for r in cur.fetchall()]
+        dispatching = [(str(r[0]), r[1]) for r in cur.fetchall()]
     finally:
         conn.close()
 
+    for job_id, exec_id in dispatching:
+        if not exec_id:
+            recovered = find_execution_for_job(job_id)
+            if recovered:
+                _record_execution_id(job_id, recovered)
+                logging.warning(
+                    f"REAPER: recovered live execution_id={recovered} for job_id={job_id}; not failing"
+                )
+                continue
+        stuck.append(job_id)
+
+    now_ts = datetime.now(timezone.utc).timestamp()
     for job_id in stuck:
-        logging.warning(f"REAPER: failing stuck job_id={job_id}")
-        _mark_failed(job_id)
+        logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
+        exec_data = _fetch_execution_outcome(job_id)   # best-effort (reads preflight diag blob)
+        if exec_data is not None:
+            # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, operator stop,
+            # or a genuinely-complete/pending job) and fail+refund EXACTLY ONCE with the class
+            # recorded — so an infra failure is never mislabelled as a customer/model failure,
+            # and a job whose container actually delivered (exit 0) is not spuriously refunded.
+            decision = _reconcile_execution_outcome(job_id, exec_data, now_ts)
+            logging.warning(f"REAPER: job_id={job_id} class={decision['failure_class']} "
+                            f"infra={decision['is_infra']} action={decision['action']}")
+        else:
+            # Safety net (dev's original fail+refund behaviour + a class): stuck past the timeout
+            # with no readable outcome -> fail+refund once, labelled an unclassified infra timeout.
+            _stamp_failure_class(job_id, "infra_timeout",
+                                 "reaper timeout; execution outcome unavailable", None)
+            _mark_failed(job_id)
 
 
 # ── Outbox dispatcher ─────────────────────────────────────────────────────────
@@ -2966,6 +3281,10 @@ def reactivate_user_subscription(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ── Stripe Webhook ────────────────────────────────────────
+class RetryableStripeWebhookError(Exception):
+    """A valid paid event whose entitlement could not be applied yet."""
+
+
 @app.route(route="webhooks/stripe", methods=["POST"])
 def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
     sig_header = req.headers.get("Stripe-Signature", "")
@@ -2986,43 +3305,51 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Stripe event has no id; skipping to stay idempotent: type={event_type}")
         return func.HttpResponse("OK", status_code=200)
 
-    if event_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        payment_type = session.get("metadata", {}).get("payment_type")
-        if payment_type == "one_time":
-            _handle_onetime_payment(session, event_id)
-        elif payment_type == "monthly":
-            _handle_monthly_checkout(session, event_id)
-        elif payment_type == "topup":
-            _handle_topup(session, event_id)
+    try:
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            payment_type = session.get("metadata", {}).get("payment_type")
+            if payment_type == "one_time":
+                _handle_onetime_payment(session, event_id)
+            elif payment_type == "monthly":
+                _handle_monthly_checkout(session, event_id)
+            elif payment_type == "topup":
+                _handle_topup(session, event_id)
 
-    elif event_type == "checkout.session.expired":
-        session = event["data"]["object"]
-        metadata = session.get("metadata", {})
-        user_id = metadata.get("user_id")
-        checkout_token = metadata.get("checkout_token")
-        if user_id and checkout_token:
-            _release_monthly_checkout(user_id, checkout_token)
+        elif event_type == "checkout.session.expired":
+            # Release a monthly-checkout reservation whose Stripe session expired unpaid.
+            session = event["data"]["object"]
+            metadata = session.get("metadata", {})
+            user_id = metadata.get("user_id")
+            checkout_token = metadata.get("checkout_token")
+            if user_id and checkout_token:
+                _release_monthly_checkout(user_id, checkout_token)
 
-    # invoice.paid is the single source of truth for successful renewal grants.
-    # Stripe may emit invoice.payment_succeeded for the same invoice; handling both
-    # would make correctness depend on two distinct event IDs being deduplicated.
-    elif event_type == "invoice.paid":
-        _handle_invoice_paid(event["data"]["object"], event_id)
+        # invoice.paid is the single source of truth for renewal grants. Stripe may ALSO emit
+        # invoice.payment_succeeded for the same invoice with a DIFFERENT event id — handling
+        # both would bypass event-id dedup and double-grant, so payment_succeeded is ignored.
+        elif event_type == "invoice.paid":
+            _handle_invoice_paid(event["data"]["object"], event_id)
 
-    elif event_type == "invoice.payment_succeeded":
-        logging.info(
-            f"Stripe event {event_id} ignored; invoice.paid owns renewal credit grants."
-        )
+        elif event_type == "invoice.payment_succeeded":
+            logging.info(
+                f"Stripe event {event_id} ignored; invoice.paid owns renewal credit grants.")
 
-    elif event_type == "invoice.payment_failed":
-        _handle_payment_failed(event["data"]["object"], event_id)
+        elif event_type == "invoice.payment_failed":
+            _handle_payment_failed(event["data"]["object"], event_id)
 
-    elif event_type == "customer.subscription.deleted":
-        _handle_subscription_ended(event["data"]["object"], event_id)
+        elif event_type == "customer.subscription.deleted":
+            _handle_subscription_ended(event["data"]["object"], event_id)
 
-    elif event_type == "customer.subscription.updated":
-        _handle_subscription_updated(event["data"]["object"], event_id)
+        elif event_type == "customer.subscription.updated":
+            _handle_subscription_updated(event["data"]["object"], event_id)
+
+    except RetryableStripeWebhookError as e:
+        # A 2xx tells Stripe the event is permanently handled; a 500 makes Stripe replay the
+        # still-unclaimed event after registration/reconciliation creates its target (dev's
+        # paid-but-not-granted retry).
+        logging.error(f"Retryable Stripe webhook failure: event={event_id}: {e}")
+        return func.HttpResponse("Entitlement not applied; retry", status_code=500)
 
     return func.HttpResponse("OK", status_code=200)
 
@@ -3087,9 +3414,11 @@ def _handle_onetime_payment(session: dict, event_id: str):
                 f"credits={credits} matched 0 user rows — user not registered. "
                 f"MANUAL RECONCILIATION REQUIRED (grant {credits} credits once the row exists)."
             )
-            return
+            raise RetryableStripeWebhookError(
+                f"one_time grant matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_ONE_TIME)
+        conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
     finally:
         conn.close()
@@ -3160,9 +3489,11 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 f"credits={credits} sub={sub_id} matched 0 user rows — user not registered. "
                 f"MANUAL RECONCILIATION REQUIRED."
             )
-            return
+            raise RetryableStripeWebhookError(
+                f"monthly activation matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
-        conn.commit()  # claim + activation commit atomically
+        credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
+        conn.commit()  # claim + activation + ledger row commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
     finally:
         conn.close()
@@ -3197,7 +3528,8 @@ def _handle_topup(session: dict, event_id: str):
             logging.error(
                 f"PAYMENT NOT APPLIED (topup): user_id={user_id} is not an active monthly "
                 f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
-            return
+            raise RetryableStripeWebhookError(
+                f"topup matched no active monthly user: user_id={user_id} pack={pack}")
         monthly_plan = get_plan(prow[0])
         add_on_credits = images * monthly_plan.credits_per_image
         cur.execute(
@@ -3209,7 +3541,8 @@ def _handle_topup(session: dict, event_id: str):
             WHERE user_id = ? AND subscription_type = 'monthly'""",
             add_on_credits, add_on_credits, pack, prow[0], user_id,
         )
-        conn.commit()  # claim + grant commit atomically
+        credit_ledger.record(cur, user_id, add_on_credits, credit_ledger.REASON_TOPUP)
+        conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(
             f"Persistent add-on: user={user_id} pack={pack} "
             f"+{add_on_credits} add-on credits ({images} images)"
@@ -3218,8 +3551,38 @@ def _handle_topup(session: dict, event_id: str):
         conn.close()
 
 
+def _invoice_subscription_id(invoice: dict):
+    """The subscription id on an invoice, across Stripe API versions.
+
+    THE BUG THIS FIXES — SILENT RENEWAL FAILURE
+    -------------------------------------------
+    Stripe removed the top-level invoice.subscription field. As of the version this account
+    now sends events in (2026-05-27.dahlia), the top-level invoice.subscription is None, and
+    the id lives at invoice.parent.subscription_details.subscription. Both invoice handlers
+    read the old field, hit `if not sub_id: return`, and no-op — so EVERY monthly renewal's
+    invoice.paid (billing_reason=subscription_cycle) silently failed to reset credits, and
+    every invoice.payment_failed silently failed to flag dunning. Only the FIRST month
+    worked, because activation goes through checkout.session.completed, a different handler.
+
+    Checks the legacy top-level field first, then the new nested location, then the line
+    item — so it works whatever version an event arrives in.
+    """
+    sub = invoice.get("subscription")
+    if sub:
+        return sub
+    parent = invoice.get("parent") or {}
+    sub = (parent.get("subscription_details") or {}).get("subscription")
+    if sub:
+        return sub
+    for line in (invoice.get("lines", {}) or {}).get("data", []):
+        lp = (line.get("parent") or {}).get("subscription_item_details") or {}
+        if lp.get("subscription"):
+            return lp["subscription"]
+    return None
+
+
 def _handle_invoice_paid(invoice: dict, event_id: str):
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)
     if not sub_id:
         return
     conn = new_connection()
@@ -3245,14 +3608,35 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
             return
         cur.execute(
             """UPDATE users SET
-                credits_remaining       = credits_monthly_limit + one_time_credits_remaining,
+                -- Separate-balance renewal: reset the monthly allowance to the limit (monthly
+                -- credits do not roll over) and recompute the combined balance; one-time and
+                -- top-up credits in one_time_credits_remaining are preserved (non-expiring).
+                credits_remaining         = credits_monthly_limit + one_time_credits_remaining,
                 monthly_credits_remaining = credits_monthly_limit,
                 subscription_renewed_at = GETUTCDATE(),
                 payment_failed_at       = NULL
             WHERE stripe_subscription_id = ?""",
             sub_id,
         )
-        conn.commit()  # claim + reset commit atomically
+        if cur.rowcount == 0:
+            # Checkout/user registration and the first invoice can race. Roll back the
+            # processed-event claim and force a retry instead of losing a paid renewal.
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (invoice): subscription={sub_id} matched 0 user rows. "
+                f"Returning non-2xx for Stripe retry; event_id={event_id}."
+            )
+            raise RetryableStripeWebhookError(
+                f"invoice grant matched no subscription: subscription={sub_id}")
+        # Ledger the renewal grant: the monthly allowance granted this cycle (monthly credits
+        # reset to the limit rather than rolling over, so the grant is the full limit).
+        cur.execute(
+            "SELECT user_id, credits_monthly_limit FROM users WHERE stripe_subscription_id = ?",
+            sub_id)
+        urow = cur.fetchone()  # stripe_subscription_id is unique per user → at most one row
+        if urow:
+            credit_ledger.record(cur, urow[0], int(urow[1] or 0), credit_ledger.REASON_RENEWAL)
+        conn.commit()  # claim + reset + ledger row commit atomically
         logging.info(f"Credits reset for subscription={sub_id}")
     finally:
         conn.close()
@@ -3264,7 +3648,7 @@ def _handle_payment_failed(invoice: dict, event_id: str):
     (dunning) for days, and the terminal canceled/unpaid is handled by
     _handle_subscription_ended. The flag is cleared automatically by the next successful
     invoice.paid (recovery)."""
-    sub_id = invoice.get("subscription")
+    sub_id = _invoice_subscription_id(invoice)   # see _invoice_subscription_id: the id moved
     if not sub_id:
         return
     conn = new_connection()
@@ -3384,6 +3768,9 @@ def _handle_subscription_ended(sub: dict, event_id: str):
             # more, then the hourly cleanup deletes the blobs.
             cur.execute(
                 """UPDATE users SET
+                    -- Separate-balance downgrade: when the subscription ends, keep any remaining
+                    -- one-time credits (revert to a one_time account) rather than wiping them;
+                    -- fall back to free only when there are none.
                     subscription_plan      =
                         CASE WHEN one_time_credits_remaining > 0
                              THEN ISNULL(one_time_plan, ISNULL(one_time_plan_name, 'free'))

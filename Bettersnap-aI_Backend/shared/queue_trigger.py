@@ -51,6 +51,34 @@ def _newest_execution_name(client, job_name: str = JOB_NAME) -> str:
     return newest
 
 
+def find_execution_for_job(job_id: str, job_name: str = JOB_NAME) -> str:
+    """Find the ACA execution carrying ``JOB_ID=job_id``.
+
+    This closes the unavoidable gap between ACA accepting ``begin_start`` and SQL
+    recording the returned execution name.  The queue retry/reaper can reconcile
+    that execution instead of either starting a duplicate or refunding a live run.
+    """
+    credential = DefaultAzureCredential()
+    client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
+    for summary in client.jobs_executions.list(RESOURCE_GROUP, job_name):
+        execution = summary
+        # List responses are not guaranteed to contain the execution template.
+        if not getattr(getattr(execution, "template", None), "containers", None):
+            name = getattr(summary, "name", None)
+            if not name:
+                continue
+            try:
+                execution = client.jobs_executions.get(RESOURCE_GROUP, job_name, name)
+            except Exception:
+                logging.exception(f"could not inspect ACA execution={name}")
+                continue
+        for container in (getattr(getattr(execution, "template", None), "containers", None) or []):
+            for env in (getattr(container, "env", None) or []):
+                if getattr(env, "name", None) == "JOB_ID" and str(getattr(env, "value", "")) == str(job_id):
+                    return getattr(execution, "name", None) or getattr(summary, "name", None)
+    return None
+
+
 def _start_execution(owned_env_keys, env_overrides, job_name: str = JOB_NAME) -> str:
     """Start ONE execution of `job_name`. Extracted verbatim from the two dispatchers
     (inference + training) — NO behavior change; only the per-run env policy differs and

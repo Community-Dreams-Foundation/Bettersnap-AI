@@ -37,6 +37,8 @@ python scripts/run_migrations.py             # apply every pending file, in orde
 ```
 
 - Applies **every** `migrations/NNN_*.sql` in deterministic (filename) order.
+- Applies all `GO` batches in one transaction per file; the schema changes and tracking
+  insert commit together, or all roll back on failure.
 - Records each applied file in `dbo.schema_migrations`; only NEW files ever run.
 - Idempotent — a ~1s no-op when nothing is pending, so it is safe on every deploy.
 - Fails loud (non-zero exit) if it cannot reach the DB or a migration errors.
@@ -46,7 +48,20 @@ python scripts/run_migrations.py             # apply every pending file, in orde
   to record the current files as applied WITHOUT re-running them. (Prod was baselined
   2026-07-18 — 12 files. Do NOT baseline again; new migrations apply normally.)
 
-**Current migrations** (`001`–`011` + `013`; there is intentionally no `012`):
+**Current migrations** are contiguous. `012_reserved.sql` is an explicit no-op marker
+for the previously unused number; never insert a new migration below the highest version
+already deployed. The runner rejects gaps, duplicate versions, and late backfills.
+
+For a database that already has `013` or later recorded but predates the `012` marker,
+record the no-op marker once before running the upgraded runner:
+
+```sql
+INSERT INTO dbo.schema_migrations (filename)
+SELECT '012_reserved.sql'
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.schema_migrations WHERE filename = '012_reserved.sql'
+);
+```
 gpu-dispatch lease, jobs idempotency, user plans, lora trainings, trial default,
 retrain, retention, terms accepted, stripe columns, stripe-webhook idempotency,
 dunning, cancel-pending. **All are required by the running code** — a fresh or

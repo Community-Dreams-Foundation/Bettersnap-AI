@@ -16,6 +16,18 @@ _UID         = os.environ.get("SQL_UID",      "CloudSAe874642e")
 _TIMEOUT     = os.environ.get("SQL_CONN_TIMEOUT", "60")
 _PWD_SECRET  = os.environ.get("SQL_PASSWORD_SECRET", "Db-Password")
 
+# Required for inserts/updates on tables carrying filtered indexes (007_retention).
+# Pooled SQL Server connections retain session state, so assert these on every checkout.
+_REQUIRED_SESSION_OPTIONS = """
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET ARITHABORT ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET NUMERIC_ROUNDABORT OFF;
+"""
+
 
 def _conn_str():
     # Lazy import so importing this module doesn't pull the Azure SDK (the concurrency
@@ -33,6 +45,23 @@ def _conn_str():
         "TrustServerCertificate=no;"
         f"Connection Timeout={_TIMEOUT};"
     )
+
+
+def _connect(*, autocommit=False):
+    conn = pyodbc.connect(_conn_str(), autocommit=autocommit)
+    try:
+        cur = conn.cursor()
+        cur.execute(_REQUIRED_SESSION_OPTIONS)
+        cur.execute(
+            "SELECT SESSIONPROPERTY('QUOTED_IDENTIFIER'), "
+            "SESSIONPROPERTY('ANSI_NULLS')"
+        )
+        if tuple(cur.fetchone()) != (1, 1):
+            raise RuntimeError("required SQL session options are not enabled")
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def get_db():
@@ -56,10 +85,10 @@ def get_db():
     webhook grants) use new_connection() instead — it manages its own transaction and
     closes in a finally (close → rollback), so it cannot leak.
     """
-    return pyodbc.connect(_conn_str(), autocommit=True)
+    return _connect(autocommit=True)
 
 
 def new_connection():
     """Fresh, isolated (non-autocommit) connection for transactional work. Caller must
     close it (close → rollback of anything uncommitted). Also draws from the ODBC pool."""
-    return pyodbc.connect(_conn_str())
+    return _connect()

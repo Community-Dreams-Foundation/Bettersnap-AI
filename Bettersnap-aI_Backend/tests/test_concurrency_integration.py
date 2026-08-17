@@ -65,6 +65,7 @@ class ConcurrencyIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         # Fresh, self-contained schema in the test DB.
+        self._exec("IF OBJECT_ID('dbo.outbox','U') IS NOT NULL DROP TABLE dbo.outbox;")
         self._exec("IF OBJECT_ID('dbo.jobs','U') IS NOT NULL DROP TABLE dbo.jobs;")
         self._exec("IF OBJECT_ID('dbo.users','U') IS NOT NULL DROP TABLE dbo.users;")
         self._exec("IF OBJECT_ID('dbo.GpuDispatchLease','U') IS NOT NULL DROP TABLE dbo.GpuDispatchLease;")
@@ -85,6 +86,13 @@ class ConcurrencyIntegrationTests(unittest.TestCase):
                 source_type NVARCHAR(20) NULL,
                 external_execution_id VARCHAR(128) NULL,
                 created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
+            );""")
+        self._exec("""
+            CREATE TABLE dbo.outbox (
+                outbox_id BIGINT IDENTITY(1,1) PRIMARY KEY,
+                queue_name NVARCHAR(100) NOT NULL,
+                payload NVARCHAR(MAX) NOT NULL,
+                visibility_timeout INT NULL
             );""")
         self._exec("""
             CREATE TABLE dbo.GpuDispatchLease (
@@ -117,6 +125,38 @@ class ConcurrencyIntegrationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=50) as ex:
             results = list(ex.map(submit, range(50)))
         self.assertEqual(sum(results), 25, "exactly 25 should pass the global cap")
+
+    def test_failed_and_parked_jobs_do_not_consume_daily_caps(self):
+        from shared.job_reservation import reserve_job_slot
+        self._exec("INSERT INTO dbo.users (user_id, credits_remaining) VALUES ('caps', 1000);")
+        self._exec("""
+            INSERT INTO dbo.jobs (user_id, status, input_blob_path, job_params)
+            VALUES ('caps', 'failed', 'x', '{}'),
+                   ('caps', 'failed', 'x', '{}'),
+                   ('caps', 'waiting_lora', 'x', '{}'),
+                   ('caps', 'waiting_lora', 'x', '{}');""")
+
+        result = reserve_job_slot(
+            "caps", "inputs/caps/new.jpg", "{}", per_user_cap=1, global_cap=1)
+
+        self.assertTrue(result.ok, "failed/refunded and parked rows must not exhaust caps")
+
+    def test_queued_and_gpu_consuming_jobs_do_consume_daily_caps(self):
+        from shared.job_reservation import reserve_job_slot
+        statuses = ("queued", "dispatching", "processing", "completed")
+        for index, status in enumerate(statuses):
+            user_id = f"counted-{index}"
+            self._exec(
+                f"INSERT INTO dbo.users (user_id, credits_remaining) VALUES ('{user_id}', 1000);"
+            )
+            self._exec(
+                f"INSERT INTO dbo.jobs (user_id, status, input_blob_path, job_params) "
+                f"VALUES ('{user_id}', '{status}', 'x', '{{}}');"
+            )
+            result = reserve_job_slot(
+                user_id, "inputs/new.jpg", "{}", per_user_cap=1, global_cap=1000)
+            self.assertFalse(result.ok, f"{status} must consume daily capacity")
+            self.assertEqual(result.reason, "user_cap")
 
     def test_dispatch_lease_single_winner(self):
         from shared.gpu_lease import acquire_dispatch_lease

@@ -164,6 +164,8 @@ upscaler = None   # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause) — 2K post-process
 ip_adapter_ok = False   # IP-Adapter Plus-Face loaded successfully?
 img2img_pipe = None     # SDXL img2img (shares pipe's UNet/LoRA/IP-Adapter) for face refine
 _face_cascade = None    # cv2 Haar cascade for locating the face to refine
+cn_pipe = None          # SDXL depth-ControlNet pipe (shares pipe.components) — pose reference, default off
+depth_estimator = None  # {"model":DPT, "proc":DPTImageProcessor} for depth maps — pose reference, default off
 
 # Per-stage init outcome for the run manifest: name -> {enabled, initialized, reason[, error]}.
 # Populated by load_base_model via stage_runtime.run_stage. SINGLE-JOB INVARIANT: the GPU
@@ -211,9 +213,12 @@ LIGHTING = [
 #  • LoRA identity weight ~1.0: let the user's own trained identity dominate.
 DEFAULT_CFG           = float(os.environ.get("GUIDANCE_SCALE", "6.0"))
 DEFAULT_LORA_WEIGHT   = float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0"))
-# IP-Adapter Plus-Face conditioning strength (0 disables). 0.5-0.7 adds identity from the
-# user's own face crop without fighting the prompt/attire. Env-tunable for A/B testing.
-IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.6"))
+# IP-Adapter Plus-Face conditioning strength (0 disables). FROZEN at 0.2 (DECISIONS.md A1):
+# an A/B on female+male subjects showed 0.6 OVER-conditions — visible reference bleed that
+# fights the attire/scene prompt — while 0.2 follows the prompt and preserves likeness.
+# Env-tunable for A/B testing, but the DEFAULT must stay 0.2 so a missing/dropped env var
+# can't silently revert to the rejected 0.6. Deployment also sets it explicitly (job.yaml).
+IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.2"))
 # Which fetched reference crop feeds IP-Adapter (Phase-3 ablation). DEFAULT 0 = the first
 # crop = current behavior (strategy A), so the baseline / Phase-2 control is unchanged. The
 # harness (evaluation.reference_selection) picks a best-quality index for strategy B and it
@@ -252,6 +257,26 @@ DEFAULT_WIDTH         = int(os.environ.get("GEN_WIDTH", "1024"))
 DEFAULT_HEIGHT        = int(os.environ.get("GEN_HEIGHT", "1024"))
 # How many (background, attire) tuples one job spans (product wants ~4-6 for range).
 DEFAULT_NUM_OUTPUTS   = int(os.environ.get("NUM_OUTPUTS", "6"))
+
+# ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────────
+# Opt-in pose guidance: condition generation on the DEPTH of a set of reference photos
+# so outputs adopt those poses (head/shoulder position, framing, posture) while identity
+# still comes from the LoRA + IP-Adapter. The depth ControlNet (xinsir, Apache-2.0) + DPT
+# depth estimator are already BAKED into the image; this wires them, off by default.
+#   * A SINGLE reference would force ALL images into one pose (why ControlNet was left off).
+#     So we take a SET of refs (POSE_REF_PREFIX) and CYCLE them: image i uses ref[i % N].
+#     N good poses -> N varied professional poses, not N clones.
+#   * POSE_REF_SCALE is controlnet_conditioning_scale: how hard the depth forces the pose.
+#     ~0.5 guides pose without overpowering the attire/scene; 1.0 locks the pose harder.
+# DEFAULT OFF => the plain txt2img path runs UNCHANGED (byte-identical) until validated on GPU,
+# same discipline as EXPRESSION_CLAUSE / BODY_BUILD_CLAUSE / COMPOSITION_CONTROL.
+POSE_REF_ENABLE       = os.environ.get("POSE_REF_ENABLE", "0").strip() != "0"
+# Blob folder (in POSE_REF_CONTAINER) holding the pose-reference images (img0.jpg, img1.jpg, ...).
+POSE_REF_CONTAINER    = os.environ.get("POSE_REF_CONTAINER", "inputs")
+POSE_REF_PREFIX       = os.environ.get("POSE_REF_PREFIX", "").strip()
+POSE_REF_SCALE        = float(os.environ.get("POSE_REF_SCALE", "0.5"))
+# How many refs to try to fetch (img0..img{N-1}); the set is cycled across the output images.
+POSE_REF_FETCH_N      = int(os.environ.get("POSE_REF_FETCH_N", "12"))
 
 # DreamBooth trigger token baked into EVERY prompt as "ohwx <class>" so the
 # per-user identity LoRA actually FIRES. Every per-user LoRA is trained with this
@@ -440,6 +465,33 @@ def load_base_model():
             _init_shared_img2img()
             write_debug("Realism img2img pipe ready")
 
+        def _init_pose_ref():
+            # Pose reference (depth-ControlNet) — DEFAULT OFF. Loads the baked depth ControlNet
+            # (xinsir, Apache-2.0) + DPT depth estimator and builds an SDXL ControlNet pipe from
+            # the SAME components as the base pipe (shares UNet/LoRA/IP-Adapter — no second SDXL
+            # load), exactly like _init_shared_img2img. Only reached when POSE_REF_ENABLE.
+            global cn_pipe, depth_estimator
+            from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+            from transformers import DPTForDepthEstimation, DPTImageProcessor
+            cn = ControlNetModel.from_pretrained(
+                "/models/controlnet-depth-sdxl",
+                torch_dtype=torch.float16, use_safetensors=True).to("cuda")
+            # ControlNet pipe shares every base component; controlnet is the only addition.
+            cn_pipe = StableDiffusionXLControlNetPipeline(**pipe.components, controlnet=cn)
+            if IP_ADAPTER_SCALE > 0 and ip_adapter_ok:
+                # The IP-Adapter scale lives on the shared UNet attn processors, but set it on
+                # this pipe handle too so cn_pipe(ip_adapter_image=...) conditions identically.
+                try:
+                    cn_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+                except Exception as e:
+                    write_debug(f"pose_ref: set_ip_adapter_scale on cn_pipe failed (non-fatal): {e}")
+            depth_estimator = {
+                "model": DPTForDepthEstimation.from_pretrained(
+                    "/models/dpt-hybrid-midas", torch_dtype=torch.float16).to("cuda").eval(),
+                "proc": DPTImageProcessor.from_pretrained("/models/dpt-hybrid-midas"),
+            }
+            write_debug(f"pose_ref: depth ControlNet + DPT loaded (scale={POSE_REF_SCALE})")
+
         def _stage(name, enabled, init_fn, **kw):
             return run_stage(name, enabled, init_fn, STAGE_STATUS, log=write_debug, **kw)
 
@@ -448,6 +500,7 @@ def load_base_model():
                fatal=False, degraded_reason="degraded_to_1024")
         _stage("face_refine", FACE_REFINE_ENABLE,   _init_face_refine)
         _stage("realism",     REALISM_PASS_ENABLE,  _init_realism)
+        _stage("pose_ref",    POSE_REF_ENABLE,      _init_pose_ref)
 
         try:
             props = torch.cuda.get_device_properties(0)
@@ -707,6 +760,53 @@ def _get_ref_faces(user_id: str, n: int = None):
     return refs, ids
 
 
+def _depth_map(pil_img, size: int = 1024):
+    """DPT depth map of `pil_img` as a size×size RGB PIL image (the ControlNet control input).
+    Normalized to full 0-255 range so near/far contrast is consistent regardless of the source
+    scene. Only called on the pose-reference path (POSE_REF_ENABLE); depth_estimator is loaded."""
+    import numpy as np
+    from PIL import Image
+    proc = depth_estimator["proc"]
+    model = depth_estimator["model"]
+    inputs = proc(images=pil_img, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to("cuda", dtype=torch.float16)
+    with torch.no_grad():
+        depth = model(pixel_values=pixel_values).predicted_depth  # (1, H, W)
+    depth = torch.nn.functional.interpolate(
+        depth.unsqueeze(1).float(), size=(size, size), mode="bicubic", align_corners=False)
+    lo, hi = depth.min(), depth.max()
+    depth = (depth - lo) / (hi - lo + 1e-8)
+    arr = (depth.squeeze().cpu().numpy() * 255.0).astype("uint8")
+    return Image.fromarray(np.stack([arr, arr, arr], axis=-1))  # 3-channel depth
+
+
+def _get_pose_ref_depths(n: int = None):
+    """Fetch the pose-reference images from POSE_REF_CONTAINER/POSE_REF_PREFIX (img0.jpg,
+    img1.jpg, ...) and return their DEPTH maps as a list of PIL images, in order. The caller
+    CYCLES this list across the output images so N refs give N varied poses. Empty POSE_REF_PREFIX
+    or no images -> [] (caller then falls back to the plain txt2img path). Only the pose-ref path
+    calls this."""
+    import io
+    from PIL import Image
+    if n is None:
+        n = POSE_REF_FETCH_N
+    if not POSE_REF_PREFIX:
+        write_debug("pose_ref: POSE_REF_PREFIX unset -> no pose references")
+        return []
+    prefix = POSE_REF_PREFIX.rstrip("/")
+    depths = []
+    for i in range(n):
+        blob_name = f"{prefix}/img{i}.jpg"
+        try:
+            data = _read_blob(POSE_REF_CONTAINER, blob_name)
+            src = Image.open(io.BytesIO(data)).convert("RGB")
+            depths.append(_depth_map(src, size=DEFAULT_WIDTH))
+        except Exception as e:
+            write_debug(f"pose_ref img{i} unavailable: {e}")
+    write_debug(f"pose_ref: computed {len(depths)} depth map(s) from {POSE_REF_CONTAINER}/{prefix}/")
+    return depths
+
+
 # ─────────────────────────────────────────────────────────
 # Core inference
 # ─────────────────────────────────────────────────────────
@@ -792,6 +892,19 @@ def run_inference(job: dict) -> list:
             f"USING 1 (index {ref_idx} = {ref_ids[ref_idx]}); scale={IP_ADAPTER_SCALE}"
         )
 
+    # ── B3: resolve effective gender from trained class_word (Policy B) ──────────────
+    # The LoRA is trained to bind the trigger token to "<IDENTITY_TRIGGER> <class_word>".
+    # Generation-time gender may differ (returning sessions re-default to "male", user changes
+    # preferences, legacy records). Use the TRAINED class_word as source of truth when available;
+    # fall back to generation-time gender for legacy records (no class_word).
+    gen_gender = job_params.get("gender") or ""
+    class_word_trained = job_params.get("class_word")
+    if class_word_trained and class_word_trained in SUBJECT_NOUN.values():
+        effective_gender = catalog.gender_from_class_word(class_word_trained)
+        if effective_gender:
+            gen_gender = effective_gender  # override: use the trained gender
+    # ─────────────────────────────────────────────────────────────────────────────────
+
     # ── resolved plan + runtime context ──────────────────────────────────────
     _plan = Plan(   # worker-side reconstruction; billing fields UNUSED here (control plane owns billing)
         key=(job_params.get("plan_name") or "unknown"),
@@ -802,9 +915,10 @@ def run_inference(job: dict) -> list:
         user_id=user_id, job_id=job_id, plan=_plan,
         billable_count=image_count, credit_cost=0, candidate_budget=image_count,
         acceptance_threshold=0.0, retry_limit=0,
-        gender=(job_params.get("gender") or ""),
+        gender=gen_gender,
         age_range=(job_params.get("age_range") or ""),
         hair_color=(job_params.get("hair_color") or ""),
+        body_type=(job_params.get("body_type") or ""),
         attire_refs=tuple(attire_refs), background_refs=tuple(background_refs),
         custom_prompt=custom_prompt,
     )
@@ -820,6 +934,21 @@ def run_inference(job: dict) -> list:
     ctx.work["ip_adapter_image"] = _ref
     ctx.work["ref_face"] = _ref
 
+    # ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────
+    # When enabled AND the ControlNet pipe initialized AND we actually fetched depth maps,
+    # hand the generation engine the ControlNet pipe + the (cycled) depth maps. If ANY of
+    # those is missing, we leave these unset and the engine runs the plain txt2img path —
+    # so a misconfigured pose-ref run degrades to normal generation, never crashes.
+    if POSE_REF_ENABLE and cn_pipe is not None:
+        _pose_depths = _get_pose_ref_depths()
+        if _pose_depths:
+            ctx.models["cn_pipe"] = cn_pipe
+            ctx.work["pose_ref_depths"] = _pose_depths
+            ctx.work["pose_ref_scale"] = POSE_REF_SCALE
+            write_debug(f"pose_ref ACTIVE: {len(_pose_depths)} depth map(s), scale={POSE_REF_SCALE}")
+        else:
+            write_debug("pose_ref enabled but no depth maps fetched -> plain txt2img path")
+
     # ── run: prompt -> generate -> [Phase-6 wrap] -> enhance -> deliver ───────
     _gen_t0 = time.time()
     prompt_engine = SdxlPromptEngine(ctx, cfg, write_debug)
@@ -831,12 +960,42 @@ def run_inference(job: dict) -> list:
     adapter    = Ref(RefKind.ADAPTER, f"/tmp/lora_identity_{user_id}.safetensors")
     candidates = gen_engine.generate(prompts, adapter)
 
-    # Phase-2 pass-through: no Quality Gate yet — every candidate becomes a winner (accepted).
-    winners = [
-        Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
-               slot_id=(c.slot_id if c.slot_id is not None else i))
-        for i, c in enumerate(candidates)
-    ]
+    # ── Diagnostic STAGE CAPTURE (instrumentation only; DEFAULT OFF) ──────────────
+    # When STAGE_CAPTURE=1, upload the RAW base-generation image (post SDXL+LoRA+IP-Adapter,
+    # BEFORE upscale/realism/face-refine) for each seed to a diagnostics prefix, IN ADDITION to
+    # the normal final delivery. This reads the already-produced ctx.images[gen://…] and writes
+    # EXTRA blobs only — it changes NO image computation, RNG, or delivered output, so it cannot
+    # affect results. Lets ONE run compare raw-vs-final expression (E1/E2 causal isolation).
+    if os.environ.get("STAGE_CAPTURE", "0").strip() == "1":
+        for i, c in enumerate(candidates):
+            try:
+                _raw = ctx.images[c.image_ref.location]
+                _buf = io.BytesIO(); _raw.save(_buf, format="PNG"); _buf.seek(0)
+                blob_service.get_blob_client(
+                    container=AZURE_BLOB_CONTAINER,
+                    blob=f"diagnostics/stages/{job_id}/headshot_{i + 1}_raw.png",
+                ).upload_blob(_buf, overwrite=True)
+                write_debug(f"STAGE_CAPTURE: raw headshot_{i + 1} -> diagnostics/stages/{job_id}/")
+            except Exception as e:
+                write_debug(f"STAGE_CAPTURE raw upload failed for candidate {i}: {e}")
+
+    # ── Phase-6 Quality Gate (DEFAULT OFF) ────────────────────────────────────────────
+    # QUALITY_GATE=1 scores candidates with a commercial-safe embedder, keeps the best per slot
+    # above threshold, and retries failed slots within candidate_budget BEFORE enhancement.
+    # DEFAULT OFF -> the historical pass-through below, so prod behavior is UNCHANGED until this
+    # is validated on an A100. (The commercial embedder is not integrated yet, so with the flag
+    # ON it raises NotImplementedError by design — the gate can never silently ship an
+    # unlicensed scorer.)
+    if os.environ.get("QUALITY_GATE", "0").strip() == "1":
+        from runtime.quality_gate import run_quality_gate_for_job
+        winners = run_quality_gate_for_job(
+            candidates, plan, ctx, ref_faces, prompt_engine, gen_engine, write_debug)
+    else:
+        winners = [
+            Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
+                   slot_id=(c.slot_id if c.slot_id is not None else i))
+            for i, c in enumerate(candidates)
+        ]
     finals = enh_engine.enhance(winners)
 
     # delivered_size read from the actual last final image (parity with legacy).

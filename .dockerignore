@@ -3,6 +3,7 @@
 !Dockerfile.unified
 !Dockerfile.app
 !entrypoint.py
+!gpu_preflight.py
 !main.py
 !requirements.txt
 !rrdbnet.py

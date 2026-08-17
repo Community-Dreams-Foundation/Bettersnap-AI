@@ -53,6 +53,27 @@ FUSED = {"train_infer", "train+infer", "train_and_infer", "fused"}
 
 mode = os.environ.get("MODE", "infer").strip().lower()
 
+# ── MANDATORY GPU PREFLIGHT ──────────────────────────────────────────────────────────
+# Runs for EVERY mode, before ANY dispatch, model load, job-state update, or credit
+# finalization. On a GPU/CUDA failure it prints a full diagnostic, best-effort persists it
+# to durable storage, and exits with a distinct non-zero code (42/43/44) — so the container
+# NEVER falls back to CPU and never reaches run_training.py / main.py. The exit code is
+# visible via `ContainerTerminated` in ContainerAppSystemLogs even when console logs lag.
+# (gpu_preflight.py is COPYed next to this script in Dockerfile.unified, so it is importable
+# from the script directory.)
+import gpu_preflight  # noqa: E402
+gpu_preflight.run_preflight()   # never returns when CUDA is unavailable
+
+# ── PREFLIGHT-ONLY DIAGNOSTIC MODE ───────────────────────────────────────────────────
+# Infra-validation switch: prove the GPU preflight runs correctly inside Azure Container Apps
+# WITHOUT loading any model, training, generating, reserving work, or consuming credits. On a
+# GPU FAILURE run_preflight() already exited (42/43/44) above and wrote its diagnostic blob;
+# on a GPU SUCCESS it returned, and here we exit 0 BEFORE any dispatch. Completes in seconds.
+if os.environ.get("PREFLIGHT_ONLY", "").strip().lower() in ("1", "true", "yes"):
+    log.info("PREFLIGHT_ONLY set -> GPU preflight PASSED; exiting 0 without dispatch "
+             "(no model load, no training, no inference, no credits).")
+    sys.exit(0)
+
 
 def _exec(cwd, script):
     """Replace this process with `script`, so its exit code is the container's."""

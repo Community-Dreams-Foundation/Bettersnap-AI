@@ -62,6 +62,29 @@ NUM_CLASS_IMAGES = os.environ.get("NUM_CLASS_IMAGES", "200")
 PRIOR_W          = os.environ.get("PRIOR_LOSS_WEIGHT", "1.0")
 # woman | man | person — the cache key for the class images (see below).
 CLASS_WORD       = os.environ.get("CLASS_WORD", "woman").strip().lower()
+# CLASS_WORD chooses the shared Blob prefix, while CLASS_PROMPT generates the images
+# stored beneath it. A mismatch poisons every later cache hit (for example, male images
+# uploaded under class/woman/). Validate before any filesystem, Blob, cache, or GPU work.
+_VALID_CLASS_WORDS = {"woman", "man", "person"}
+_norm_prompt = lambda value: " ".join((value or "").strip().lower().split())
+_expected_class_prompt = f"a photo of a {CLASS_WORD}"
+_expected_instance_prompt = f"a photo of ohwx {CLASS_WORD}"
+if CLASS_WORD not in _VALID_CLASS_WORDS:
+    fail(
+        f"invalid CLASS_WORD={CLASS_WORD!r}; expected one of "
+        f"{sorted(_VALID_CLASS_WORDS)}"
+    )
+if _norm_prompt(CLASS_PROMPT) != _expected_class_prompt:
+    fail(
+        f"CLASS_PROMPT/CLASS_WORD mismatch: CLASS_WORD={CLASS_WORD!r} requires "
+        f"CLASS_PROMPT={_expected_class_prompt!r}, got {CLASS_PROMPT!r}; "
+        "refusing to read or publish the shared class-image cache"
+    )
+if _norm_prompt(INSTANCE_PROMPT) != _expected_instance_prompt:
+    fail(
+        f"INSTANCE_PROMPT/CLASS_WORD mismatch: CLASS_WORD={CLASS_WORD!r} requires "
+        f"INSTANCE_PROMPT={_expected_instance_prompt!r}, got {INSTANCE_PROMPT!r}"
+    )
 # Gradient checkpointing recomputes activations in the backward pass instead of
 # storing them: ~30-40% SLOWER, much less VRAM. It is on by default because that is
 # the safe assumption for SDXL@1024 — but we run on an 80GB A100 where inference peaks

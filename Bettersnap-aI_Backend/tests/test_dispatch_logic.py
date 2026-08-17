@@ -21,6 +21,7 @@ import sys
 import json
 import types
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -88,6 +89,7 @@ _mod("azure.storage")
 _mod("azure.storage.blob",
      generate_blob_sas=mock.Mock(return_value="sas"),
      BlobSasPermissions=mock.Mock())
+_mod("requests", post=mock.Mock(), get=mock.Mock())
 
 # Stub the heavy LEAF modules so importing function_app never pulls pyodbc / jwt
 # / azure-mgmt. NOTE: 'shared' itself and shared.job_reservation are left REAL so
@@ -105,7 +107,8 @@ _mod("shared.blob",
 _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
 _mod("shared.queue_trigger",
      trigger_container_job=mock.Mock(return_value="exec-123"),
-     count_active_job_executions=mock.Mock(return_value=0))
+     count_active_job_executions=mock.Mock(return_value=0),
+     find_execution_for_job=mock.Mock(return_value=None))
 
 
 # Identity-LoRA training deps. crops pulls opencv and training_trigger pulls
@@ -130,13 +133,172 @@ _mod("shared.gpu_lease",
      acquire_dispatch_lease=mock.Mock(return_value="owner-1"),
      release_dispatch_lease=mock.Mock(),
      mark_dispatched=mock.Mock(),
+     clear_dispatch_pending=mock.Mock(),
      recent_dispatch_pending=mock.Mock(return_value=False),
      DispatchConfigError=_DispatchConfigError)
 
 import function_app  # noqa: E402
 
 
+class JobRouteIdTests(unittest.TestCase):
+    def setUp(self):
+        self._db_patcher = mock.patch.object(function_app, "get_db")
+        self.get_db = self._db_patcher.start()
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+
+    def tearDown(self):
+        self._db_patcher.stop()
+
+    @staticmethod
+    def _request(job_id):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {"job_id": job_id}
+        return req
+
+    def test_malformed_id_returns_404_before_sql_for_all_job_routes(self):
+        for handler in (
+            function_app.job_status,
+            function_app.job_result_url,
+            function_app.delete_job,
+        ):
+            with self.subTest(handler=handler.__name__):
+                self.get_db.reset_mock()
+                response = handler(self._request("not-a-guid"))
+                self.assertEqual(response.status_code, 404)
+                self.get_db.assert_not_called()
+
+    def test_valid_id_is_canonicalized(self):
+        raw = "D85B1407-351D-4694-9392-03ACC5870EB1"
+        self.assertEqual(
+            function_app._route_job_id(self._request(raw)),
+            "d85b1407-351d-4694-9392-03acc5870eb1",
+        )
+
+
+class ProfileEmailValidationTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self, update_error=None):
+            self.update_error = update_error
+            self._row = None
+
+        def execute(self, sql, *_params):
+            normalized = " ".join(sql.lower().split())
+            if normalized.startswith("select user_id from users"):
+                self._row = ("user-1",)
+            elif normalized.startswith("update users set") and self.update_error:
+                raise self.update_error
+            return self
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self, update_error=None):
+            self.cur = ProfileEmailValidationTests.Cursor(update_error)
+            self.rolled_back = False
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            self.rolled_back = True
+
+    @staticmethod
+    def _request(email):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.get_json = lambda: {"email": email}
+        return req
+
+    def test_invalid_email_returns_400_before_database_access(self):
+        with mock.patch.object(function_app, "get_db") as get_db:
+            response = function_app.update_profile(self._request("not-an-email"))
+
+        self.assertEqual(response.status_code, 400)
+        get_db.assert_not_called()
+
+    def test_duplicate_email_unique_violation_returns_409(self):
+        duplicate = RuntimeError(
+            "23000", "Cannot insert duplicate key row in unique index "
+            "'UX_users_email' (2601)"
+        )
+        conn = self.Connection(duplicate)
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.update_profile(self._request(" Used@Example.COM "))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already in use", response.body)
+        self.assertTrue(conn.rolled_back)
+
+    def test_unrelated_database_error_is_not_hidden_as_conflict(self):
+        conn = self.Connection(RuntimeError("database unavailable"))
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                function_app.update_profile(self._request("valid@example.com"))
+
+        self.assertTrue(conn.rolled_back)
+
+
 # ── A programmable fake DB connection/cursor ──────────────────────────────
+class UploadServerNamingTests(unittest.TestCase):
+    class File:
+        def __init__(self, filename, data):
+            self.filename = filename
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    @staticmethod
+    def _image_bytes(fmt):
+        from io import BytesIO
+        from PIL import Image
+
+        output = BytesIO()
+        Image.new("RGB", (256, 256), "white").save(output, format=fmt)
+        return output.getvalue()
+
+    @classmethod
+    def _request(cls, filename, fmt="JPEG"):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.files = {"photo": cls.File(filename, cls._image_bytes(fmt))}
+        return req
+
+    def setUp(self):
+        function_app.upload_blob.reset_mock()
+        function_app.upload_blob.return_value = "https://storage/upload"
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+
+    def test_duplicate_client_filenames_get_distinct_server_blob_names(self):
+        first = function_app.upload_photo(self._request("image.jpg"))
+        second = function_app.upload_photo(self._request("image.jpg"))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        first_name = json.loads(first.body)["blob_name"]
+        second_name = json.loads(second.body)["blob_name"]
+        self.assertNotEqual(first_name, second_name)
+        for name in (first_name, second_name):
+            self.assertRegex(name, r"^user-1/input/[0-9a-f]{32}\.jpg$")
+            self.assertNotIn("image.jpg", name)
+
+    def test_slash_name_is_ignored_and_extension_comes_from_verified_bytes(self):
+        response = function_app.upload_photo(
+            self._request("nested/client/name.jpg", fmt="PNG"))
+
+        self.assertEqual(response.status_code, 200)
+        blob_name = json.loads(response.body)["blob_name"]
+        self.assertRegex(blob_name, r"^user-1/input/[0-9a-f]{32}\.png$")
+        relative_name = blob_name.removeprefix("user-1/input/")
+        self.assertNotIn("/", relative_name)
+        self.assertNotIn("nested", blob_name)
+
+
 class FakeCursor:
     """Branches on SQL text to return per-test values. Tracks executed SQL."""
     def __init__(self, cfg):
@@ -165,6 +327,12 @@ class FakeCursor:
             )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
+        elif "select job_id from jobs where status = 'processing'" in s:
+            self._fetchall = self.cfg.get("reaper_processing", [])
+        elif "select job_id, external_execution_id from jobs where status = 'dispatching'" in s:
+            self._fetchall = self.cfg.get("reaper_dispatching", [])
+        elif "select terms_accepted_at from users" in s:
+            self._fetch = (self.cfg.get("terms_accepted_at"),)
         elif "update jobs set status = 'dispatching'" in s:
             self.rowcount = self.cfg.get("claim_rowcount", 1)
         elif "update lora_trainings set status = 'dispatching'" in s:
@@ -188,6 +356,11 @@ class FakeCursor:
         elif "select job_id, job_params from jobs" in s:
             self._fetch = None
             self._fetchall = self.cfg.get("parked_jobs", [])
+        elif "lora_status from users with (updlock" in s:
+            # Merged reserve_job_slot reads lora_status alone (its own UPDLOCK query).
+            self._fetch = (
+                self.cfg.get("reservation_lora_status", self.cfg.get("lora_status", "ready")),
+            )
         elif "select monthly_credits_remaining, one_time_credits_remaining" in s:
             self._fetch = (
                 self.cfg.get("credits", 20),
@@ -199,7 +372,8 @@ class FakeCursor:
             self._fetch = (self.cfg.get("credits", 20),)
         # #6 purchase-gate: in-flight job count (status IN ...) — MUST precede the generic
         # user-count branch, which the same "count(*) from jobs where user_id" would swallow.
-        elif "count(*) from jobs where user_id" in s and "status in" in s:
+        elif ("count(*) from jobs where user_id" in s and "status in" in s
+              and "created_at" not in s):
             self._fetch = (self.cfg.get("jobs_in_flight", 0),)
         elif "select subscription_type, stripe_subscription_id" in s:
             if "stripe_checkout_expires_at" in s:
@@ -280,7 +454,7 @@ class FakeCursor:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
-        elif "count(*) from jobs where created_at" in s:
+        elif "count(*) from jobs" in s and "user_id" not in s and "created_at" in s:
             self._fetch = (self.cfg.get("global_count", 0),)
         elif "insert into jobs" in s:
             self._fetch = (self.cfg.get("new_job_id", 999),)
@@ -288,6 +462,8 @@ class FakeCursor:
         # _finish_training's txn) — OUTPUT INSERTED.outbox_id, so fetchone must return an id.
         elif "insert into outbox" in s:
             self._fetch = (self.cfg.get("new_outbox_id", 12345),)
+        elif "insert into processed_stripe_events" in s:
+            self.rowcount = self.cfg.get("claim_event_rowcount", 1)
         elif "select user_id from lora_trainings" in s:
             self._fetch = (self.cfg.get("training_user", "user-1"),)
         else:
@@ -330,13 +506,15 @@ class DispatchTests(unittest.TestCase):
         qt = sys.modules["shared.queue_trigger"]
         qc = sys.modules["shared.queue_client"]
         for m in (gl.acquire_dispatch_lease, gl.release_dispatch_lease, gl.mark_dispatched,
+                  gl.clear_dispatch_pending,
                   gl.recent_dispatch_pending, qt.trigger_container_job,
-                  qt.count_active_job_executions, qc.enqueue_job):
+                  qt.count_active_job_executions, qt.find_execution_for_job, qc.enqueue_job):
             m.reset_mock(); m.side_effect = None
         gl.acquire_dispatch_lease.return_value = "owner-1"
         gl.recent_dispatch_pending.return_value = False
         qt.trigger_container_job.return_value = "exec-123"
         qt.count_active_job_executions.return_value = 0
+        qt.find_execution_for_job.return_value = None
         os.environ["GPU_DISPATCH_ENABLED"] = "true"
         self._cfg = {"job_row": ("queued", None), "claim_rowcount": 1}
         self._patch = mock.patch.object(
@@ -375,10 +553,12 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.assert_not_called()
 
     def test_existing_execution_id_skips_even_if_queued(self):
+        gl = sys.modules["shared.gpu_lease"]
         qt = sys.modules["shared.queue_trigger"]
         self._cfg["job_row"] = ("queued", "exec-existing")  # has exec id -> skip
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_not_called()
+        gl.clear_dispatch_pending.assert_called_once_with("owner-1")
 
     # 3) happy path -> starts exactly once, records execution id, releases lease
     def test_happy_path_starts_once(self):
@@ -387,11 +567,26 @@ class DispatchTests(unittest.TestCase):
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_called_once()
         gl.mark_dispatched.assert_called_once()
+        gl.clear_dispatch_pending.assert_called_once_with("owner-1")
         gl.release_dispatch_lease.assert_called_once()
         # #5A: the queued->dispatching claim stamps dispatched_at, so the reaper can measure
         # the processing deadline from GPU-run start instead of submit time.
         self.assertTrue(any("dispatched_at = getutcdate()" in s.lower()
                             for s, _ in self._cfg["executed"]))
+
+    def test_cold_start_is_reserved_before_azure_start(self):
+        gl = sys.modules["shared.gpu_lease"]
+        qt = sys.modules["shared.queue_trigger"]
+
+        def start_only_after_reservation(*_args, **_kwargs):
+            gl.mark_dispatched.assert_called_once_with("owner-1")
+            return "exec-123"
+
+        qt.trigger_container_job.side_effect = start_only_after_reservation
+        function_app.process_inference_job(
+            _QueueMessage({"job_id": "1", "user_id": "u"})
+        )
+        qt.trigger_container_job.assert_called_once()
 
     # 4) over-cap -> defers, does not start
     def test_over_cap_defers(self):
@@ -444,6 +639,8 @@ class DispatchTests(unittest.TestCase):
         qt.trigger_container_job.side_effect = RuntimeError("ACA 500")
         with self.assertRaises(RuntimeError):
             function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
+        sys.modules["shared.gpu_lease"].clear_dispatch_pending.assert_called_once_with(
+            "owner-1")
         self.assertTrue(any("status = 'queued'" in sql and "dispatching" in sql
                             for sql, _ in self._cfg["executed"]))
 
@@ -465,6 +662,25 @@ class DispatchTests(unittest.TestCase):
         self._cfg["job_row"] = ("dispatching", None)  # state left by the crash
         function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
         qt.trigger_container_job.assert_not_called()
+
+    def test_retry_after_start_commit_gap_recovers_execution_id(self):
+        qt = sys.modules["shared.queue_trigger"]
+        self._cfg["job_row"] = ("dispatching", None)
+        qt.find_execution_for_job.return_value = "exec-recovered"
+        function_app.process_inference_job(_QueueMessage({"job_id": "1", "user_id": "u"}))
+        qt.trigger_container_job.assert_not_called()
+        self.assertTrue(any(
+            "set external_execution_id" in sql.lower() and params[0] == "exec-recovered"
+            for sql, params in self._cfg["executed"]
+        ))
+
+    def test_malformed_message_is_not_silently_acknowledged(self):
+        with self.assertRaises(ValueError):
+            function_app.process_inference_job(_QueueMessage({"user_id": "u"}))
+
+    def test_poison_message_without_job_id_is_not_dropped(self):
+        with self.assertRaises(ValueError):
+            function_app.handle_poison_job(_QueueMessage({"user_id": "u"}, dequeue_count=3))
 
     # 11) a terminal failure refunds the credit exactly once (guarded transition).
     #     The refund is the FULL amount charged at submit (image_count *
@@ -528,6 +744,53 @@ class DailyCapTests(unittest.TestCase):
         }
         return r
 
+    def test_malformed_json_returns_400(self):
+        req = self._req()
+        req.get_json = mock.Mock(side_effect=ValueError("bad JSON"))
+        resp = function_app.submit_job(req)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("invalid JSON body", resp.body)
+
+    def test_oversized_age_range_is_rejected_before_database_access(self):
+        req = self._req()
+        body = req.get_json()
+        body["age_range"] = "2" * (function_app.MAX_PROFILE_ATTRIBUTE_CHARS + 1)
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("age_range", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
+    def test_oversized_hair_color_is_rejected_before_database_access(self):
+        req = self._req()
+        body = req.get_json()
+        body["hair_color"] = "x" * (function_app.MAX_PROFILE_ATTRIBUTE_CHARS + 1)
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("hair_color", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
+    def test_non_string_profile_attributes_are_rejected(self):
+        req = self._req()
+        body = req.get_json()
+        body["age_range"] = ["25-29"]
+        req.get_json = lambda: body
+        self._cfg["executed"] = []
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must be strings", resp.body)
+        self.assertEqual(self._cfg["executed"], [])
+
+
     def test_per_user_cap_blocks_at_limit(self):
         self._cfg["user_count"] = function_app.PER_USER_DAILY_CAP
         self._cfg["global_count"] = 0
@@ -541,6 +804,22 @@ class DailyCapTests(unittest.TestCase):
         resp = function_app.submit_job(self._req())
         self.assertEqual(resp.status_code, 429)
         self.assertIn("global", resp.body)
+
+    def test_daily_caps_exclude_failed_and_waiting_lora_statuses(self):
+        self._cfg.update(user_count=0, global_count=0)
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+
+        cap_queries = [
+            sql.lower() for sql, _ in self._cfg["executed"]
+            if "count(*) from jobs" in sql.lower() and "created_at" in sql.lower()
+        ]
+        self.assertEqual(len(cap_queries), 2)
+        for sql in cap_queries:
+            self.assertIn(
+                "status in ('queued', 'dispatching', 'processing', 'completed')", sql)
+            self.assertNotIn("waiting_lora", sql)
+            self.assertNotIn("failed", sql)
 
     def test_no_credits_blocks(self):
         self._cfg["credits"] = 0
@@ -582,6 +861,25 @@ class DailyCapTests(unittest.TestCase):
             mf.assert_not_called()                     # NOT refunded; the dispatcher retries
         finally:
             qc._send.side_effect = None
+
+
+class AcceptTermsTests(unittest.TestCase):
+    def test_uses_server_utc_time_and_ignores_client_timestamp(self):
+        server_time = datetime(2026, 8, 3, 12, 34, 56, tzinfo=timezone.utc)
+        cfg = {"terms_accepted_at": server_time}
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer t"}
+        req.get_json = mock.Mock(return_value={"accepted_at": "1999-01-01T00:00:00Z"})
+
+        with mock.patch.object(function_app, "get_db", return_value=FakeConn(cfg)):
+            resp = function_app.accept_terms(req)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(req.get_json.called)
+        update_sql, update_params = cfg["executed"][0]
+        self.assertIn("terms_accepted_at = GETUTCDATE()", update_sql)
+        self.assertEqual(update_params, ("user-1",))
+        self.assertNotIn("1999", resp.body)
 
 
 class IdentityLoraGateTests(unittest.TestCase):
@@ -643,6 +941,34 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertIn("waiting_lora", resp.body)
         inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
         self.assertEqual(inserts[0][1], "waiting_lora")                  # parked status
+        sys.modules["shared.queue_client"]._send.assert_not_called()
+
+    def test_training_finishes_between_gate_and_reservation_queues_job(self):
+        """Regression: the early handler read says training, but completion wins the
+        race before the atomic reservation. The locked re-read must choose queued and
+        write an outbox message, never insert an orphaned waiting_lora row."""
+        self._cfg["lora_status"] = "training"              # early, stale read
+        self._cfg["reservation_lora_status"] = "ready"     # locked transactional read
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 202)
+        self.assertIn('"status": "queued"', resp.body)
+        inserts = [p for s, p in self._cfg["executed"] if "insert into jobs" in s.lower()]
+        self.assertEqual(inserts[0][1], "queued")
+        # Merged reserve_job_slot reads lora_status in its OWN UPDLOCK/HOLDLOCK query
+        # (split from the credit-balance read) — behaviour is identical, query text changed.
+        locked_reads = [s.lower() for s, _ in self._cfg["executed"]
+                        if "select lora_status" in s.lower()]
+        self.assertTrue(any("updlock" in s and "holdlock" in s for s in locked_reads))
+        sys.modules["shared.queue_client"]._send.assert_called_once()
+
+    def test_training_failure_between_gate_and_reservation_does_not_charge(self):
+        self._cfg["lora_status"] = "training"              # early, stale read
+        self._cfg["reservation_lora_status"] = "failed"    # locked transactional read
+        resp = function_app.submit_job(self._req())
+        self.assertEqual(resp.status_code, 409)
+        sqls = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertFalse(any("insert into jobs" in s for s in sqls))
+        self.assertFalse(any("credits_remaining -" in s for s in sqls))
         sys.modules["shared.queue_client"]._send.assert_not_called()
 
     def test_ready_lora_dispatches_normally(self):
@@ -1429,6 +1755,21 @@ class ReaperTests(unittest.TestCase):
         self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
                          "reaper still measures from created_at (submit time)")
 
+    def test_reaper_recovers_live_null_execution_instead_of_failing_it(self):
+        cfg = {"reaper_dispatching": [("job-7", None)]}
+        qt = sys.modules["shared.queue_trigger"]
+        qt.find_execution_for_job.reset_mock()
+        qt.find_execution_for_job.return_value = "exec-live"
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+
+        self.assertTrue(any(
+            "set external_execution_id" in sql.lower() and params == ("exec-live", "job-7")
+            for sql, params in cfg["executed"]
+        ))
+        self.assertFalse(any("status = 'failed'" in sql.lower() for sql, _ in cfg["executed"]))
+
 
 class RegistrationTests(unittest.TestCase):
     """M1 regression: POST /users/register must REPORT the same credit balance it
@@ -1471,6 +1812,184 @@ class RegistrationTests(unittest.TestCase):
             returned, granted,
             "register response 'credits' must match the granted/persisted balance",
         )
+
+
+class PublicCatalogPrivacyTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.sql = ""
+
+        def execute(self, sql, *_params):
+            self.sql = " ".join(sql.lower().split())
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def __init__(self, rows):
+            self.cur = PublicCatalogPrivacyTests.Cursor(rows)
+
+        def cursor(self):
+            return self.cur
+
+    def test_attires_exclude_internal_blob_path(self):
+        conn = self.Conn([("suit", "Navy Suit", "professional")])
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.get_attires(None)
+        item = json.loads(response.body)["attires"][0]
+        self.assertNotIn("blob_path", item)
+        self.assertNotIn("blob_path", conn.cur.sql)
+
+    def test_backgrounds_exclude_internal_blob_path(self):
+        conn = self.Conn([("studio", "Studio", "professional")])
+        with mock.patch.object(function_app, "get_db", return_value=conn):
+            response = function_app.get_backgrounds(None)
+        item = json.loads(response.body)["backgrounds"][0]
+        self.assertNotIn("blob_path", item)
+        self.assertNotIn("blob_path", conn.cur.sql)
+
+
+class SubscriptionDowngradeTests(unittest.TestCase):
+    def test_ended_subscription_preserves_one_time_credits(self):
+        cfg = {}
+        with mock.patch.object(function_app, "new_connection",
+                               return_value=FakeConn(cfg)):
+            function_app._handle_subscription_ended(
+                {"id": "sub-ended", "status": "canceled"}, "evt-ended"
+            )
+
+        updates = [
+            (sql, params) for sql, params in cfg["executed"]
+            if "update users set" in sql.lower() and "credits_monthly_limit" in sql.lower()
+        ]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
+        # Separate-balance downgrade: keep any remaining one-time credits (revert to a one_time
+        # account) instead of wiping to the trial/registration limit. Only RETENTION_DAYS + the
+        # subscription id bind now.
+        self.assertIn("credits_remaining = one_time_credits_remaining", sql.lower())
+        self.assertIn("monthly_credits_remaining = 0", sql.lower())
+        self.assertEqual(params[0], function_app.RETENTION_DAYS)
+        self.assertEqual(params[1], "sub-ended")
+
+
+class StripePaidGrantTests(unittest.TestCase):
+    """A paid entitlement must not be acknowledged after a zero-row update."""
+
+    class _Req:
+        headers = {"Stripe-Signature": "sig"}
+
+        @staticmethod
+        def get_body():
+            return b"{}"
+
+    def test_retryable_paid_grant_returns_500(self):
+        event = {
+            "id": "evt_paid_unregistered",
+            "type": "checkout.session.completed",
+            "data": {"object": {"metadata": {"payment_type": "one_time"}}},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value=event), \
+             mock.patch.object(
+                 function_app,
+                 "_handle_onetime_payment",
+                 side_effect=function_app.RetryableStripeWebhookError("no user row"),
+             ):
+            response = function_app.stripe_webhook(self._Req())
+        self.assertEqual(response.status_code, 500)
+
+    def test_invoice_zero_row_rolls_back_and_is_retryable(self):
+        class Cursor:
+            rowcount = 0
+
+            def execute(self, sql, *params):
+                self.rowcount = 1 if "processed_stripe_events" in sql else 0
+                return self
+
+        class Conn:
+            def __init__(self):
+                self.cur = Cursor()
+                self.committed = False
+                self.rolled_back = False
+
+            def cursor(self):
+                return self.cur
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                self.rolled_back = True
+
+            def close(self):
+                pass
+
+        conn = Conn()
+        with mock.patch.object(function_app, "new_connection", return_value=conn):
+            with self.assertRaises(function_app.RetryableStripeWebhookError):
+                function_app._handle_invoice_paid(
+                    {"subscription": "sub_missing"}, "evt_invoice_missing"
+                )
+        self.assertTrue(conn.rolled_back)
+        self.assertFalse(conn.committed)
+
+    def test_renewal_never_overwrites_balance_with_monthly_limit(self):
+        class Cursor:
+            rowcount = 0
+
+            def __init__(self):
+                self.sql = []
+
+            def execute(self, sql, *params):
+                normalized = " ".join(sql.lower().split())
+                self.sql.append(normalized)
+                self.rowcount = 1
+                return self
+
+            def fetchone(self):
+                # Feeds the post-reset renewal-ledger lookup (user_id, credits_monthly_limit).
+                return ("u-renew", 100)
+
+        class Conn:
+            def __init__(self):
+                self.cur = Cursor()
+                self.committed = False
+
+            def cursor(self):
+                return self.cur
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        conn = Conn()
+        with mock.patch.object(function_app, "new_connection", return_value=conn):
+            function_app._handle_invoice_paid(
+                {"subscription": "sub_topup"}, "evt_renew_topup"
+            )
+
+        renewal_sql = next(
+            sql for sql in conn.cur.sql
+            if "update users set" in sql and "credits_monthly_limit" in sql
+        )
+        # Separate-balance renewal: reset the monthly allowance to the limit, recompute the
+        # combined balance, and PRESERVE one-time/top-up credits (in one_time_credits_remaining)
+        # — the same "never wipe top-ups on renewal" invariant, expressed for the split balances.
+        self.assertIn(
+            "credits_remaining = credits_monthly_limit + one_time_credits_remaining",
+            renewal_sql,
+        )
+        self.assertIn("monthly_credits_remaining = credits_monthly_limit", renewal_sql)
+        self.assertNotIn(
+            "when credits_remaining > credits_monthly_limit", renewal_sql,
+        )
+        self.assertTrue(conn.committed)
 
 
 if __name__ == "__main__":

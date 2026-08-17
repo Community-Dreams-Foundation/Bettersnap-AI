@@ -61,6 +61,7 @@ _TEST_EMAIL = re.compile(
     r"|\.invalid$"                        # RFC 2606 reserved
     r"|^exp-"                             # exp-girl-..., exp-new-...
     r"|^qa(\d+)?([+._-]|@)"               # qa@, qa01@, qa+bs01@, qa.bs01@
+    r"|[.-]test\d*@"                      # kumar-test@, kumar.test@, foo-test01@ (test-auth accounts)
     r"|[+](test|qa|bs|demo)\w*@)", re.I)  # anything+test@, +qa@, +bs01@, +demo@
 
 
