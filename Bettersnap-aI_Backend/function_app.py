@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+import secrets
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
 # Deliberately conservative for an unproven A100 product — raise only after
@@ -2552,3 +2553,357 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
 # was mid-dunning) got a free monthly refill. If a payment-confirmed fallback is ever
 # needed (e.g. to cover a missed webhook), it must reconcile against Stripe — query the
 # subscription's latest invoice status — not refill on elapsed time alone.
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — invitations & members (migration 016)
+#
+# Owns the two tables from 016: invitations, organization_members.
+# Sireesha's 015 owns organizations / organization_payments / jobs.organization_id.
+#
+# editing the
+# file on Features_team — keeping each person's handlers in one contiguous block
+# at a known place keeps merge conflicts to the seam instead of scattered through
+# 2,500 lines.
+# ══════════════════════════════════════════════════════════════════════════
+
+# How long an invite link stays usable. Long enough that an employee can act on an
+# email they read on Monday and click on Friday; short enough that a leaked link in
+# an old inbox stops working.
+INVITE_EXPIRY_DAYS = int(os.environ.get("INVITE_EXPIRY_DAYS", "14"))
+
+
+def _require_org_admin(cursor, user_id, org_id):
+    """Returns (org_row, None) if user_id is the admin of org_id, else (None, error_response).
+
+    Every Teams endpoint below resolves authority through this: the org is looked up
+    by BOTH id and admin_user_id, so a caller cannot act on an org they don't own by
+    guessing an organization_id. 404 (not 403) on someone else's org — a wrong-owner
+    request should not confirm the org exists.
+    """
+    cursor.execute(
+        "SELECT organization_id, seats_purchased, credits_per_seat, status "
+        "FROM organizations WHERE organization_id = ? AND admin_user_id = ?",
+        org_id, user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, func.HttpResponse("Organization not found", status_code=404)
+    if row[3] != "active":
+        return None, func.HttpResponse(
+            json.dumps({"error": "ORG_NOT_ACTIVE", "status": row[3]}),
+            mimetype="application/json", status_code=403)
+    return row, None
+
+
+# ── Send invitations ──────────────────────────────────────
+@app.route(route="orgs/{org_id}/invitations", methods=["POST"])
+def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
+    """Admin invites employees by email. Body: {"emails": ["a@x.com", "b@x.com"]}
+
+    Seat accounting counts members + still-pending invites together. Counting only
+    members would let an admin with 5 seats send 50 invites and oversell the plan on
+    a first-come race; a pending invite is a reserved seat until it expires.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    org_id = req.route_params.get("org_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    emails = body.get("emails") or []
+    if isinstance(emails, str):          # tolerate a single address
+        emails = [emails]
+    # Normalize before de-duping so "A@x.com" and "a@x.com " don't both get a seat.
+    emails = [e.strip().lower() for e in emails if isinstance(e, str) and e.strip()]
+    emails = list(dict.fromkeys(emails))  # de-dupe, preserve order
+    if not emails:
+        return func.HttpResponse(
+            json.dumps({"error": "NO_EMAILS"}),
+            mimetype="application/json", status_code=400)
+
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        org, err = _require_org_admin(cur, user_id, org_id)
+        if err:
+            return err
+        seats_purchased, credits_per_seat = org[1], org[2]
+
+        # Seats already taken: active members + live pending invites.
+        cur.execute(
+            "SELECT COUNT(*) FROM organization_members "
+            "WHERE organization_id = ? AND status = 'active'", org_id)
+        active_members = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM invitations WHERE organization_id = ? "
+            "AND status = 'pending' AND expires_at > SYSUTCDATETIME()", org_id)
+        pending_invites = cur.fetchone()[0]
+        seats_left = seats_purchased - active_members - pending_invites
+
+        if seats_left <= 0:
+            return func.HttpResponse(
+                json.dumps({"error": "NO_SEATS_AVAILABLE",
+                            "seats_purchased": seats_purchased,
+                            "active_members": active_members,
+                            "pending_invites": pending_invites}),
+                mimetype="application/json", status_code=409)
+
+        # Skip anyone already on the plan or already holding a live invite, rather than
+        # spending a seat on a duplicate. Reported back so the admin sees why.
+        cur.execute(
+            "SELECT LOWER(i.email) FROM invitations i WHERE i.organization_id = ? "
+            "AND i.status = 'pending' AND i.expires_at > SYSUTCDATETIME()", org_id)
+        already_invited = {r[0] for r in cur.fetchall()}
+
+        created, skipped = [], []
+        expires_at = datetime.now(timezone.utc) + timedelta(days=INVITE_EXPIRY_DAYS)
+
+        for email in emails:
+            if email in already_invited:
+                skipped.append({"email": email, "reason": "ALREADY_INVITED"})
+                continue
+            if len(created) >= seats_left:
+                skipped.append({"email": email, "reason": "NO_SEATS_AVAILABLE"})
+                continue
+            # token_urlsafe is a CSPRNG — this value IS the credential in the emailed
+            # link, so it must not come from uuid4/random. 32 bytes -> ~43 chars, well
+            # inside the VARCHAR(128) column.
+            invite_token = secrets.token_urlsafe(32)
+            cur.execute("""
+                INSERT INTO invitations
+                    (organization_id, email, token, status, invited_by_user_id, expires_at)
+                OUTPUT INSERTED.invitation_id
+                VALUES (?, ?, ?, 'pending', ?, ?)
+            """, org_id, email, invite_token, user_id, expires_at)
+            invitation_id = cur.fetchone()[0]
+            created.append({"invitation_id": str(invitation_id),
+                            "email": email,
+                            "token": invite_token})
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    # NOTE: sending the actual emails is not wired up here. bettersnap-acs
+    # (Communication Service) is already used elsewhere for completion emails — the
+    # invite email should go through the same path. Until then the caller gets the
+    # tokens back and the frontend/admin distributes the links.
+    logging.info(f"invitations created: org={org_id} count={len(created)} "
+                 f"skipped={len(skipped)}")
+
+    return func.HttpResponse(
+        json.dumps({"created": created, "skipped": skipped,
+                    "credits_per_seat": credits_per_seat,
+                    "expires_at": expires_at.isoformat()}),
+        mimetype="application/json", status_code=201)
+
+
+# ── Accept an invitation ──────────────────────────────────
+@app.route(route="invitations/{token}/accept", methods=["POST"])
+def accept_invitation(req: func.HttpRequest) -> func.HttpResponse:
+    """Employee joins the org after logging in.
+
+    By the time this is called the caller already has a users row: the frontend's
+    AuthContext calls POST /users/register after every login, and that endpoint is
+    idempotent. So this only has to create the MEMBERSHIP, not the account.
+
+    Everything runs in one transaction: re-check the invite, re-count seats, insert
+    the member, mark the invite accepted. The seat count is re-checked HERE and not
+    just at invite time, because two employees can accept the last seat at the same
+    moment.
+    """
+    auth = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(auth)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    invite_token = req.route_params.get("token")
+    if not invite_token:
+        return func.HttpResponse("Missing token", status_code=400)
+
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        # UPDLOCK/HOLDLOCK: hold the invite row for the life of the transaction so a
+        # double-click can't have two requests both read 'pending' and both insert.
+        cur.execute("""
+            SELECT invitation_id, organization_id, status, expires_at
+            FROM invitations WITH (UPDLOCK, HOLDLOCK)
+            WHERE token = ?
+        """, invite_token)
+        inv = cur.fetchone()
+        if not inv:
+            return func.HttpResponse(
+                json.dumps({"error": "INVALID_INVITE"}),
+                mimetype="application/json", status_code=404)
+
+        invitation_id, org_id, inv_status, expires_at = inv
+
+        if inv_status != "pending":
+            # 409, not 404: the link is real, it has just been used or revoked.
+            return func.HttpResponse(
+                json.dumps({"error": "INVITE_NOT_PENDING", "status": inv_status}),
+                mimetype="application/json", status_code=409)
+
+        # expires_at comes back naive from SQL Server; compare against naive UTC.
+        if expires_at <= datetime.now(timezone.utc).replace(tzinfo=None):
+            cur.execute(
+                "UPDATE invitations SET status = 'expired' WHERE invitation_id = ?",
+                invitation_id)
+            conn.commit()
+            return func.HttpResponse(
+                json.dumps({"error": "INVITE_EXPIRED"}),
+                mimetype="application/json", status_code=410)
+
+        # A user belongs to at most one org (UQ_member_user). Check explicitly so the
+        # caller gets a clear reason instead of a 500 from the unique violation, and
+        # so re-accepting your own invite is a friendly no-op rather than an error.
+        cur.execute(
+            "SELECT organization_id FROM organization_members WHERE user_id = ?",
+            user_id)
+        existing = cur.fetchone()
+        if existing:
+            if str(existing[0]).lower() == str(org_id).lower():
+                conn.commit()
+                return func.HttpResponse(
+                    json.dumps({"message": "Already a member",
+                                "organization_id": str(org_id)}),
+                    mimetype="application/json", status_code=200)
+            return func.HttpResponse(
+                json.dumps({"error": "ALREADY_IN_ANOTHER_ORG"}),
+                mimetype="application/json", status_code=409)
+
+        cur.execute(
+            "SELECT seats_purchased, credits_per_seat, status "
+            "FROM organizations WHERE organization_id = ?", org_id)
+        org = cur.fetchone()
+        if not org:
+            return func.HttpResponse("Organization not found", status_code=404)
+        seats_purchased, credits_per_seat, org_status = org
+        if org_status != "active":
+            return func.HttpResponse(
+                json.dumps({"error": "ORG_NOT_ACTIVE", "status": org_status}),
+                mimetype="application/json", status_code=403)
+
+        cur.execute(
+            "SELECT COUNT(*) FROM organization_members "
+            "WHERE organization_id = ? AND status = 'active'", org_id)
+        if cur.fetchone()[0] >= seats_purchased:
+            return func.HttpResponse(
+                json.dumps({"error": "NO_SEATS_AVAILABLE"}),
+                mimetype="application/json", status_code=409)
+
+        # credits_granted is a SNAPSHOT of credits_per_seat at join time. If the admin
+        # later changes the per-seat number, people who already joined keep what they
+        # were given.
+        cur.execute("""
+            INSERT INTO organization_members
+                (organization_id, user_id, invitation_id,
+                 credits_granted, credits_remaining, status)
+            OUTPUT INSERTED.membership_id
+            VALUES (?, ?, ?, ?, ?, 'active')
+        """, org_id, user_id, invitation_id, credits_per_seat, credits_per_seat)
+        membership_id = cur.fetchone()[0]
+
+        cur.execute("""
+            UPDATE invitations
+            SET status = 'accepted', accepted_user_id = ?, accepted_at = SYSUTCDATETIME()
+            WHERE invitation_id = ?
+        """, user_id, invitation_id)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    logging.info(f"invitation accepted: org={org_id} user={user_id} "
+                 f"membership={membership_id}")
+
+    return func.HttpResponse(
+        json.dumps({"membership_id": str(membership_id),
+                    "organization_id": str(org_id),
+                    "credits_granted": credits_per_seat}),
+        mimetype="application/json", status_code=201)
+
+
+# ── List org members ──────────────────────────────────────
+@app.route(route="orgs/{org_id}/members", methods=["GET"])
+def list_org_members(req: func.HttpRequest) -> func.HttpResponse:
+    """Admin's roster view: who has joined, credits used, plus outstanding invites."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    org_id = req.route_params.get("org_id")
+    conn = get_db()
+    cur = conn.cursor()
+
+    org, err = _require_org_admin(cur, user_id, org_id)
+    if err:
+        return err
+    seats_purchased = org[1]
+
+    # LEFT JOIN users: the membership row is the source of truth for who is on the
+    # plan. An INNER JOIN would silently hide a member whose users row is missing.
+    cur.execute("""
+        SELECT m.membership_id, m.user_id, u.email, u.full_name,
+               m.credits_granted, m.credits_remaining, m.status, m.joined_at,
+               m.invitation_id
+        FROM organization_members m
+        LEFT JOIN users u ON u.user_id = m.user_id
+        WHERE m.organization_id = ?
+        ORDER BY m.joined_at ASC
+    """, org_id)
+    members = [{
+        "membership_id": str(r[0]),
+        "user_id": str(r[1]),
+        "email": r[2],
+        "full_name": r[3],
+        "credits_granted": r[4],
+        "credits_remaining": r[5],
+        "status": r[6],
+        "joined_at": r[7].isoformat() if r[7] else None,
+        # NULL invitation_id = the admin, who created the org rather than accepting a link.
+        "is_admin": r[8] is None,
+    } for r in cur.fetchall()]
+
+    cur.execute("""
+        SELECT invitation_id, email, status, expires_at, created_at
+        FROM invitations
+        WHERE organization_id = ? AND status = 'pending'
+              AND expires_at > SYSUTCDATETIME()
+        ORDER BY created_at ASC
+    """, org_id)
+    pending = [{
+        "invitation_id": str(r[0]),
+        "email": r[1],
+        "status": r[2],
+        "expires_at": r[3].isoformat() if r[3] else None,
+        "created_at": r[4].isoformat() if r[4] else None,
+    } for r in cur.fetchall()]
+    # Tokens are deliberately NOT returned here — this is a listing view, and a token
+    # is a credential. They are returned once, at creation.
+
+    active_count = sum(1 for m in members if m["status"] == "active")
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": str(org_id),
+            "seats_purchased": seats_purchased,
+            "seats_used": active_count,
+            "seats_available": max(0, seats_purchased - active_count - len(pending)),
+            "members": members,
+            "pending_invitations": pending,
+        }),
+        mimetype="application/json", status_code=200)
