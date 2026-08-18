@@ -116,23 +116,25 @@ def get_secret(name: str) -> str:
     _secret_cache[name] = (now, value)
     return value
 
-# ── Debug logger to blob ──────────────────────────────────
+# ── Debug logger to blob (append-blob; see runtime/debug_log.py, M9) ──────────
+# Per-job log blob namespaced by JOB_ID (isolates concurrent A100 runs). The logger APPENDS each
+# line to an Azure Append Blob — O(1) per call, no read-modify-write of the whole growing log
+# (was O(n^2) per job and reset the log to one line on a transient download failure), and each
+# line persists immediately so the log survives an OOM SIGKILL. Built lazily on first use.
+_debug_log = None
+
+
 def write_debug(msg: str):
+    global _debug_log
     try:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         line = f"[{timestamp}] {msg}\n"
-        # Per-job log blob. The old code appended EVERY run to one shared
-        # outputs/debug/log.txt with overwrite=True, so two concurrent A100 runs
-        # clobbered each other's logs (read-modify-write race) and the blob grew
-        # unbounded. Namespacing by JOB_ID isolates each run's log.
         job_id = os.environ.get("JOB_ID", "unknown")
         blob_name = f"debug/{job_id}.txt"
-        blob_client = blob_service.get_blob_client(container=AZURE_BLOB_CONTAINER, blob=blob_name)
-        try:
-            existing = blob_client.download_blob().readall().decode()
-        except:
-            existing = ""
-        blob_client.upload_blob(existing + line, overwrite=True)
+        if _debug_log is None:
+            from runtime.debug_log import BlobDebugLog
+            _debug_log = BlobDebugLog(blob_service, AZURE_BLOB_CONTAINER)
+        _debug_log.append(blob_name, line)
     except Exception as e:
         log.error(f"write_debug failed: {e}")
 
@@ -883,6 +885,12 @@ def run_inference(job: dict) -> list:
             write_debug(f"IP_ADAPTER_REF_INDEX={ref_idx} out of range for "
                         f"{len(ref_faces)} crops -> using 0")
             ref_idx = 0
+        # M5: the configured crop can be a training-gate false positive (a wall/room crop with no
+        # face). Re-validate and fall back to a face-bearing crop before it conditions IP-Adapter.
+        from runtime.ref_face_gate import pick_face_ref_index
+        ref_idx, _ref_validation = pick_face_ref_index(
+            ref_faces, ref_ids, ref_idx, _face_cascade, write_debug)
+        ref_meta["face_validation"] = _ref_validation
         ref_meta["fetched"] = ref_ids
         ref_meta["used"] = ref_ids[ref_idx]
         ref_meta["used_index"] = ref_idx
@@ -998,6 +1006,12 @@ def run_inference(job: dict) -> list:
         ]
     finals = enh_engine.enhance(winners)
 
+    # Minimum inline quality gate (M4): every delivered image must contain a detectable face.
+    # Flags faceless images in the manifest; raises (-> fail + refund) only if the whole batch
+    # is faceless. Independent of the (validation-pending) full identity gate above.
+    _face_gate = enh_engine.face_present_gate(finals)
+    ctx.work["face_gate"] = _face_gate
+
     # delivered_size read from the actual last final image (parity with legacy).
     _delivered_size = None
     if finals:
@@ -1013,6 +1027,8 @@ def run_inference(job: dict) -> list:
         "image_count": image_count,
         "delivered_size": _delivered_size,
         "generation_seconds": round(time.time() - _gen_t0, 1),
+        "enhancement": ctx.work.get("enhancement_stats"),   # H7: per-stage applied/failed/skipped
+        "face_gate": ctx.work.get("face_gate"),             # M4: face-present check on delivered images
     }
     gjob = GenerationJob(job_id=job_id, user_id=user_id)
     return del_engine.deliver(finals, gjob)
