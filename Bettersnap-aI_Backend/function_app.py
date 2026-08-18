@@ -348,13 +348,33 @@ def user_credits(req: func.HttpRequest) -> func.HttpResponse:
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
+    cursor.execute(
+        "SELECT credits_remaining, one_time_credits_remaining, monthly_credits_remaining "
+        "FROM users WHERE user_id = ?",
+        user_id,
+    )
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Separate-balance model: spendable credits live in the one_time/monthly BUCKET columns —
+    # that is what reserve_job_slot actually debits. The legacy `credits_remaining` column is
+    # stale for any user who purchased/renewed after the split (e.g. a one-time top-up lands in
+    # one_time_credits_remaining, leaving credits_remaining at 0), which made the dashboard show
+    # 0 despite a paid balance. Report the effective bucket total; fall back to the legacy column
+    # only when both buckets are empty (pre-migration users whose balance never moved to a bucket).
+    legacy = int(row[0] or 0)
+    one_time = int(row[1] or 0)
+    monthly = int(row[2] or 0)
+    bucket_total = one_time + monthly
+    effective = bucket_total if bucket_total > 0 else legacy
+
     return func.HttpResponse(
-        json.dumps({"credits_remaining": row[0]}),
+        json.dumps({
+            "credits_remaining": effective,
+            "one_time_credits_remaining": one_time,
+            "monthly_credits_remaining": monthly,
+        }),
         mimetype="application/json",
         status_code=200
     )
