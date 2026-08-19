@@ -934,8 +934,17 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # generation job so _dispatch_training can fuse it into this same container. The
     # transactional-outbox guarantee is unaffected: the row is already committed, and
     # outbox_dispatch_pending still backstops a failed send.
-    outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg,
-                        visibility_timeout=TRAIN_FUSE_HEAD_START or None)
+    # Reservation already committed (training row + credit charge + outbox message) — the
+    # request has succeeded and outbox_dispatch_pending backstops delivery, so a fast-path
+    # hiccup here must NOT 500 a training that already started. Guard and return 202.
+    try:
+        outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg,
+                            visibility_timeout=TRAIN_FUSE_HEAD_START or None)
+    except Exception as e:
+        logging.warning(
+            f"training outbox fast-path failed for training_id={training_id} "
+            f"(non-fatal; the dispatcher will deliver): {e}"
+        )
     logging.info(
         f"training queued: training_id={training_id} user={user_id} "
         f"photos={len(files)} class_word={cword} head_start={TRAIN_FUSE_HEAD_START}s"
@@ -1242,10 +1251,23 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # into the outbox IN THE SAME TRANSACTION as the job row + credit charge, so the send can
     # no longer be lost. Fast-path it now; if the queue is briefly down the outbox_dispatcher
     # delivers it — the job is neither failed nor refunded, it just starts a little later.
-    outbox_try_send_now(
-        result.outbox_id, INFERENCE_QUEUE,
-        {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
-    )
+    # Once the reservation has COMMITTED (job row + credit charge + outbox message, atomically),
+    # the request has succeeded — the job WILL run, because the outbox_dispatcher delivers the
+    # queue message even if this fast-path send (or its bookkeeping) hiccups. So this tail must
+    # never turn a committed job into a 500: a false failure makes the user retry and double-pay,
+    # and (as seen in prod) shows "Submit failed" for a job that generates all its images.
+    # outbox_try_send_now already swallows send failures, but its _mark_delivered/_record_failure
+    # DB writes can still raise — guard the whole call and always return 202.
+    try:
+        outbox_try_send_now(
+            result.outbox_id, INFERENCE_QUEUE,
+            {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
+        )
+    except Exception as e:
+        logging.warning(
+            f"outbox fast-path failed for job_id={job_id} (non-fatal; the dispatcher will "
+            f"deliver the queued message): {e}"
+        )
 
     return func.HttpResponse(
         json.dumps({"job_id": str(job_id), "status": "queued"}),
@@ -2352,7 +2374,15 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         # Fast-path each release (visibility 0, so the GPU picks them up at once); whatever
         # doesn't send now, the outbox_dispatcher delivers on its next tick.
         for outbox_id, msg in released:
-            outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
+            # Per-job guard: a fast-path failure on ONE parked job must not abort releasing the
+            # rest (the outbox_dispatcher backstops any that don't send here).
+            try:
+                outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
+            except Exception as e:
+                logging.warning(
+                    f"release fast-path failed for job_id={msg['job_id']} "
+                    f"(non-fatal; dispatcher will deliver): {e}"
+                )
             logging.info(f"released parked job_id={msg['job_id']} for user={user_id}")
     else:
         # Never leave a user waiting on an adapter that will never exist.
