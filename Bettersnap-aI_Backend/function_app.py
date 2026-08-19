@@ -1420,6 +1420,57 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
 # Owner-only hard delete: remove the jobs row AND its result blobs
 # (outputs/results/<job_id>/*). 404 if the job doesn't exist, 403 if it isn't the
 # caller's. Route is /jobs/{job_id} (NOT under a reserved prefix like admin/*).
+@app.route(route="jobs/{job_id}/cancel", methods=["POST"])
+def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
+    """Cancel the caller's own in-flight job so it reflects 'failed' + refunds WITHIN SECONDS,
+    instead of waiting up to ~10 min for the reaper. Stops the running container (frees the single
+    A100) and marks the job failed + refunds SYNCHRONOUSLY via _mark_failed (guarded, exactly-once).
+    A job already 'completed'/'failed' is a no-op (idempotent)."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    # Ownership gate: 404 if missing, 403 if not the caller's job.
+    cursor.execute(
+        "SELECT user_id, status, external_execution_id FROM jobs WHERE job_id = ?", job_id)
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    if row[0] != user_id:
+        return func.HttpResponse("Forbidden", status_code=403)
+    status, exec_id = (row[1] or "").strip(), row[2]
+
+    if status in ("completed", "failed"):
+        # Nothing to cancel; report current state so the client just refreshes.
+        return func.HttpResponse(
+            json.dumps({"job_id": str(job_id), "status": status, "cancelled": False}),
+            mimetype="application/json", status_code=200)
+
+    # 1) Free the GPU immediately: best-effort stop the live container (if its execution is known).
+    if exec_id:
+        try:
+            from shared.queue_trigger import stop_execution
+            stop_execution(exec_id)
+        except Exception as e:
+            logging.warning(f"cancel_job: stop_execution failed for job_id={job_id}: {e}")
+
+    # 2) Mark failed + refund SYNCHRONOUSLY (guarded transition, one-time refund).
+    _mark_failed(job_id)
+
+    logging.info(f"cancel_job: user={user_id} cancelled job_id={job_id} (was '{status}')")
+    return func.HttpResponse(
+        json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
+        mimetype="application/json", status_code=200)
+
+
 @app.route(route="jobs/{job_id}", methods=["DELETE"])
 def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -2479,7 +2530,7 @@ def handle_poison_job(msg: func.QueueMessage):
 # Both paths call _mark_failed: guarded transition + one-time credit refund.
 # An OOM SIGKILL (exit 137) leaves the row in 'processing' because the process
 # is killed before it can write — this reaper is the ONLY thing that clears it.
-@app.timer_trigger(schedule="0 */10 * * * *", arg_name="timer", run_on_startup=False)
+@app.timer_trigger(schedule="0 */2 * * * *", arg_name="timer", run_on_startup=False)
 def reaper(timer: func.TimerRequest):
     from shared.queue_trigger import find_execution_for_job
     conn = new_connection()
