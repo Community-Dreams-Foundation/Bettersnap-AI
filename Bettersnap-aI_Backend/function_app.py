@@ -379,6 +379,37 @@ def user_credits(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
+# ── Reset model (the "New LoRA" path of the one-time re-purchase flow) ──────
+@app.route(route="users/model", methods=["DELETE"])
+def delete_user_model(req: func.HttpRequest) -> func.HttpResponse:
+    """Wipe the caller's trained model so they can build a brand-new one.
+
+    This is the backend for the 'New model' choice a one-time user makes after buying another
+    pack: it deletes the adapter blob and resets lora_status -> 'none' + retrain_count -> 0, so
+    the next /train is a fresh FIRST train (free, included in the pack) rather than a charged
+    retrain (FREE_RETRAINS=1 would otherwise bill the 2nd model). Scoped strictly to the caller's
+    own user_id — a user can only reset THEIR model. Idempotent: resetting an already-'none'
+    account is a no-op that still returns 200. Generation is unaffected until they retrain."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    # Adapter blobs live under the LOWERCASED user_id prefix (training writes lowercase; the
+    # generation lookup is case-sensitive — see _delete_blobs's case note / the lora-case fix).
+    n_lora = _delete_blobs("lora-weights", f"identity/{user_id.lower()}/")
+    conn = get_db()
+    conn.cursor().execute(
+        "UPDATE users SET lora_status = 'none', retrain_count = 0 WHERE user_id = ?",
+        user_id,
+    )
+    logging.info(f"delete_user_model: user={user_id} deleted adapter_blobs={n_lora}")
+    return func.HttpResponse(
+        json.dumps({"status": "reset", "lora_status": "none", "deleted_adapters": n_lora}),
+        mimetype="application/json", status_code=200,
+    )
+
 # ── Profile: Get ──────────────────────────────────────────
 # Reads the caller's profile straight off the EXISTING users table (keyed on the
 # Entra oid = users.user_id). No separate profiles table — that would duplicate
