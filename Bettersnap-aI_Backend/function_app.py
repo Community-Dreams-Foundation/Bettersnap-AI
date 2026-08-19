@@ -726,14 +726,20 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT lora_status, credits_remaining, retrain_count, plan_name FROM users WHERE user_id = ?",
+        "SELECT lora_status, credits_remaining, retrain_count, plan_name, "
+        "one_time_credits_remaining, monthly_credits_remaining FROM users WHERE user_id = ?",
         user_id,
     )
     row = cur.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
-    credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
+    retrain_count = int(row[2] or 0)
+    # Effective spendable = the buckets (what the retrain charge actually debits), NOT the legacy
+    # credits_remaining column — else a fully-funded one-time account (balance in one_time bucket,
+    # legacy 0) is wrongly told "Not enough credits to retrain". Mirrors reserve_training_slot.
+    _bucket_total = int(row[4] or 0) + int(row[5] or 0)
+    credits = _bucket_total if _bucket_total > 0 else int(row[1] or 0)
     if lora_status == "training":
         return func.HttpResponse(
             json.dumps({"status": "training", "message": "Training already in progress"}),

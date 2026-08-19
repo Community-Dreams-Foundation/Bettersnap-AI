@@ -17,9 +17,12 @@ class _Cursor:
         if "sp_getapplock" in normalized:
             self._row = (0,)
         elif "select lora_status, credits_remaining" in normalized:
+            # 6 cols now: the retrain gate reads the one_time/monthly BUCKETS (effective balance),
+            # not just legacy. Model a one-time 'basic' user whose balance sits in one_time.
             self._row = (
                 self.state["status"], self.state["credits"],
                 self.state["retrain_count"], "basic",
+                self.state["credits"], 0,
             )
         elif "count(*) from lora_trainings" in normalized:
             self._row = (self.state["training_count"],)
@@ -28,10 +31,11 @@ class _Cursor:
             self._row = (f"training-{self.state['training_count']}",)
             self.rowcount = 1
         elif "update users set lora_status = 'training'" in normalized:
-            charge = int(params[0])
             self.state["status"] = "training"
-            self.state["retrain_count"] += 1
-            self.state["credits"] -= charge
+            if "retrain_count = retrain_count + 1" in normalized:
+                # retrain UPDATE params: (monthly_debit, one_time_debit, charge, user_id)
+                self.state["retrain_count"] += 1
+                self.state["credits"] -= int(params[2])
             self.rowcount = 1
         elif "insert into outbox" in normalized:
             self._row = (1000 + self.state["training_count"],)

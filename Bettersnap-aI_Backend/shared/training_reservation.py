@@ -36,7 +36,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
             return TrainingReserveResult(False, reason="busy")
 
         cur.execute(
-            "SELECT lora_status, credits_remaining, retrain_count, plan_name "
+            "SELECT lora_status, credits_remaining, retrain_count, plan_name, "
+            "one_time_credits_remaining, monthly_credits_remaining "
             "FROM users WITH (UPDLOCK, HOLDLOCK) WHERE user_id = ?",
             user_id,
         )
@@ -46,8 +47,16 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
             return TrainingReserveResult(False, reason="user_missing")
 
         status = (row[0] or "none").strip()
-        credits = int(row[1] or 0)
+        legacy = int(row[1] or 0)
         retrain_count = int(row[2] or 0)
+        one_time_bal = int(row[4] or 0)
+        monthly_bal = int(row[5] or 0)
+        # Spendable balance = the buckets (what generation debits), NOT the legacy column: a
+        # one-time top-up lands in one_time_credits_remaining and leaves credits_remaining at 0,
+        # so checking/charging legacy here blocked retrains for a fully-funded account. Fall back
+        # to legacy only for pre-bucket users whose balance never moved into a bucket.
+        bucket_total = one_time_bal + monthly_bal
+        effective = bucket_total if bucket_total > 0 else legacy
         if status == "training":
             conn.rollback()
             return TrainingReserveResult(False, reason="already_training")
@@ -57,7 +66,7 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
 
         is_retrain = status in ("ready", "failed") and force
         charge = retrain_credits if is_retrain and retrain_count >= free_retrains else 0
-        if credits < charge:
+        if effective < charge:
             conn.rollback()
             return TrainingReserveResult(False, reason="credits")
 
@@ -80,11 +89,22 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
         )
         training_id = cur.fetchone()[0]
         if is_retrain:
+            # Charge from the SAME buckets generation debits (mirror reserve_job_slot): monthly
+            # first then one-time overflow for monthly plans, one-time for one-time plans; keep
+            # the legacy mirror in sync. Pre-bucket users (no bucket balance) charge legacy only.
+            if bucket_total > 0:
+                monthly_debit = min(monthly_bal, charge) if source_type == "monthly" else 0
+                one_time_debit = charge - monthly_debit
+            else:
+                monthly_debit = 0
+                one_time_debit = 0
             cur.execute(
                 "UPDATE users SET lora_status = 'training', "
                 "retrain_count = retrain_count + 1, "
+                "monthly_credits_remaining = monthly_credits_remaining - ?, "
+                "one_time_credits_remaining = one_time_credits_remaining - ?, "
                 "credits_remaining = credits_remaining - ? WHERE user_id = ?",
-                charge, user_id,
+                monthly_debit, one_time_debit, charge, user_id,
             )
             # Ledger the retrain spend (record() no-ops when charge==0, i.e. a free retrain).
             credit_ledger.record(cur, user_id, -charge, credit_ledger.REASON_RETRAIN_CHARGE)
