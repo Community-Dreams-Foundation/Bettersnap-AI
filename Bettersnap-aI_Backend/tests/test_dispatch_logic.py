@@ -108,7 +108,9 @@ _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
 _mod("shared.queue_trigger",
      trigger_container_job=mock.Mock(return_value="exec-123"),
      count_active_job_executions=mock.Mock(return_value=0),
-     find_execution_for_job=mock.Mock(return_value=None))
+     find_execution_for_job=mock.Mock(return_value=None),
+     execution_status=mock.Mock(return_value="running"),
+     stop_execution=mock.Mock(return_value=True))
 
 
 # Identity-LoRA training deps. crops pulls opencv and training_trigger pulls
@@ -327,6 +329,8 @@ class FakeCursor:
             )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
+        elif "where status = 'processing' and external_execution_id is not null" in s:
+            self._fetchall = self.cfg.get("reaper_processing_with_exec", [])
         elif "select job_id from jobs where status = 'processing'" in s:
             self._fetchall = self.cfg.get("reaper_processing", [])
         elif "select job_id, external_execution_id from jobs where status = 'dispatching'" in s:
@@ -1611,8 +1615,13 @@ class ReaperTests(unittest.TestCase):
         disp = [s for s in sqls if "status = 'dispatching'" in s]
         self.assertTrue(proc, "reaper did not scan 'processing'")
         self.assertTrue(disp, "reaper did not scan 'dispatching'")
-        # Both scans must age from COALESCE(dispatched_at, created_at)...
-        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in proc + disp))
+        # The DEADLINE-based scans (those with a DATEADD window) must age from
+        # COALESCE(dispatched_at, created_at). The execution-status early-reconcile scan is
+        # deliberately deadline-free (it reconciles on terminal ACA status, not elapsed time),
+        # so it is excluded from this check.
+        deadline = [s for s in proc + disp if "dateadd" in s]
+        self.assertTrue(deadline, "reaper had no deadline-based scan")
+        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in deadline))
         # ...and must NOT age from the bare submit-time column.
         self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
                          "reaper still measures from created_at (submit time)")

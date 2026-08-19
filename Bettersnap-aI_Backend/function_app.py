@@ -2532,7 +2532,7 @@ def handle_poison_job(msg: func.QueueMessage):
 # is killed before it can write — this reaper is the ONLY thing that clears it.
 @app.timer_trigger(schedule="0 */2 * * * *", arg_name="timer", run_on_startup=False)
 def reaper(timer: func.TimerRequest):
-    from shared.queue_trigger import find_execution_for_job
+    from shared.queue_trigger import find_execution_for_job, execution_status
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -2552,8 +2552,36 @@ def reaper(timer: func.TimerRequest):
             -REAPER_DISPATCHING_MINUTES,
         )
         dispatching = [(str(r[0]), r[1]) for r in cur.fetchall()]
+
+        # EARLY reconcile: a 'processing' job whose ACA execution has ALREADY gone terminal
+        # (killed / crashed / operator-stopped) is definitively dead — don't make it wait out the
+        # full REAPER_STUCK_MINUTES healthy-run window. Bounded to rows with a known execution id;
+        # the per-execution status read (an ACA call) is done below, after the DB conn closes.
+        cur.execute(
+            "SELECT job_id, external_execution_id FROM jobs "
+            "WHERE status = 'processing' AND external_execution_id IS NOT NULL"
+        )
+        processing_with_exec = [(str(r[0]), r[1]) for r in cur.fetchall()]
     finally:
         conn.close()
+
+    # A terminal-but-not-successful execution means the container is gone without delivering —
+    # fail+refund now. 'Succeeded' is deliberately excluded: the container writes 'completed'
+    # itself, so a Succeeded execution whose row still reads 'processing' is a write race, NOT a
+    # refund case (refunding it would hand the user both a refund AND the delivered images).
+    _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
+    _stuck_seen = set(stuck)
+    for job_id, exec_id in processing_with_exec:
+        if job_id in _stuck_seen:
+            continue
+        state = (execution_status(exec_id) or "").lower()
+        if state in _DEAD_EXEC_STATES:
+            logging.warning(
+                f"REAPER: processing job_id={job_id} has terminal execution status='{state}' "
+                f"— reconciling early (not waiting REAPER_STUCK_MINUTES)"
+            )
+            stuck.append(job_id)
+            _stuck_seen.add(job_id)
 
     for job_id, exec_id in dispatching:
         if not exec_id:

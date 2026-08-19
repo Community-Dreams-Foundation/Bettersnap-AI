@@ -147,6 +147,23 @@ def _start_execution(owned_env_keys, env_overrides, job_name: str = JOB_NAME) ->
     return execution_id
 
 
+def execution_status(execution_name: str, job_name: str = JOB_NAME) -> str:
+    """Return the ACA status of ONE execution (e.g. 'Running', 'Succeeded', 'Failed', 'Stopped'),
+    or '' if it can't be read. Lets the reaper tell a dead container from a healthy long-running
+    one WITHOUT waiting out the full REAPER_STUCK_MINUTES window."""
+    if not execution_name:
+        return ""
+    credential = DefaultAzureCredential()
+    client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
+    try:
+        for ex in client.jobs_executions.list(RESOURCE_GROUP, job_name):
+            if getattr(ex, "name", None) == execution_name:
+                return (getattr(ex, "status", "") or "")
+    except Exception as e:
+        logging.warning(f"execution_status: could not read {execution_name}: {e}")
+    return ""
+
+
 def stop_execution(execution_name: str, job_name: str = JOB_NAME) -> bool:
     """Best-effort stop of ONE ACA job execution. Used by cancel to free the single A100 slot
     immediately, instead of letting a doomed run hold the GPU until it exits on its own. Safe to
