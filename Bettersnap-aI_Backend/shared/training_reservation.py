@@ -9,7 +9,8 @@ from . import credit_ledger
 
 class TrainingReserveResult:
     def __init__(self, ok, training_id=None, reason=None, outbox_id=None,
-                 message=None, retrain=False, credits_charged=0):
+                 message=None, retrain=False, credits_charged=0,
+                 monthly_credits_charged=0, one_time_credits_charged=0):
         self.ok = ok
         self.training_id = training_id
         self.reason = reason
@@ -17,6 +18,8 @@ class TrainingReserveResult:
         self.message = message
         self.retrain = retrain
         self.credits_charged = credits_charged
+        self.monthly_credits_charged = monthly_credits_charged
+        self.one_time_credits_charged = one_time_credits_charged
 
 
 def reserve_training_slot(user_id, files, class_word, force, free_retrains,
@@ -36,7 +39,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
             return TrainingReserveResult(False, reason="busy")
 
         cur.execute(
-            "SELECT lora_status, credits_remaining, retrain_count, plan_name "
+            "SELECT lora_status, credits_remaining, retrain_count, plan_name, "
+            "monthly_credits_remaining, one_time_credits_remaining "
             "FROM users WITH (UPDLOCK, HOLDLOCK) WHERE user_id = ?",
             user_id,
         )
@@ -57,7 +61,19 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
 
         is_retrain = status in ("ready", "failed") and force
         charge = retrain_credits if is_retrain and retrain_count >= free_retrains else 0
-        if credits < charge:
+        source_type = get_plan(row[3]).plan_type
+        monthly_balance = int(row[4] or 0)
+        one_time_balance = int(row[5] or 0)
+        monthly_charge = 0
+        one_time_charge = 0
+        if source_type == "monthly":
+            monthly_charge = min(monthly_balance, charge)
+            one_time_charge = charge - monthly_charge
+        elif source_type == "one_time":
+            one_time_charge = charge
+        if (credits < charge
+                or monthly_charge > monthly_balance
+                or one_time_charge > one_time_balance):
             conn.rollback()
             return TrainingReserveResult(False, reason="credits")
 
@@ -71,20 +87,23 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
             return TrainingReserveResult(False, reason="daily_cap")
 
         files_json = json.dumps(files)
-        source_type = get_plan(row[3]).plan_type
         cur.execute(
             "INSERT INTO lora_trainings "
-            "(user_id, status, photo_count, class_word, files_json, source_type) "
-            "OUTPUT INSERTED.training_id VALUES (?, 'queued', ?, ?, ?, ?)",
+            "(user_id, status, photo_count, class_word, files_json, source_type, "
+            "monthly_credit_cost, one_time_credit_cost) "
+            "OUTPUT INSERTED.training_id VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)",
             user_id, len(files), class_word, files_json, source_type,
+            monthly_charge, one_time_charge,
         )
         training_id = cur.fetchone()[0]
         if is_retrain:
             cur.execute(
                 "UPDATE users SET lora_status = 'training', "
                 "retrain_count = retrain_count + 1, "
+                "monthly_credits_remaining = monthly_credits_remaining - ?, "
+                "one_time_credits_remaining = one_time_credits_remaining - ?, "
                 "credits_remaining = credits_remaining - ? WHERE user_id = ?",
-                charge, user_id,
+                monthly_charge, one_time_charge, charge, user_id,
             )
             # Ledger the retrain spend (record() no-ops when charge==0, i.e. a free retrain).
             credit_ledger.record(cur, user_id, -charge, credit_ledger.REASON_RETRAIN_CHARGE)
@@ -97,6 +116,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
         return TrainingReserveResult(
             True, training_id=training_id, outbox_id=outbox_id, message=message,
             retrain=is_retrain, credits_charged=charge,
+            monthly_credits_charged=monthly_charge,
+            one_time_credits_charged=one_time_charge,
         )
     finally:
         conn.close()

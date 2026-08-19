@@ -120,6 +120,9 @@ TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
 # results) are deleted; DB rows are KEPT for analytics. One-time plans start the clock
 # on each generation (last-gen + N); monthly plans on subscription end (period-end + N).
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "3"))
+# Failed monthly renewals keep their remaining monthly credits for this many days.
+# A later invoice.paid restores the normal monthly allowance automatically.
+FAILED_PAYMENT_GRACE_DAYS = int(os.environ.get("FAILED_PAYMENT_GRACE_DAYS", "3"))
 
 
 def _gpu_dispatch_enabled() -> bool:
@@ -873,10 +876,8 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # Insert the run, flip the user to 'training', and CHARGE the retrain in ONE
     # transaction — so a crash between them can't take credits without starting a run,
     # or start a run without charging.
-    # Serialized retrain reservation (dev's reserve_training_slot): insert + flip to
-    # 'training' + charge in one app-locked transaction. NOTE (follow-up): make the charge
-    # separate-balance-aware (monthly vs one_time) to fully match the features-stripe credit
-    # model — today it charges the combined credits_remaining.
+    # Serialized retrain reservation: insert + flip to 'training' + bucket-aware charge
+    # in one app-locked transaction.
     reserved = reserve_training_slot(
         user_id, files, cword, force, FREE_RETRAINS, RETRAIN_CREDITS,
         MAX_TRAININGS_PER_DAY,
@@ -1867,12 +1868,11 @@ def _stamp_failure_class(job_id, failure_class, reason, execution_id):
 
 
 def _fetch_execution_outcome(job_id):
-    """Best-effort: recover a job's execution outcome for classification WITHOUT a new Azure
-    dependency, by reading the diagnostics blob the GPU preflight wrote before exiting
-    (gpu_preflight.write_diagnostic -> diagnostics/preflight/<execution_id>.json). The blob
-    carries the exact preflight exit_code + reason, which the ARM execution object does not
-    expose. Returns an exec_data dict or None (caller then uses the timeout safety net)."""
+    """Read the whole container execution status from ACA, then optionally enrich it with
+    preflight diagnostics. A preflight exit 0 is never treated as container success."""
     try:
+        from shared.queue_trigger import get_job_execution_outcome
+
         conn = new_connection()
         try:
             cur = conn.cursor()
@@ -1883,22 +1883,58 @@ def _fetch_execution_outcome(job_id):
         exec_id = r[0] if r else None
         if not exec_id:
             return None
-        raw = download_blob("diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
-        diag = json.loads(raw)
-        result = diag.get("result") or {}
-        return {
-            "exit_code": result.get("exit_code"),
-            "reason": "ProcessExited",
-            "events": [],
-            "execution_id": diag.get("execution_id") or exec_id,
-            "diagnostic_reason": result.get("reason"),
-        }
+        outcome = get_job_execution_outcome(str(exec_id))
+        outcome.setdefault("events", [])
+        try:
+            raw = download_blob(
+                "diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
+            diag = json.loads(raw)
+            result = diag.get("result") or {}
+            outcome["preflight_exit_code"] = result.get("exit_code")
+            outcome["diagnostic_reason"] = result.get("reason")
+        except Exception:
+            pass
+        return outcome
     except Exception:
+        logging.exception(f"could not fetch ACA execution outcome for job_id={job_id}")
         return None
 
 
+def _list_delivered_results(job_id):
+    """Return delivered image blob paths, [] when definitively empty, or None on storage error."""
+    try:
+        container = get_blob_client().get_container_client("outputs")
+        paths = [
+            str(blob.name) for blob in container.list_blobs(name_starts_with=f"results/{job_id}/")
+            if str(blob.name).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+        ]
+        return sorted(paths)
+    except Exception:
+        logging.exception(f"could not verify delivered outputs for job_id={job_id}")
+        return None
+
+
+def _recover_completed_job(job_id, result_paths):
+    """Recover a stale processing row when ACA succeeded and output blobs exist."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE jobs SET status = 'completed', output_blob_path = ?, "
+            "completed_at = COALESCE(completed_at, GETUTCDATE()) "
+            "WHERE job_id = ? AND status NOT IN ('completed', 'failed')",
+            json.dumps(result_paths), job_id,
+        )
+        transitioned = cur.rowcount == 1
+        conn.commit()
+        return transitioned
+    finally:
+        conn.close()
+
+
 def _reconcile_execution_outcome(job_id, exec_data, now, *,
-                                 mark_failed=None, stamp=None, classify=None):
+                                 mark_failed=None, stamp=None, classify=None,
+                                 list_results=None, recover_completed=None):
     """Classify one execution outcome and, when a refund is owed, stamp the class+reason and
     fail+refund EXACTLY ONCE. The one-refund guarantee is _mark_failed's rowcount guard
     (status NOT IN ('failed','completed')); stamping is separately idempotent. Deps are
@@ -1906,10 +1942,34 @@ def _reconcile_execution_outcome(job_id, exec_data, now, *,
     mark_failed = mark_failed or _mark_failed
     stamp = stamp or _stamp_failure_class
     classify = classify or exec_reconcile.classify_execution
+    list_results = list_results or _list_delivered_results
+    recover_completed = recover_completed or _recover_completed_job
     decision = classify(exec_data, now)
     if decision["action"] == exec_reconcile.ACTION_REFUND:
         stamp(job_id, decision["failure_class"], decision["reason"], decision["execution_id"])
         mark_failed(job_id)   # idempotent; refunds only on the real state transition
+    elif decision["action"] == exec_reconcile.ACTION_VERIFY_DELIVERY:
+        result_paths = list_results(job_id)
+        if result_paths is None:
+            return {
+                **decision,
+                "action": exec_reconcile.ACTION_NONE,
+                "failure_class": exec_reconcile.CLASS_PENDING,
+                "reason": "ACA succeeded but output storage could not be checked; retrying",
+            }
+        if result_paths:
+            recover_completed(job_id, result_paths)
+            return {**decision, "action": exec_reconcile.ACTION_RECOVER,
+                    "reason": f"recovered {len(result_paths)} delivered image(s)"}
+        missing = {
+            **decision,
+            "action": exec_reconcile.ACTION_REFUND,
+            "failure_class": exec_reconcile.CLASS_DELIVERY_MISSING,
+            "reason": "ACA execution succeeded but no result images were delivered",
+        }
+        stamp(job_id, missing["failure_class"], missing["reason"], missing["execution_id"])
+        mark_failed(job_id)
+        return missing
     return decision
 
 
@@ -2265,6 +2325,14 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
     conn = new_connection()
     try:
         cur = conn.cursor()
+        cur.execute(
+            "SELECT ISNULL(monthly_credit_cost, 0), ISNULL(one_time_credit_cost, 0) "
+            "FROM lora_trainings WITH (UPDLOCK, HOLDLOCK) WHERE training_id = ?",
+            training_id,
+        )
+        charge_row = cur.fetchone()
+        monthly_retrain_charge = int(charge_row[0] or 0) if charge_row else 0
+        one_time_retrain_charge = int(charge_row[1] or 0) if charge_row else 0
         # COALESCE: never clobber a root cause already recorded by _record_training_error.
         # The poison handler's "exceeded retry limit" arrives LAST and is the least useful
         # message; the first error written is the one that explains the failure.
@@ -2295,6 +2363,19 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         new_status = "ready" if (ok or recovered) else "failed"
         cur.execute(
             "UPDATE users SET lora_status = ? WHERE user_id = ?", new_status, user_id)
+
+        if not ok and (monthly_retrain_charge or one_time_retrain_charge):
+            retrain_refund = monthly_retrain_charge + one_time_retrain_charge
+            cur.execute(
+                "UPDATE users SET "
+                "monthly_credits_remaining = monthly_credits_remaining + ?, "
+                "one_time_credits_remaining = one_time_credits_remaining + ?, "
+                "credits_remaining = credits_remaining + ? WHERE user_id = ?",
+                monthly_retrain_charge, one_time_retrain_charge,
+                retrain_refund, user_id,
+            )
+            credit_ledger.record(
+                cur, user_id, retrain_refund, credit_ledger.REASON_RETRAIN_REFUND)
 
         # `ok` stays the TRUTH about the training run (for the row + the log). `usable` is
         # the separate question of whether the user has an adapter to render with, which is
@@ -2431,7 +2512,7 @@ def reaper(timer: func.TimerRequest):
     now_ts = datetime.now(timezone.utc).timestamp()
     for job_id in stuck:
         logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
-        exec_data = _fetch_execution_outcome(job_id)   # best-effort (reads preflight diag blob)
+        exec_data = _fetch_execution_outcome(job_id)   # ACA execution status + optional preflight detail
         if exec_data is not None:
             # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, operator stop,
             # or a genuinely-complete/pending job) and fail+refund EXACTLY ONCE with the class
@@ -2686,6 +2767,13 @@ def create_subscription_portal(req: func.HttpRequest) -> func.HttpResponse:
         body.get("return_url")
         or os.environ.get("FRONTEND_URL", "https://bettersnap.ai") + "/billing"
     )
+    mode = body.get("mode", "payment_method_update")
+    if mode not in ("payment_method_update", "manage"):
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid billing portal mode"}),
+            mimetype="application/json",
+            status_code=400,
+        )
 
     conn = get_db()
     cursor = conn.cursor()
@@ -2702,7 +2790,7 @@ def create_subscription_portal(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        session = create_billing_portal(row[0], return_url)
+        session = create_billing_portal(row[0], return_url, mode)
     except Exception as e:
         logging.error(f"Stripe billing portal failed for user {user_id}: {e}")
         return func.HttpResponse(
@@ -3644,10 +3732,9 @@ def _handle_invoice_paid(invoice: dict, event_id: str):
 
 def _handle_payment_failed(invoice: dict, event_id: str):
     """A monthly renewal charge FAILED. Flag the account (payment_failed_at) so the UI can
-    prompt the user to update their card — but do NOT cut access here: Stripe keeps retrying
-    (dunning) for days, and the terminal canceled/unpaid is handled by
-    _handle_subscription_ended. The flag is cleared automatically by the next successful
-    invoice.paid (recovery)."""
+    prompt the user to update their card. Preserve the FIRST failed-at timestamp so Stripe's
+    later retries do not restart our grace period. The flag is cleared automatically by the
+    next successful invoice.paid (recovery)."""
     sub_id = _invoice_subscription_id(invoice)   # see _invoice_subscription_id: the id moved
     if not sub_id:
         return
@@ -3659,11 +3746,44 @@ def _handle_payment_failed(invoice: dict, event_id: str):
             logging.info(f"Stripe event {event_id} already processed; skipping payment-failed flag.")
             return
         cur.execute(
-            "UPDATE users SET payment_failed_at = GETUTCDATE() WHERE stripe_subscription_id = ?",
+            "UPDATE users SET payment_failed_at = COALESCE(payment_failed_at, GETUTCDATE()) "
+            "WHERE stripe_subscription_id = ?",
             sub_id,
         )
         conn.commit()
         logging.warning(f"Monthly payment FAILED for subscription={sub_id}; flagged for dunning.")
+    finally:
+        conn.close()
+
+
+@app.timer_trigger(schedule="0 0 * * * *", arg_name="timer", run_on_startup=False)
+def failed_payment_grace_cleanup(timer: func.TimerRequest) -> None:
+    """Hourly: remove only monthly credits after the failed-renewal grace period.
+
+    The subscription remains linked while Stripe is retrying. If a later invoice.paid
+    arrives, its normal renewal handler clears payment_failed_at and restores the monthly
+    allowance. One-time/add-on credits are never removed here.
+    """
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE users SET
+                monthly_credits_remaining = 0,
+                credits_remaining = one_time_credits_remaining
+            WHERE subscription_type = 'monthly'
+              AND payment_failed_at IS NOT NULL
+              AND payment_failed_at <= DATEADD(DAY, -?, GETUTCDATE())
+              AND monthly_credits_remaining > 0""",
+            FAILED_PAYMENT_GRACE_DAYS,
+        )
+        expired = cur.rowcount
+        conn.commit()
+        if expired:
+            logging.warning(
+                f"Removed monthly credits for {expired} account(s) after "
+                f"{FAILED_PAYMENT_GRACE_DAYS}-day failed-payment grace period."
+            )
     finally:
         conn.close()
 
@@ -3834,7 +3954,9 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
     cur = conn.cursor()
     cur.execute(
         "SELECT user_id FROM users "
-        "WHERE retention_expires_at IS NOT NULL AND retention_expires_at < GETUTCDATE()"
+        "WHERE retention_expires_at IS NOT NULL AND retention_expires_at < GETUTCDATE() "
+        "AND ISNULL(monthly_credits_remaining, 0) <= 0 "
+        "AND ISNULL(one_time_credits_remaining, 0) <= 0"
     )
     due = [str(r[0]) for r in cur.fetchall()]
     if not due:
@@ -3842,30 +3964,64 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
     logging.info(f"retention_cleanup: {len(due)} user(s) due")
 
     for user_id in due:
-        # Photos (raw + crops) and the trained adapter (+ backups) live under the user's
-        # own prefix; results are per-job in the 'outputs' container, so look those up.
-        n_photos = _delete_blobs("inputs", f"{user_id}/")
-        n_lora = _delete_blobs("lora-weights", f"identity/{user_id}/")
-        cur.execute("SELECT job_id FROM jobs WHERE user_id = ?", user_id)
-        job_ids = [str(r[0]) for r in cur.fetchall()]
-        n_results = 0
-        for jid in job_ids:
-            n_results += _delete_blobs("outputs", f"results/{jid}/")
-            _delete_blobs("outputs", f"debug/{jid}.txt")
-
-        # Keep the rows: reset the user, mark jobs expired, clear the window — one txn so a
-        # crash can't leave the window set (which would re-delete every hour) or half-done.
-        conn2 = new_connection()
+        eligibility = new_connection()
         try:
-            conn2.autocommit = False
-            cur2 = conn2.cursor()
-            cur2.execute("UPDATE jobs SET expired = 1 WHERE user_id = ?", user_id)
-            cur2.execute(
+            eligibility.autocommit = False
+            eligibility_cur = eligibility.cursor()
+            eligibility_cur.execute(
+                "SELECT user_id FROM users WITH (UPDLOCK, HOLDLOCK) "
+                "WHERE user_id = ? "
+                "AND retention_expires_at IS NOT NULL "
+                "AND retention_expires_at < GETUTCDATE() "
+                "AND ISNULL(monthly_credits_remaining, 0) <= 0 "
+                "AND ISNULL(one_time_credits_remaining, 0) <= 0 "
+                "AND NOT EXISTS (SELECT 1 FROM jobs WHERE user_id = ? "
+                "AND status NOT IN ('completed', 'failed'))",
+                user_id, user_id,
+            )
+            eligible = eligibility_cur.fetchone() is not None
+            if not eligible:
+                eligibility.rollback()
+                logging.info(
+                    f"retention_cleanup: skipping user={user_id}; "
+                    "credits, deadline, or active jobs changed")
+                continue
+
+            eligibility_cur.execute(
+                "SELECT job_id FROM jobs WHERE user_id = ? "
+                "AND status IN ('completed', 'failed')",
+                user_id,
+            )
+            job_ids = [str(r[0]) for r in eligibility_cur.fetchall()]
+
+            # Hold the locked eligibility transaction through deletion so a concurrent
+            # purchase cannot add paid credits between the final check and adapter removal.
+            n_photos = _delete_blobs("inputs", f"{user_id}/")
+            n_lora = _delete_blobs("lora-weights", f"identity/{user_id}/")
+            n_results = 0
+            for jid in job_ids:
+                n_results += _delete_blobs("outputs", f"results/{jid}/")
+                _delete_blobs("outputs", f"debug/{jid}.txt")
+
+            eligibility_cur.execute(
+                "UPDATE jobs SET expired = 1 WHERE user_id = ? "
+                "AND status IN ('completed', 'failed')",
+                user_id,
+            )
+            eligibility_cur.execute(
                 "UPDATE users SET lora_status = 'none', retention_expires_at = NULL "
-                "WHERE user_id = ?", user_id)
-            conn2.commit()
+                "WHERE user_id = ? "
+                "AND retention_expires_at IS NOT NULL "
+                "AND retention_expires_at < GETUTCDATE() "
+                "AND ISNULL(monthly_credits_remaining, 0) <= 0 "
+                "AND ISNULL(one_time_credits_remaining, 0) <= 0 "
+                "AND NOT EXISTS (SELECT 1 FROM jobs WHERE user_id = ? "
+                "AND status NOT IN ('completed', 'failed'))",
+                user_id, user_id,
+            )
+            eligibility.commit()
         finally:
-            conn2.close()
+            eligibility.close()
         logging.info(
             f"retention_cleanup: user={user_id} deleted photos={n_photos} lora={n_lora} "
             f"results={n_results} jobs_expired={len(job_ids)}")

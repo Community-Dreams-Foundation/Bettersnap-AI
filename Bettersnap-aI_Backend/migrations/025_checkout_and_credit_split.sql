@@ -1,4 +1,4 @@
--- 018_checkout_and_credit_split.sql — capture the 6 `users` columns that exist in
+-- 025_checkout_and_credit_split.sql — capture the 6 `users` columns that exist in
 -- production but were added out-of-band and appear in NO migration (schema drift the audit
 -- found). Code references all of them (one-time vs monthly credit split, Stripe Checkout
 -- token handshake), so a fresh/DR database provisioned purely from git was missing them.

@@ -49,12 +49,33 @@ class SixCaseTests(unittest.TestCase):
         self.assertEqual(d["failure_class"], er.CLASS_PENDING)
         self.assertFalse(d["is_infra"])
 
-    # 3b) success — the container delivered and exited 0
+    # 3b) ACA success still requires proof that result blobs landed.
     def test_clean_success(self):
-        d = er.classify_execution({"exit_code": 0, "reason": "ProcessExited", "events": []}, now=0)
-        self.assertEqual(d["action"], er.ACTION_NONE)
+        d = er.classify_execution(
+            {"execution_status": "Succeeded", "preflight_exit_code": 0, "events": []},
+            now=0,
+        )
+        self.assertEqual(d["action"], er.ACTION_VERIFY_DELIVERY)
         self.assertEqual(d["failure_class"], er.CLASS_SUCCESS)
         self.assertFalse(d["is_infra"])
+
+    def test_passing_preflight_does_not_hide_failed_execution(self):
+        d = er.classify_execution(
+            {"execution_status": "Failed", "preflight_exit_code": 0,
+             "execution_id": "oom-exec"},
+            now=0,
+        )
+        self.assertEqual(d["action"], er.ACTION_REFUND)
+        self.assertEqual(d["failure_class"], er.CLASS_APPLICATION)
+
+    def test_passing_preflight_without_terminal_aca_status_is_pending(self):
+        d = er.classify_execution(
+            {"execution_status": "Running", "preflight_exit_code": 0,
+             "events": [ev("ContainerStarted", 1)]},
+            now=10,
+        )
+        self.assertEqual(d["action"], er.ACTION_NONE)
+        self.assertEqual(d["failure_class"], er.CLASS_PENDING)
 
     # 4) manually stopped execution -> refund, but NOT infra
     def test_manually_stopped(self):
@@ -68,7 +89,7 @@ class SixCaseTests(unittest.TestCase):
     def test_preflight_exit_codes(self):
         for code, cls in ((42, "infra_no_gpu"), (43, "infra_gpu_unusable"), (44, "infra_gpu_probe_error")):
             d = er.classify_execution(
-                {"exit_code": code, "reason": "ProcessExited",
+                {"execution_status": "Failed", "preflight_exit_code": code,
                  "events": [ev("AssigningReplica", 0), ev("ContainerStarted", 200)],
                  "execution_id": "x", "diagnostic_reason": f"reason-{code}"}, now=0)
             self.assertEqual(d["action"], er.ACTION_REFUND, code)
@@ -79,7 +100,7 @@ class SixCaseTests(unittest.TestCase):
     # 6) application exit AFTER the preflight passed and the container started -> NOT infra
     def test_application_failure_after_start(self):
         d = er.classify_execution(
-            {"exit_code": 1, "reason": "ProcessExited",
+            {"execution_status": "Failed", "preflight_exit_code": 0,
              "events": [ev("AssigningReplica", 0), ev("PulledImage", 100), ev("ContainerStarted", 220)],
              "execution_id": "x"}, now=0)
         self.assertEqual(d["action"], er.ACTION_REFUND)
@@ -92,13 +113,15 @@ class TaxonomyTests(unittest.TestCase):
         for c in ("infra_no_gpu", "infra_gpu_unusable", "infra_gpu_probe_error",
                   ss.INFRA_IMAGE_PULL_STALL.lower(), ss.INFRA_POST_PULL_START_STALL.lower()):
             self.assertIn(c, er.INFRA_CLASSES)
-        for c in (er.CLASS_APPLICATION, er.CLASS_OPERATOR_STOPPED, er.CLASS_SUCCESS, er.CLASS_PENDING):
+        for c in (er.CLASS_APPLICATION, er.CLASS_OPERATOR_STOPPED, er.CLASS_SUCCESS,
+                  er.CLASS_PENDING, er.CLASS_DELIVERY_MISSING):
             self.assertNotIn(c, er.INFRA_CLASSES)
 
     def test_preflight_infra_wins_over_application_branch(self):
         # exit 43 also occurs after ContainerStarted; the infra branch must win.
         d = er.classify_execution(
-            {"exit_code": 43, "events": [ev("ContainerStarted", 10)]}, now=0)
+            {"execution_status": "Failed", "preflight_exit_code": 43,
+             "events": [ev("ContainerStarted", 10)]}, now=0)
         self.assertEqual(d["failure_class"], "infra_gpu_unusable")
 
 

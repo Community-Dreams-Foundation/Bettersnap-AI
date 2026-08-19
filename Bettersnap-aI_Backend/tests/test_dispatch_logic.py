@@ -339,6 +339,9 @@ class FakeCursor:
             self.rowcount = self.cfg.get("training_claim_rowcount", 1)
         elif "update lora_trainings set status = ?" in s:
             self.rowcount = self.cfg.get("training_finish_rowcount", 1)
+        elif ("select isnull(monthly_credit_cost" in s
+              and "from lora_trainings" in s):
+            self._fetch = self.cfg.get("training_credit_costs", (0, 0))
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
@@ -1020,6 +1023,22 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertEqual(user_sets[0][0], "ready")
         sys.modules["shared.queue_client"]._send.assert_called_once()
 
+    def test_failed_paid_retrain_refunds_original_credit_buckets_once(self):
+        self._cfg["training_credit_costs"] = (4, 6)
+        with mock.patch.object(function_app, "_identity_adapter_exists", return_value=True):
+            function_app._finish_training("t-1", "user-1", ok=False, error="OOM")
+
+        bucket_refunds = [
+            params for sql, params in self._cfg["executed"]
+            if "monthly_credits_remaining = monthly_credits_remaining + ?" in sql.lower()
+        ]
+        self.assertEqual(bucket_refunds, [(4, 6, 10, "user-1")])
+        ledger_rows = [
+            params for sql, params in self._cfg["executed"]
+            if "insert into credit_transactions" in sql.lower()
+        ]
+        self.assertIn(("user-1", 10, "retrain_refund", None), ledger_rows)
+
     # A retried training message must never start a SECOND A100 for the same run.
     def test_training_dispatch_is_idempotent(self):
         tt = sys.modules["shared.training_trigger"]
@@ -1196,7 +1215,37 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("https://billing.stripe.test/session", response.body)
         create_portal.assert_called_once_with(
-            "cus_123", "http://localhost:5173/billing")
+            "cus_123", "http://localhost:5173/billing", "payment_method_update")
+
+    def test_billing_portal_returns_after_payment_method_update(self):
+        from shared import stripe_client
+
+        with mock.patch.object(
+            stripe_client, "_post", return_value={"url": "https://billing.stripe.test/session"}
+        ) as post:
+            stripe_client.create_billing_portal(
+                "cus_123", "https://bettersnap.ai/billing", "payment_method_update")
+
+        post.assert_called_once_with("billing_portal/sessions", {
+            "customer": "cus_123",
+            "return_url": "https://bettersnap.ai/billing",
+            "flow_data[type]": "payment_method_update",
+            "flow_data[after_completion][type]": "redirect",
+            "flow_data[after_completion][redirect][return_url]":
+                "https://bettersnap.ai/billing",
+        })
+
+    def test_full_billing_portal_shows_saved_methods_and_invoices(self):
+        from shared import stripe_client
+
+        with mock.patch.object(stripe_client, "_post", return_value={"url": "portal"}) as post:
+            stripe_client.create_billing_portal(
+                "cus_123", "https://bettersnap.ai/billing", "manage")
+
+        post.assert_called_once_with("billing_portal/sessions", {
+            "customer": "cus_123",
+            "return_url": "https://bettersnap.ai/billing",
+        })
 
     def test_b1_payment_failure_is_recorded(self):
         function_app._handle_payment_failed(
@@ -1204,10 +1253,24 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         executed = self._cfg["executed"]
         self.assertTrue(any(
-            "payment_failed_at = getutcdate()" in sql.lower()
+            "payment_failed_at = coalesce(payment_failed_at, getutcdate())" in sql.lower()
             and params == ("sub_123",)
             for sql, params in executed
         ))
+
+    def test_failed_payment_grace_removes_only_monthly_credits(self):
+        function_app.failed_payment_grace_cleanup(mock.Mock())
+
+        cleanup_sql, params = next(
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "payment_failed_at <= dateadd" in sql.lower()
+        )
+        normalized = cleanup_sql.lower()
+        self.assertIn("monthly_credits_remaining = 0", normalized)
+        self.assertIn("credits_remaining = one_time_credits_remaining", normalized)
+        self.assertNotIn("one_time_credits_remaining =", normalized)
+        self.assertIn("subscription_type = 'monthly'", normalized)
+        self.assertEqual(params, (3,))
 
     def test_local_webhook_secret_overrides_key_vault(self):
         from shared import stripe_client
@@ -1990,6 +2053,93 @@ class StripePaidGrantTests(unittest.TestCase):
             "when credits_remaining > credits_monthly_limit", renewal_sql,
         )
         self.assertTrue(conn.committed)
+
+
+class RetentionCleanupTests(unittest.TestCase):
+    class DueCursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.sql = ""
+
+        def execute(self, sql, *_params):
+            self.sql = " ".join(sql.lower().split())
+            return self
+
+        def fetchall(self):
+            return self.rows
+
+    class DueConnection:
+        def __init__(self, rows):
+            self.cur = RetentionCleanupTests.DueCursor(rows)
+
+        def cursor(self):
+            return self.cur
+
+    class EligibilityCursor:
+        def __init__(self, eligible):
+            self.eligible = eligible
+            self.executed = []
+            self._eligibility_query = False
+
+        def execute(self, sql, *params):
+            normalized = " ".join(sql.lower().split())
+            self.executed.append((normalized, params))
+            self._eligibility_query = normalized.startswith(
+                "select user_id from users with (updlock, holdlock)"
+            )
+            return self
+
+        def fetchone(self):
+            return ("user-1",) if self._eligibility_query and self.eligible else None
+
+        def fetchall(self):
+            return []
+
+    class EligibilityConnection:
+        def __init__(self, eligible):
+            self.cur = RetentionCleanupTests.EligibilityCursor(eligible)
+            self.committed = False
+            self.rolled_back = False
+            self.closed = False
+            self.autocommit = True
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            self.closed = True
+
+    def test_due_query_preserves_users_with_paid_credit_buckets(self):
+        due_conn = self.DueConnection([])
+        with mock.patch.object(function_app, "get_db", return_value=due_conn), \
+                mock.patch.object(function_app, "new_connection") as new_connection:
+            function_app.retention_cleanup(None)
+
+        self.assertIn("isnull(monthly_credits_remaining, 0) <= 0", due_conn.cur.sql)
+        self.assertIn("isnull(one_time_credits_remaining, 0) <= 0", due_conn.cur.sql)
+        new_connection.assert_not_called()
+
+    def test_active_job_blocks_blob_deletion(self):
+        due_conn = self.DueConnection([("user-1",)])
+        eligibility_conn = self.EligibilityConnection(eligible=False)
+        with mock.patch.object(function_app, "get_db", return_value=due_conn), \
+                mock.patch.object(
+                    function_app, "new_connection", return_value=eligibility_conn
+                ), mock.patch.object(function_app, "_delete_blobs") as delete_blobs:
+            function_app.retention_cleanup(None)
+
+        eligibility_sql = eligibility_conn.cur.executed[0][0]
+        self.assertIn("status not in ('completed', 'failed')", eligibility_sql)
+        self.assertTrue(eligibility_conn.rolled_back)
+        self.assertTrue(eligibility_conn.closed)
+        self.assertFalse(eligibility_conn.committed)
+        delete_blobs.assert_not_called()
 
 
 if __name__ == "__main__":

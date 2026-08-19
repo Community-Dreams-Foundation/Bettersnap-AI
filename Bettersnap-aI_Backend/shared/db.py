@@ -53,8 +53,8 @@ def _connect(*, autocommit=False):
         cur = conn.cursor()
         cur.execute(_REQUIRED_SESSION_OPTIONS)
         cur.execute(
-            "SELECT SESSIONPROPERTY('QUOTED_IDENTIFIER'), "
-            "SESSIONPROPERTY('ANSI_NULLS')"
+            "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS INT), "
+            "CAST(SESSIONPROPERTY('ANSI_NULLS') AS INT)"
         )
         if tuple(cur.fetchone()) != (1, 1):
             raise RuntimeError("required SQL session options are not enabled")

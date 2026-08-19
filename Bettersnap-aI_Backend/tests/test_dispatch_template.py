@@ -95,6 +95,15 @@ class FakeClient:
         self.jobs = FakeJobs()
         self.jobs_executions = FakeJobsExecutions()
 
+    def job_execution(self, rg, job_name, execution_id):
+        CAPTURED["outcome_request"] = (rg, job_name, execution_id)
+        return types.SimpleNamespace(
+            name=execution_id,
+            status="Failed",
+            start_time="start",
+            end_time="end",
+        )
+
 
 def _mod(name, **attrs):
     m = types.ModuleType(name)
@@ -189,6 +198,18 @@ class DispatchTemplateTests(unittest.TestCase):
         CAPTURED["raise_result"] = True
         exec_id = queue_trigger.trigger_container_job("job-1", "user-1")
         self.assertEqual(exec_id, "exec-recovered")
+
+    def test_execution_outcome_uses_authoritative_aca_resource(self):
+        outcome = queue_trigger.get_job_execution_outcome("exec-oom")
+
+        self.assertEqual(outcome["execution_id"], "exec-oom")
+        self.assertEqual(outcome["execution_status"], "failed")
+        self.assertEqual(outcome["start_time"], "start")
+        self.assertEqual(outcome["end_time"], "end")
+        self.assertEqual(
+            CAPTURED["outcome_request"],
+            (queue_trigger.RESOURCE_GROUP, queue_trigger.JOB_NAME, "exec-oom"),
+        )
 
 
 if __name__ == "__main__":

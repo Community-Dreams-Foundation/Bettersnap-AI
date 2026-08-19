@@ -1,4 +1,4 @@
--- 019_credit_ledger.sql — formalize dbo.credit_transactions as the append-only credit ledger.
+-- 024_credit_ledger.sql — formalize dbo.credit_transactions as the append-only credit ledger.
 --
 -- The table already existed (created in 000_baseline) but was DORMANT — never written to
 -- (0 rows). shared/credit_ledger.py now appends one signed row to it on every credit change

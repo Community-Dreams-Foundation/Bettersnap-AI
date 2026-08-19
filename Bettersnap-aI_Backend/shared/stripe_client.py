@@ -234,12 +234,25 @@ def reactivate_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
-def create_billing_portal(stripe_customer_id: str, return_url: str) -> dict:
-    """Create a Stripe-hosted session where the customer can update payment details."""
-    return _post("billing_portal/sessions", {
+def create_billing_portal(
+    stripe_customer_id: str,
+    return_url: str,
+    mode: str = "payment_method_update",
+) -> dict:
+    """Create either a targeted card-update flow or the full Stripe billing portal."""
+    data = {
         "customer": stripe_customer_id,
         "return_url": return_url,
-    })
+    }
+    if mode == "payment_method_update":
+        data.update({
+            "flow_data[type]": "payment_method_update",
+            "flow_data[after_completion][type]": "redirect",
+            "flow_data[after_completion][redirect][return_url]": return_url,
+        })
+    elif mode != "manage":
+        raise ValueError("unsupported billing portal mode")
+    return _post("billing_portal/sessions", data)
 
 def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
     # env override first (features-stripe), then Key Vault (dev) — either source works.
