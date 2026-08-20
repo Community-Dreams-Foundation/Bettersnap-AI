@@ -156,19 +156,29 @@ def require_admin(token: str) -> dict:
             return {"oid": os.environ.get("ADMIN_TEST_OID", "00000000-0000-4000-8000-000000000001"),
                     "email": email, "name": "Admin Test", "roles": ["Admin"]}
 
-    aud = os.environ.get("ADMIN_AUD")
+    aud_raw = os.environ.get("ADMIN_AUD")
     iss = os.environ.get("ADMIN_ISSUER")
-    if not aud:
+    if not aud_raw:
         raise RuntimeError("ADMIN_AUD not set — admin API refuses to validate (fail closed).")
     if not iss:
         raise RuntimeError("ADMIN_ISSUER not set — admin API refuses to validate (fail closed).")
+    # ADMIN_AUD and ADMIN_ISSUER may each be a comma-separated list. A work-tenant access token's
+    # `aud` for a custom API can be the App ID URI (api://<client-id>) OR the bare client-id GUID,
+    # and `iss` can be the v2 form (login.microsoftonline.com/<tid>/v2.0) OR the v1 form
+    # (sts.windows.net/<tid>/) depending on the app's requestedAccessTokenVersion. Accept any of
+    # each so a version mismatch doesn't silently 401. jwt.decode matches a list of audiences; we
+    # verify the issuer ourselves against the allowed set (its `issuer=` param is single-valued).
+    aud = [a.strip() for a in aud_raw.split(",") if a.strip()]
+    issuers = [i.strip() for i in iss.split(",") if i.strip()]
 
     signing_key = _get_admin_jwks_client().get_signing_key_from_jwt(token)
     payload = jwt.decode(
-        token, signing_key.key, algorithms=["RS256"], audience=aud, issuer=iss,
+        token, signing_key.key, algorithms=["RS256"], audience=aud,
         options={"require": ["exp", "iss", "aud", "oid"], "verify_signature": True,
-                 "verify_exp": True, "verify_aud": True, "verify_iss": True},
+                 "verify_exp": True, "verify_aud": True, "verify_iss": False},
     )
+    if payload.get("iss") not in issuers:
+        raise jwt.InvalidIssuerError(f"iss {payload.get('iss')} not in allowed {issuers}")
     role_name = os.environ.get("ADMIN_ROLE", "Admin")
     roles = payload.get("roles") or []
     if role_name not in roles:
