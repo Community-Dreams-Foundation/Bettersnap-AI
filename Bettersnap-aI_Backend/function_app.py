@@ -3891,7 +3891,7 @@ def _admin_page(req: func.HttpRequest):
     return limit, offset
 
 
-@app.route(route="admin/dashboard/summary", methods=["GET"])
+@app.route(route="superadmin/dashboard/summary", methods=["GET"])
 def admin_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     _admin, err = _require_admin_or_response(req)
     if err:
@@ -3933,7 +3933,7 @@ def admin_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     }), mimetype="application/json", status_code=200)
 
 
-@app.route(route="admin/users", methods=["GET"])
+@app.route(route="superadmin/users", methods=["GET"])
 def admin_list_users(req: func.HttpRequest) -> func.HttpResponse:
     _admin, err = _require_admin_or_response(req)
     if err:
@@ -3964,7 +3964,7 @@ def admin_list_users(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=200)
 
 
-@app.route(route="admin/users/{user_id}", methods=["GET"])
+@app.route(route="superadmin/users/{user_id}", methods=["GET"])
 def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
     _admin, err = _require_admin_or_response(req)
     if err:
@@ -4002,7 +4002,7 @@ def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps(user), mimetype="application/json", status_code=200)
 
 
-@app.route(route="admin/jobs", methods=["GET"])
+@app.route(route="superadmin/jobs", methods=["GET"])
 def admin_list_jobs(req: func.HttpRequest) -> func.HttpResponse:
     _admin, err = _require_admin_or_response(req)
     if err:
@@ -4035,7 +4035,7 @@ def admin_list_jobs(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=200)
 
 
-@app.route(route="admin/jobs/{job_id}", methods=["GET"])
+@app.route(route="superadmin/jobs/{job_id}", methods=["GET"])
 def admin_job_detail(req: func.HttpRequest) -> func.HttpResponse:
     _admin, err = _require_admin_or_response(req)
     if err:
