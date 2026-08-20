@@ -94,7 +94,9 @@ _mod("requests", post=mock.Mock(), get=mock.Mock())
 # Stub the heavy LEAF modules so importing function_app never pulls pyodbc / jwt
 # / azure-mgmt. NOTE: 'shared' itself and shared.job_reservation are left REAL so
 # the tests exercise the real reservation logic (it uses the stubbed shared.db).
-_mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"))
+_mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"),
+     require_admin=mock.Mock(return_value={"oid": "admin", "email": "admin@test", "name": "Admin", "roles": ["Admin"]}),
+     NotAdminError=type("NotAdminError", (Exception,), {}))
 _mod("shared.db", get_db=mock.Mock(), new_connection=mock.Mock())
 _mod("shared.queue_client",
      enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock(),
@@ -351,7 +353,8 @@ class FakeCursor:
             self._fetch = (self.cfg.get("plan_name", "basic"),
                            self.cfg.get("lora_status", "ready"),
                            self.cfg.get("credits", 20),
-                           self.cfg.get("one_time_credits", 0))
+                           self.cfg.get("one_time_credits", 0),
+                           self.cfg.get("suspended_at"))  # None = active (submit_job suspend gate)
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
         elif "select job_params, user_id, source_type from jobs" in s:
             self._fetch = (self.cfg.get("job_params",

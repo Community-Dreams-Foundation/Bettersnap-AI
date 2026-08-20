@@ -108,7 +108,9 @@ if "function_app" not in sys.modules:
     _mod("azure.storage")
     _mod("azure.storage.blob", generate_blob_sas=mock.Mock(return_value="sas"),
          BlobSasPermissions=mock.Mock())
-    _mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"))
+    _mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"),
+         require_admin=mock.Mock(return_value={"oid": "admin", "email": "admin@test", "name": "Admin", "roles": ["Admin"]}),
+         NotAdminError=type("NotAdminError", (Exception,), {}))
     _mod("shared.db", get_db=mock.Mock(), new_connection=fake_new_connection)
     _mod("shared.queue_client", enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock(),
          _send=mock.Mock(), INFERENCE_QUEUE="inference-jobs", TRAINING_QUEUE="lora-training-jobs")

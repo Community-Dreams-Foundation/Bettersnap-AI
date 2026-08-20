@@ -1100,12 +1100,18 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     cur0 = conn0.cursor()
     cur0.execute(
         "SELECT plan_name, lora_status, credits_remaining, "
-        "one_time_credits_remaining FROM users WHERE user_id = ?",
+        "one_time_credits_remaining, suspended_at FROM users WHERE user_id = ?",
         user_id,
     )
     prow = cur0.fetchone()
     if not prow:
         return func.HttpResponse("User not found", status_code=404)
+    # A super-admin can suspend an account; a suspended user cannot start new generations.
+    if prow[4] is not None:
+        return func.HttpResponse(
+            json.dumps({"error": "account_suspended",
+                        "message": "This account is suspended. Contact support."}),
+            mimetype="application/json", status_code=403)
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
     credits_remaining = int(prow[2] or 0)
@@ -3913,20 +3919,27 @@ def admin_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
             "new_30d": scalar("SELECT COUNT(*) FROM users WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
             "active_30d": scalar("SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
             "paying": scalar("SELECT COUNT(DISTINCT user_id) FROM credit_transactions WHERE transaction_type LIKE 'purchase%'"),
+            "suspended": scalar("SELECT COUNT(*) FROM users WHERE suspended_at IS NOT NULL"),
+            "active_subscriptions": scalar(
+                "SELECT COUNT(*) FROM users WHERE subscription_type = 'monthly' AND subscription_cancel_at IS NULL"),
         },
         "jobs": {
             "total": scalar("SELECT COUNT(*) FROM jobs"),
+            "completed_all_time": scalar("SELECT COUNT(*) FROM jobs WHERE status='completed'"),
             "today": scalar("SELECT COUNT(*) FROM jobs WHERE created_at >= CAST(GETUTCDATE() AS DATE)"),
             "completed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='completed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
             "failed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='failed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
             "queue_depth": scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','dispatching','processing','waiting_lora')"),
             "avg_processing_seconds": round(float(avg_secs), 1) if avg_secs else 0,
+            "total_images_generated": scalar("SELECT SUM(credits_consumed) FROM jobs WHERE status='completed'"),
         },
         "billing": {
             "credits_purchased_30d": scalar(
                 "SELECT SUM(amount) FROM credit_transactions WHERE transaction_type LIKE 'purchase%' "
                 "AND created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
-            "note": "currency revenue needs the Stripe/plan-price join (not wired yet)",
+            "credits_used_all_time": scalar("SELECT SUM(credits_consumed) FROM jobs"),
+            "note": "currency revenue needs the Stripe/plan-price join (not wired yet). "
+                    "total_images_generated is credits_consumed on completed jobs (1 credit = 1 image).",
         },
         "organizations": {"total": scalar("SELECT COUNT(*) FROM organizations")},
         "support": {"open": 0, "note": "no support-ticket table yet"},
@@ -3975,7 +3988,7 @@ def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
         "SELECT user_id, email, full_name, plan_name, subscription_type, subscription_plan, "
         "lora_status, retrain_count, credits_remaining, one_time_credits_remaining, "
         "monthly_credits_remaining, created_at, subscription_start, subscription_end, "
-        "stripe_customer_id, terms_accepted_at FROM users WHERE user_id = ?", user_id)
+        "stripe_customer_id, terms_accepted_at, suspended_at FROM users WHERE user_id = ?", user_id)
     r = cur.fetchone()
     if not r:
         return func.HttpResponse("User not found", status_code=404)
@@ -3987,7 +4000,14 @@ def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
         "created_at": _utc_iso(r[11]), "subscription_start": _utc_iso(r[12]),
         "subscription_end": _utc_iso(r[13]), "stripe_customer_id": r[14],
         "terms_accepted_at": _utc_iso(r[15]),
+        "suspended": r[16] is not None, "suspended_at": _utc_iso(r[16]),
+        "account_status": "suspended" if r[16] is not None else "active",
     }
+    # internal support notes (most recent first)
+    cur.execute("SELECT admin_email, note, created_at FROM admin_user_notes "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["notes"] = [{"admin_email": n[0], "note": n[1], "created_at": _utc_iso(n[2])}
+                     for n in cur.fetchall()]
     cur.execute("SELECT TOP 20 job_id, status, category, credits_consumed, created_at, completed_at "
                 "FROM jobs WHERE user_id = ? ORDER BY created_at DESC", user_id)
     user["recent_jobs"] = [{
@@ -4074,6 +4094,431 @@ def admin_job_detail(req: func.HttpRequest) -> func.HttpResponse:
         "execution_id": r[11], "image_count": image_count, "processing_seconds": proc_secs,
         "params": params,
     }), mimetype="application/json", status_code=200)
+
+
+# ── Admin helpers: JSON body + immutable audit write ──────────────────────────
+def _admin_json_body(req: func.HttpRequest):
+    """(body_dict, None) or (None, 400 response)."""
+    try:
+        body = req.get_json()
+        return (body if isinstance(body, dict) else {}), None
+    except Exception:
+        return None, func.HttpResponse(
+            json.dumps({"error": "invalid JSON body"}), mimetype="application/json", status_code=400)
+
+
+def _write_audit(cur, admin, action, target_type=None, target_id=None,
+                 previous=None, new=None, reason=None, result="success"):
+    """Append one admin-audit row using the CALLER'S cursor, so it commits atomically with the
+    mutation in a transaction. Best-effort: an audit failure is logged, never fatal to the action."""
+    try:
+        cur.execute(
+            "INSERT INTO admin_audit_log (actor_id, actor_email, action, target_type, target_id, "
+            "previous_value, new_value, reason, result) VALUES (?,?,?,?,?,?,?,?,?)",
+            (admin or {}).get("oid"), (admin or {}).get("email"), action, target_type,
+            str(target_id) if target_id is not None else None,
+            json.dumps(previous) if previous is not None else None,
+            json.dumps(new) if new is not None else None, reason, result)
+    except Exception as e:
+        logging.warning(f"audit write failed action={action}: {e}")
+
+
+@app.route(route="superadmin/me", methods=["GET"])
+def admin_me(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    return func.HttpResponse(json.dumps({
+        "oid": admin["oid"], "email": admin["email"], "name": admin["name"], "roles": admin["roles"],
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/audit-logs", methods=["GET"])
+def admin_audit_logs(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    clauses, args = [], []
+    for col, key in (("target_type", "target_type"), ("target_id", "target_id")):
+        v = (req.params.get(key) or "").strip()
+        if v:
+            clauses.append(f"{col} = ?"); args.append(v)
+    act = (req.params.get("action") or "").strip()
+    if act:
+        clauses.append("action LIKE ?"); args.append(f"%{act}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur = get_db().cursor()
+    cur.execute(f"SELECT COUNT(*) FROM admin_audit_log {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT event_id, actor_email, action, target_type, target_id, previous_value, new_value, "
+        f"reason, result, created_at FROM admin_audit_log {where} "
+        f"ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", *(args + [offset, limit]))
+    events = [{
+        "event_id": str(r[0]), "actor_email": r[1], "action": r[2], "target_type": r[3],
+        "target_id": r[4], "previous_value": r[5], "new_value": r[6], "reason": r[7],
+        "result": r[8], "created_at": _utc_iso(r[9]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"events": events, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/suspend", methods=["POST"])
+def admin_suspend_user(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT suspended_at FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        cur.execute("UPDATE users SET suspended_at = SYSUTCDATETIME() "
+                    "WHERE user_id = ? AND suspended_at IS NULL", user_id)
+        _write_audit(cur, admin, "user.suspended", "user", user_id,
+                     previous={"suspended": row[0] is not None}, new={"suspended": True}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"user_id": str(user_id), "suspended": True}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/reactivate", methods=["POST"])
+def admin_reactivate_user(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip() or "reactivated"
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT suspended_at FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        cur.execute("UPDATE users SET suspended_at = NULL WHERE user_id = ?", user_id)
+        _write_audit(cur, admin, "user.reactivated", "user", user_id,
+                     previous={"suspended": row[0] is not None}, new={"suspended": False}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"user_id": str(user_id), "suspended": False}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/notes", methods=["GET", "POST"])
+def admin_user_notes(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    cur = get_db().cursor()
+    if req.method == "POST":
+        body, berr = _admin_json_body(req)
+        if berr:
+            return berr
+        note = (body.get("note") or "").strip()
+        if not note:
+            return func.HttpResponse(json.dumps({"error": "note required"}),
+                                     mimetype="application/json", status_code=400)
+        cur.execute("INSERT INTO admin_user_notes (user_id, admin_id, admin_email, note) VALUES (?,?,?,?)",
+                    user_id, admin["oid"], admin["email"], note[:4000])
+        _write_audit(cur, admin, "user.note_added", "user", user_id, new={"note": note[:200]})
+        return func.HttpResponse(json.dumps({"status": "added"}),
+                                 mimetype="application/json", status_code=201)
+    cur.execute("SELECT admin_email, note, created_at FROM admin_user_notes "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    notes = [{"admin_email": r[0], "note": r[1], "created_at": _utc_iso(r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(json.dumps({"notes": notes}), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/credits/adjust", methods=["POST"])
+def admin_adjust_credits(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    try:
+        amount = int(body.get("amount"))
+    except (TypeError, ValueError):
+        return func.HttpResponse(json.dumps({"error": "amount must be an integer"}),
+                                 mimetype="application/json", status_code=400)
+    if amount == 0:
+        return func.HttpResponse(json.dumps({"error": "amount must be non-zero"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT credits_remaining, one_time_credits_remaining, monthly_credits_remaining "
+                    "FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        before = {"legacy": int(row[0] or 0), "one_time": int(row[1] or 0), "monthly": int(row[2] or 0)}
+        # Adjust the one_time bucket (+ legacy mirror). A deduction never drives the bucket below 0.
+        new_one_time = before["one_time"] + amount if amount > 0 else max(0, before["one_time"] + amount)
+        applied = new_one_time - before["one_time"]
+        cur.execute("UPDATE users SET one_time_credits_remaining = ?, "
+                    "credits_remaining = credits_remaining + ? WHERE user_id = ?",
+                    new_one_time, applied, user_id)
+        cur.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type) VALUES (?,?,?)",
+                    user_id, applied, "admin_adjust")
+        after = {**before, "one_time": new_one_time, "legacy": before["legacy"] + applied}
+        _write_audit(cur, admin, "user.credits.adjusted", "user", user_id,
+                     previous=before, new=after, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({
+        "user_id": str(user_id), "requested": amount, "applied": applied,
+        "one_time_credits_remaining": new_one_time,
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/credits", methods=["GET"])
+def admin_credits_ledger(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    clauses, args = [], []
+    uf = (req.params.get("user_id") or "").strip()
+    tf = (req.params.get("type") or "").strip()
+    if uf:
+        clauses.append("t.user_id = ?"); args.append(uf)
+    if tf:
+        clauses.append("t.transaction_type = ?"); args.append(tf)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur = get_db().cursor()
+    cur.execute(f"SELECT COUNT(*) FROM credit_transactions t {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT t.transaction_id, t.user_id, u.email, t.amount, t.transaction_type, t.job_id, t.created_at "
+        f"FROM credit_transactions t LEFT JOIN users u ON u.user_id = t.user_id {where} "
+        f"ORDER BY t.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", *(args + [offset, limit]))
+    entries = [{
+        "transaction_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "amount": int(r[3] or 0),
+        "type": r[4], "job_id": str(r[5]) if r[5] else None, "created_at": _utc_iso(r[6]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"entries": entries, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/cancel", methods=["POST"])
+def admin_cancel_job(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute("SELECT status, external_execution_id FROM jobs WHERE job_id = ?", job_id)
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    status, exec_id = (row[0] or "").strip(), row[1]
+    if status in ("completed", "failed"):
+        return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": status, "cancelled": False}),
+                                 mimetype="application/json", status_code=200)
+    if exec_id:
+        try:
+            from shared.queue_trigger import stop_execution
+            stop_execution(exec_id)
+        except Exception as e:
+            logging.warning(f"admin_cancel_job stop failed job={job_id}: {e}")
+    _mark_failed(job_id)  # fail + refund, guarded once
+    _write_audit(get_db().cursor(), admin, "job.cancelled", "job", str(job_id),
+                 previous={"status": status}, new={"status": "failed"})
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/retry", methods=["POST"])
+def admin_retry_job(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute("SELECT status, user_id, job_params FROM jobs WHERE job_id = ?", job_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("Not found", status_code=404)
+    status = (r[0] or "").strip()
+    if status != "failed":
+        return func.HttpResponse(
+            json.dumps({"error": f"can only retry a failed job (status={status})"}),
+            mimetype="application/json", status_code=409)
+    cur.execute("UPDATE jobs SET status='queued', external_execution_id=NULL, completed_at=NULL "
+                "WHERE job_id = ?", job_id)
+    try:
+        from shared.queue_client import INFERENCE_QUEUE, enqueue_job
+        enqueue_job(INFERENCE_QUEUE, {"job_id": str(job_id), "user_id": str(r[1]), "job_params": r[2]})
+    except Exception as e:
+        logging.warning(f"admin_retry_job enqueue failed job={job_id}: {e}")
+    _write_audit(get_db().cursor(), admin, "job.retried", "job", str(job_id),
+                 previous={"status": status}, new={"status": "queued"})
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": "queued"}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/restore-credit", methods=["POST"])
+def admin_restore_credit(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, job_params FROM jobs WHERE job_id = ?", job_id)
+        r = cur.fetchone()
+        if not r:
+            conn.rollback()
+            return func.HttpResponse("Not found", status_code=404)
+        try:
+            cost = max(1, int(json.loads(r[1]).get("credit_cost", 1)))
+        except Exception:
+            cost = 1
+        cur.execute("UPDATE users SET one_time_credits_remaining = one_time_credits_remaining + ?, "
+                    "credits_remaining = credits_remaining + ? WHERE user_id = ?", cost, cost, r[0])
+        cur.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type, job_id) "
+                    "VALUES (?,?,?,?)", r[0], cost, "admin_restore", job_id)
+        _write_audit(cur, admin, "job.credits_restored", "job", str(job_id),
+                     new={"restored": cost}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "restored": cost}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/payments", methods=["GET"])
+def admin_payments(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    cur = get_db().cursor()
+    cur.execute("SELECT COUNT(*) FROM credit_transactions WHERE transaction_type LIKE 'purchase%'")
+    total = cur.fetchone()[0]
+    cur.execute(
+        "SELECT t.transaction_id, t.user_id, u.email, u.stripe_customer_id, t.amount, "
+        "t.transaction_type, t.created_at FROM credit_transactions t "
+        "LEFT JOIN users u ON u.user_id = t.user_id WHERE t.transaction_type LIKE 'purchase%' "
+        "ORDER BY t.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", offset, limit)
+    payments = [{
+        "transaction_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "stripe_customer_id": r[3],
+        "credits_granted": int(r[4] or 0), "type": r[5], "created_at": _utc_iso(r[6]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(json.dumps({
+        "payments": payments, "total": total, "limit": limit, "offset": offset,
+        "note": "credit-grant records from the ledger; currency amounts + Stripe refunds need the "
+                "Stripe API join (not wired yet — use /jobs/{id}/restore-credit or credits/adjust to "
+                "return credits).",
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/subscriptions", methods=["GET"])
+def admin_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    cur = get_db().cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE subscription_type IS NOT NULL")
+    total = cur.fetchone()[0]
+    cur.execute(
+        "SELECT user_id, email, subscription_type, subscription_plan, monthly_credits_remaining, "
+        "subscription_start, subscription_end, subscription_cancel_at, payment_failed_at "
+        "FROM users WHERE subscription_type IS NOT NULL "
+        "ORDER BY subscription_start DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", offset, limit)
+    subs = [{
+        "user_id": str(r[0]), "email": r[1], "subscription_type": r[2], "subscription_plan": r[3],
+        "monthly_credits_remaining": int(r[4] or 0), "start": _utc_iso(r[5]), "end": _utc_iso(r[6]),
+        "cancel_at": _utc_iso(r[7]), "payment_failed": r[8] is not None,
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"subscriptions": subs, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/system-health", methods=["GET"])
+def admin_system_health(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    health = {}
+    try:
+        get_db().cursor().execute("SELECT 1")
+        health["sql"] = "ok"
+    except Exception as e:
+        health["sql"] = f"error: {str(e)[:100]}"
+    try:
+        get_blob_client().get_container_client("outputs").get_container_properties()
+        health["blob"] = "ok"
+    except Exception as e:
+        health["blob"] = f"error: {str(e)[:100]}"
+    try:
+        from shared.queue_trigger import count_active_job_executions
+        health["gpu_active_executions"] = count_active_job_executions()
+    except Exception as e:
+        health["gpu_active_executions"] = f"error: {str(e)[:100]}"
+    try:
+        cur = get_db().cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE status IN "
+                    "('queued','dispatching','processing','waiting_lora')")
+        health["queue_depth"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE status='failed' "
+                    "AND created_at >= DATEADD(DAY,-1,GETUTCDATE())")
+        health["failed_jobs_24h"] = cur.fetchone()[0]
+    except Exception as e:
+        health["queue_depth"] = f"error: {str(e)[:100]}"
+    return func.HttpResponse(json.dumps(health), mimetype="application/json", status_code=200)
 
 
 @app.timer_trigger(schedule="0 0 * * * *", arg_name="timer", run_on_startup=False)
