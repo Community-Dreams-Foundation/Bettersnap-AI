@@ -92,6 +92,10 @@ TRAIN_FUSE_HEAD_START = int(os.environ.get("TRAIN_FUSE_HEAD_START", "25"))
 # less aggressive than the GPU's hard cap, so it can NEVER false-fail a healthy run. (Was
 # 45, which — measured from submit — could reap a large job that merely waited in queue.)
 REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "130"))
+# How long after submit a user may cancel their own job. Enforced server-side (the UI also
+# hides the button past this) so a late cancel on a job that's already deep into generation
+# can't be forced. Measured from created_at.
+CANCEL_WINDOW_MINUTES      = int(os.environ.get("CANCEL_WINDOW_MINUTES", "5"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
 # ── Identity-LoRA training ────────────────────────────────────────────────
@@ -1438,21 +1442,33 @@ def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
 
     conn = get_db()
     cursor = conn.cursor()
-    # Ownership gate: 404 if missing, 403 if not the caller's job.
+    # Ownership gate: 404 if missing, 403 if not the caller's job. age_sec = seconds since submit,
+    # computed in SQL (both created_at and GETUTCDATE are UTC) to avoid client/server clock skew.
     cursor.execute(
-        "SELECT user_id, status, external_execution_id FROM jobs WHERE job_id = ?", job_id)
+        "SELECT user_id, status, external_execution_id, "
+        "DATEDIFF(SECOND, created_at, GETUTCDATE()) FROM jobs WHERE job_id = ?", job_id)
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("Not found", status_code=404)
     if row[0] != user_id:
         return func.HttpResponse("Forbidden", status_code=403)
-    status, exec_id = (row[1] or "").strip(), row[2]
+    status, exec_id, age_sec = (row[1] or "").strip(), row[2], int(row[3] or 0)
 
     if status in ("completed", "failed"):
         # Nothing to cancel; report current state so the client just refreshes.
         return func.HttpResponse(
             json.dumps({"job_id": str(job_id), "status": status, "cancelled": False}),
             mimetype="application/json", status_code=200)
+
+    # Cancel window: only within the first CANCEL_WINDOW_MINUTES after submit. Past that the job is
+    # committed (deep into training/generation), so a late cancel is rejected server-side.
+    if age_sec > CANCEL_WINDOW_MINUTES * 60:
+        return func.HttpResponse(
+            json.dumps({"error": "cancel_window_expired",
+                        "message": f"Jobs can only be cancelled within {CANCEL_WINDOW_MINUTES} "
+                                   f"minutes of starting.",
+                        "window_minutes": CANCEL_WINDOW_MINUTES, "age_seconds": age_sec}),
+            mimetype="application/json", status_code=409)
 
     # 1) Free the GPU immediately: best-effort stop the live container (if its execution is known).
     if exec_id:
