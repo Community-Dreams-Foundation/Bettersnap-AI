@@ -132,7 +132,7 @@ def _gpu_dispatch_enabled() -> bool:
     # halt ALL A100 spend. Budgets only alert; this actually stops dispatch.
     return os.environ.get("GPU_DISPATCH_ENABLED", "true").lower() == "true"
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-from shared.auth import validate_token, get_user_id
+from shared.auth import validate_token, get_user_id, require_admin, NotAdminError
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
 from shared.training_reservation import reserve_training_slot
@@ -3857,6 +3857,223 @@ def _delete_blobs(container_name: str, prefix: str) -> int:
     except Exception as e:
         logging.warning(f"retention: blob cleanup failed for {container_name}/{prefix}: {e}")
     return n
+
+
+# ── Super-Admin API (Priority 1: role-gated, read-only platform views) ────────
+# Every endpoint is gated by require_admin (internal-tenant token + "Admin" app role). These are
+# PLATFORM-WIDE reads (all users/jobs), NOT the caller's own data — the gap Jayasri's report calls
+# out. Reads only for now; mutations (credit adjust, suspend, refund) come next and each writes an
+# audit event. Fails 401 (bad/missing token or admin API not configured) or 403 (valid but not admin).
+def _require_admin_or_response(req: func.HttpRequest):
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        return require_admin(token), None
+    except NotAdminError as e:
+        logging.info(f"admin gate: forbidden — {e}")
+        return None, func.HttpResponse(
+            json.dumps({"error": "forbidden", "message": "Admin role required."}),
+            mimetype="application/json", status_code=403)
+    except Exception as e:
+        logging.info(f"admin gate: unauthorized — {e}")
+        return None, func.HttpResponse("Unauthorized", status_code=401)
+
+
+def _admin_page(req: func.HttpRequest):
+    """Clamp pagination: limit 1..200 (default 50), offset >= 0."""
+    try:
+        limit = max(1, min(200, int(req.params.get("limit", "50"))))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(req.params.get("offset", "0")))
+    except (TypeError, ValueError):
+        offset = 0
+    return limit, offset
+
+
+@app.route(route="admin/dashboard/summary", methods=["GET"])
+def admin_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    cur = get_db().cursor()
+
+    def scalar(sql):
+        cur.execute(sql)
+        r = cur.fetchone()
+        return r[0] if r and r[0] is not None else 0
+
+    avg_secs = scalar(
+        "SELECT AVG(CAST(DATEDIFF(SECOND, dispatched_at, completed_at) AS FLOAT)) FROM jobs "
+        "WHERE status='completed' AND completed_at IS NOT NULL AND dispatched_at IS NOT NULL "
+        "AND completed_at >= DATEADD(DAY,-1,GETUTCDATE())")
+    return func.HttpResponse(json.dumps({
+        "users": {
+            "total": scalar("SELECT COUNT(*) FROM users"),
+            "new_30d": scalar("SELECT COUNT(*) FROM users WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "active_30d": scalar("SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "paying": scalar("SELECT COUNT(DISTINCT user_id) FROM credit_transactions WHERE transaction_type LIKE 'purchase%'"),
+        },
+        "jobs": {
+            "total": scalar("SELECT COUNT(*) FROM jobs"),
+            "today": scalar("SELECT COUNT(*) FROM jobs WHERE created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "completed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='completed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "failed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='failed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "queue_depth": scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','dispatching','processing','waiting_lora')"),
+            "avg_processing_seconds": round(float(avg_secs), 1) if avg_secs else 0,
+        },
+        "billing": {
+            "credits_purchased_30d": scalar(
+                "SELECT SUM(amount) FROM credit_transactions WHERE transaction_type LIKE 'purchase%' "
+                "AND created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "note": "currency revenue needs the Stripe/plan-price join (not wired yet)",
+        },
+        "organizations": {"total": scalar("SELECT COUNT(*) FROM organizations")},
+        "support": {"open": 0, "note": "no support-ticket table yet"},
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="admin/users", methods=["GET"])
+def admin_list_users(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    q = (req.params.get("q") or "").strip()
+    cur = get_db().cursor()
+    where, args = "", []
+    if q:
+        where = "WHERE (email LIKE ? OR full_name LIKE ? OR CAST(user_id AS varchar(36)) LIKE ?)"
+        args = [f"%{q}%"] * 3
+    cur.execute(f"SELECT COUNT(*) FROM users {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT user_id, email, full_name, plan_name, subscription_type, lora_status, "
+        f"credits_remaining, one_time_credits_remaining, monthly_credits_remaining, created_at "
+        f"FROM users {where} ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        *(args + [offset, limit]))
+    users = [{
+        "user_id": str(r[0]), "email": r[1], "full_name": r[2], "plan_name": r[3],
+        "subscription_type": r[4], "lora_status": r[5],
+        "credits": int((r[7] or 0) + (r[8] or 0)) if (r[7] is not None or r[8] is not None) else int(r[6] or 0),
+        "one_time_credits": int(r[7] or 0), "monthly_credits": int(r[8] or 0),
+        "created_at": _utc_iso(r[9]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"users": users, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="admin/users/{user_id}", methods=["GET"])
+def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    cur = get_db().cursor()
+    cur.execute(
+        "SELECT user_id, email, full_name, plan_name, subscription_type, subscription_plan, "
+        "lora_status, retrain_count, credits_remaining, one_time_credits_remaining, "
+        "monthly_credits_remaining, created_at, subscription_start, subscription_end, "
+        "stripe_customer_id, terms_accepted_at FROM users WHERE user_id = ?", user_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("User not found", status_code=404)
+    user = {
+        "user_id": str(r[0]), "email": r[1], "full_name": r[2], "plan_name": r[3],
+        "subscription_type": r[4], "subscription_plan": r[5], "lora_status": r[6],
+        "retrain_count": int(r[7] or 0), "credits_remaining": int(r[8] or 0),
+        "one_time_credits_remaining": int(r[9] or 0), "monthly_credits_remaining": int(r[10] or 0),
+        "created_at": _utc_iso(r[11]), "subscription_start": _utc_iso(r[12]),
+        "subscription_end": _utc_iso(r[13]), "stripe_customer_id": r[14],
+        "terms_accepted_at": _utc_iso(r[15]),
+    }
+    cur.execute("SELECT TOP 20 job_id, status, category, credits_consumed, created_at, completed_at "
+                "FROM jobs WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["recent_jobs"] = [{
+        "job_id": str(j[0]), "status": j[1], "category": j[2],
+        "credits_consumed": int(j[3] or 0), "created_at": _utc_iso(j[4]), "completed_at": _utc_iso(j[5]),
+    } for j in cur.fetchall()]
+    cur.execute("SELECT TOP 30 amount, transaction_type, job_id, created_at FROM credit_transactions "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["credit_ledger"] = [{
+        "amount": int(t[0]), "type": t[1], "job_id": str(t[2]) if t[2] else None, "created_at": _utc_iso(t[3]),
+    } for t in cur.fetchall()]
+    return func.HttpResponse(json.dumps(user), mimetype="application/json", status_code=200)
+
+
+@app.route(route="admin/jobs", methods=["GET"])
+def admin_list_jobs(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    status_f = (req.params.get("status") or "").strip()
+    user_f = (req.params.get("user_id") or "").strip()
+    cur = get_db().cursor()
+    clauses, args = [], []
+    if status_f:
+        clauses.append("j.status = ?"); args.append(status_f)
+    if user_f:
+        clauses.append("j.user_id = ?"); args.append(user_f)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur.execute(f"SELECT COUNT(*) FROM jobs j {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT j.job_id, j.user_id, u.email, j.status, j.category, j.source_type, "
+        f"j.credits_consumed, j.created_at, j.completed_at, j.external_execution_id "
+        f"FROM jobs j LEFT JOIN users u ON u.user_id = j.user_id {where} "
+        f"ORDER BY j.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        *(args + [offset, limit]))
+    jobs = [{
+        "job_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "status": r[3],
+        "category": r[4], "source_type": r[5], "credits_consumed": int(r[6] or 0),
+        "created_at": _utc_iso(r[7]), "completed_at": _utc_iso(r[8]), "execution_id": r[9],
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"jobs": jobs, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="admin/jobs/{job_id}", methods=["GET"])
+def admin_job_detail(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute(
+        "SELECT j.job_id, j.user_id, u.email, j.status, j.category, j.source_type, j.job_type, "
+        "j.credits_consumed, j.created_at, j.dispatched_at, j.completed_at, j.external_execution_id, "
+        "j.output_blob_path, j.job_params FROM jobs j LEFT JOIN users u ON u.user_id = j.user_id "
+        "WHERE j.job_id = ?", job_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("Not found", status_code=404)
+    try:
+        params = json.loads(r[13]) if r[13] else {}
+    except (TypeError, ValueError):
+        params = {}
+    try:
+        images = json.loads(r[12]) if r[12] else []
+        image_count = len(images) if isinstance(images, list) else 0
+    except (TypeError, ValueError):
+        image_count = 0
+    proc_secs = None
+    if r[9] and r[10]:
+        try:
+            proc_secs = int((r[10] - r[9]).total_seconds())
+        except Exception:
+            proc_secs = None
+    return func.HttpResponse(json.dumps({
+        "job_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "status": r[3],
+        "category": r[4], "source_type": r[5], "job_type": r[6], "credits_consumed": int(r[7] or 0),
+        "created_at": _utc_iso(r[8]), "dispatched_at": _utc_iso(r[9]), "completed_at": _utc_iso(r[10]),
+        "execution_id": r[11], "image_count": image_count, "processing_seconds": proc_secs,
+        "params": params,
+    }), mimetype="application/json", status_code=200)
 
 
 @app.timer_trigger(schedule="0 0 * * * *", arg_name="timer", run_on_startup=False)
