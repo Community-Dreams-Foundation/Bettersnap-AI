@@ -9,6 +9,7 @@ serialize here — no two can both pass the same cap (TOCTOU-safe).
 from .db import new_connection
 from .outbox import outbox_add
 from .queue_client import INFERENCE_QUEUE
+from .org_credits import get_active_membership  
 
 
 class ReserveResult:
@@ -53,11 +54,21 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="busy")
 
-        cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
-        row = cur.fetchone()
-        if not row or row[0] < credit_cost:
-            conn.rollback()
-            return ReserveResult(False, reason="credits")
+        # Teams seat wins over the personal balance. Resolved INSIDE the app lock so
+        # the check and the decrement below can't be split by a concurrent submit.
+        membership = get_active_membership(cur, user_id)
+        org_id = membership[0] if membership else None
+
+        if org_id:
+            if membership[1] < credit_cost:
+                conn.rollback()
+                return ReserveResult(False, reason="credits")
+        else:
+            cur.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
+            row = cur.fetchone()
+            if not row or row[0] < credit_cost:
+                conn.rollback()
+                return ReserveResult(False, reason="credits")
 
         cur.execute(
             "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created_at >= CAST(GETUTCDATE() AS DATE)",
@@ -74,17 +85,27 @@ def reserve_job_slot(user_id, input_blob_path, job_params,
             conn.rollback()
             return ReserveResult(False, reason="global_cap")
 
+        # organization_id is the durable record of which pool paid. The refund path
+        # reads it back rather than re-deriving membership, which would be wrong if
+        # the person leaves the org before the job fails.
         cur.execute("""
-            INSERT INTO jobs (user_id, status, input_blob_path, job_params)
+            INSERT INTO jobs (user_id, status, input_blob_path, job_params, organization_id)
             OUTPUT INSERTED.job_id
-            VALUES (?, ?, ?, ?)
-        """, user_id, initial_status, input_blob_path, job_params)
+            VALUES (?, ?, ?, ?, ?)
+        """, user_id, initial_status, input_blob_path, job_params, org_id)
         job_id = cur.fetchone()[0]
 
-        cur.execute(
-            "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
-            credit_cost, user_id,
-        )
+        if org_id:
+            cur.execute(
+                "UPDATE organization_members SET credits_remaining = credits_remaining - ? "
+                "WHERE user_id = ? AND organization_id = ?",
+                credit_cost, user_id, org_id,
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET credits_remaining = credits_remaining - ? WHERE user_id = ?",
+                credit_cost, user_id,
+            )
 
         # Transactional outbox: for a 'queued' job, write the queue message into the outbox
         # IN THIS SAME TRANSACTION as the row + credit charge, so the send can no longer be

@@ -66,6 +66,7 @@ from shared.stripe_client import (
     create_onetime_checkout, create_monthly_checkout,
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
+from shared.org_credits import effective_credits
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -756,7 +757,10 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("User not found", status_code=404)
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
-    credits_remaining = int(prow[2] or 0)
+    # A Teams seat spends the org pool, so the image-count budget below must be
+    # computed against THAT balance, not the personal one. reserve_job_slot resolves
+    # membership again under its lock — this read is only for sizing the request.
+    credits_remaining, org_id = effective_credits(cur0, user_id, int(prow[2] or 0))
 
     # ── Identity-LoRA gate ───────────────────────────────────────────────────
     # Without the user's adapter, txt2img has NOTHING carrying their identity and
@@ -1429,15 +1433,25 @@ def _mark_failed(job_id: str):
                     refund = max(1, int(json.loads(r[0]).get("credit_cost", 1)))
                 except (TypeError, ValueError):
                     refund = 1
-            cur.execute(
-                # Refund the amount ACTUALLY charged (image_count * credits_per_image,
-                # carried in job_params.credit_cost) — not a flat 20. The other side of
-                # this merge hardcoded "+ 20" while still passing `refund` as a parameter
-                # for a single placeholder, which would have thrown on every failure.
-                "UPDATE users SET credits_remaining = credits_remaining + ? "
-                "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                refund, job_id,
-            )
+            # Refund to whichever pool was charged. jobs.organization_id was written at
+            # reserve time, so this stays correct even if the person has since left the
+            # org — the credits go back to the org that paid for them.
+            cur.execute("SELECT organization_id FROM jobs WHERE job_id = ?", job_id)
+            orow = cur.fetchone()
+            job_org_id = orow[0] if orow else None
+            if job_org_id:
+                cur.execute(
+                    "UPDATE organization_members SET credits_remaining = credits_remaining + ? "
+                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?) "
+                    "AND organization_id = ?",
+                    refund, job_id, job_org_id,
+                )
+            else:
+                cur.execute(
+                    "UPDATE users SET credits_remaining = credits_remaining + ? "
+                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
+                    refund, job_id,
+                )
         conn.commit()
         logging.info(
             f"job_id={job_id} -> failed (transitioned={transitioned}, "
