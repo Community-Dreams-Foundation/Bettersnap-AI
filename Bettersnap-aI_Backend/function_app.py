@@ -2928,3 +2928,89 @@ def list_org_members(req: func.HttpRequest) -> func.HttpResponse:
             "pending_invitations": pending,
         }),
         mimetype="application/json", status_code=200)
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — member's own org context
+#
+# Append to the END of function_app.py, right after the Teams block you already
+# added (create_invitations / accept_invitation / list_org_members).
+#
+# Needs at the top of function_app.py (already there from the org-credits work):
+#   from shared.org_credits import get_active_membership
+# ══════════════════════════════════════════════════════════════════════════
+ 
+ 
+# ── What org am I in? ─────────────────────────────────────
+@app.route(route="me/organization", methods=["GET"])
+def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
+    """The employee's own view: which org, how many credits left, admin or not.
+ 
+    WHY THIS EXISTS SEPARATELY FROM /orgs/{id}/members:
+    that endpoint is the ADMIN's roster and requires knowing the org id. An invited
+    employee knows neither — they just logged in. This resolves everything from the
+    token alone, so the member dashboard can load with no prior state.
+ 
+    Returns 200 with organization: null for an ordinary individual user rather than
+    404, so the frontend can call this unconditionally after login and branch on the
+    result instead of treating a normal user as an error case.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    # Same helper the generation path uses to decide which credit pool to charge, so
+    # the number shown here is by construction the number that will actually be spent.
+    membership = get_active_membership(cur, user_id)
+    if not membership:
+        return func.HttpResponse(
+            json.dumps({"organization": None}),
+            mimetype="application/json", status_code=200)
+ 
+    org_id, credits_remaining, membership_id = membership
+ 
+    cur.execute("""
+        SELECT o.name, o.admin_user_id, o.credits_per_seat,
+               m.credits_granted, m.joined_at
+        FROM organizations o
+        JOIN organization_members m ON m.organization_id = o.organization_id
+        WHERE o.organization_id = ? AND m.membership_id = ?
+    """, org_id, membership_id)
+    row = cur.fetchone()
+    if not row:
+        # get_active_membership just returned this row, so a miss here means the org
+        # was deleted mid-request. Treat as no org rather than 500.
+        return func.HttpResponse(
+            json.dumps({"organization": None}),
+            mimetype="application/json", status_code=200)
+ 
+    org_name, admin_user_id, credits_per_seat, credits_granted, joined_at = row
+ 
+    # lora_status drives the dashboard's next action: an employee who hasn't uploaded
+    # photos yet needs "upload photos", not "generate". Same field the individual
+    # onboarding flow keys off, so the member dashboard can reuse that logic.
+    cur.execute("SELECT lora_status FROM users WHERE user_id = ?", user_id)
+    urow = cur.fetchone()
+    lora_status = (urow[0] or "none").strip() if urow else "none"
+ 
+    return func.HttpResponse(
+        json.dumps({
+            "organization": {
+                "organization_id": str(org_id),
+                "name": org_name,
+                "is_admin": str(admin_user_id).lower() == str(user_id).lower(),
+            },
+            "membership": {
+                "membership_id": str(membership_id),
+                "credits_granted": credits_granted,
+                "credits_remaining": credits_remaining,
+                "credits_used": max(0, (credits_granted or 0) - (credits_remaining or 0)),
+                "joined_at": joined_at.isoformat() if joined_at else None,
+            },
+            "lora_status": lora_status,
+        }),
+        mimetype="application/json", status_code=200)
