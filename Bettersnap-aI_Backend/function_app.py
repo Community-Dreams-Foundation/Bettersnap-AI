@@ -67,6 +67,7 @@ from shared.stripe_client import (
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
 from shared.org_credits import effective_credits
+from shared.invite_email import send_invite_email
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -2595,7 +2596,7 @@ def _require_org_admin(cursor, user_id, org_id):
     request should not confirm the org exists.
     """
     cursor.execute(
-        "SELECT organization_id, seats_purchased, credits_per_seat, status "
+        "SELECT organization_id, seats_purchased, credits_per_seat, status, name "
         "FROM organizations WHERE organization_id = ? AND admin_user_id = ?",
         org_id, user_id,
     )
@@ -2702,16 +2703,22 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
                             "email": email,
                             "token": invite_token})
 
+        org_name = org[4]
         conn.commit()
     finally:
         conn.close()
 
-    # NOTE: sending the actual emails is not wired up here. bettersnap-acs
-    # (Communication Service) is already used elsewhere for completion emails — the
-    # invite email should go through the same path. Until then the caller gets the
-    # tokens back and the frontend/admin distributes the links.
+    # AFTER the commit, deliberately. Sending inside the transaction would hold a DB
+    # connection open across a network call to ACS, and a rollback after a successful
+    # send would leave someone holding a live link to an invite that no longer exists.
+    for inv in created:
+        inv["email_sent"] = send_invite_email(
+            inv["email"], org_name, inv["token"], credits_per_seat
+        )
+
+    sent = sum(1 for i in created if i["email_sent"])
     logging.info(f"invitations created: org={org_id} count={len(created)} "
-                 f"skipped={len(skipped)}")
+                 f"emailed={sent} skipped={len(skipped)}")
 
     return func.HttpResponse(
         json.dumps({"created": created, "skipped": skipped,
