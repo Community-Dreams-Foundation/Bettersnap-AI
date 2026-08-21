@@ -185,10 +185,18 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
-# Tables whose user_id FKs to users.user_id. A returning user's whole history/credits/
-# subscriptions hang off these, so an identity migration MUST move them too or it strands
-# the data (and leaves FK-orphan rows). Keep in sync with the schema (sys.foreign_keys).
+# Tables whose user_id has an ENFORCED FK to users.user_id (see sys.foreign_keys). These
+# always exist and MUST be repointed in an identity migration, or the closing DELETE FROM
+# users FK-blocks and the whole self-heal rolls back (the returning user 500s anyway).
 _USER_CHILD_TABLES = ("jobs", "lora_models", "credit_transactions", "subscriptions")
+
+# Additional user-scoped tables that carry a user_id but have NO enforced FK to users (so the
+# DELETE would not block on them) — yet a returning user's rows here still belong to them and
+# must follow the migration or they strand under the old id. pending_purchases in particular can
+# strand a paid-but-uncommitted purchase. These tables post-date the baseline, so repoint each
+# only IF it exists (OBJECT_ID guard) — a fresh/partial environment without them must not fail
+# the migration. Names are hardcoded constants, never user input, so the f-string is injection-safe.
+_USER_CHILD_TABLES_OPTIONAL = ("lora_trainings", "pending_purchases", "admin_user_notes")
 
 
 def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
@@ -223,6 +231,13 @@ def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
     """, new_oid, email, old_user_id)
     for tbl in _USER_CHILD_TABLES:
         cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE user_id = ?", new_oid, old_user_id)
+    # Optional user-scoped tables: repoint only if present, so an environment missing a newer
+    # table (e.g. pending_purchases/admin_user_notes) still migrates cleanly instead of erroring.
+    for tbl in _USER_CHILD_TABLES_OPTIONAL:
+        cursor.execute(
+            f"IF OBJECT_ID('dbo.{tbl}', 'U') IS NOT NULL "
+            f"UPDATE dbo.{tbl} SET user_id = ? WHERE user_id = ?",
+            new_oid, old_user_id)
     cursor.execute("DELETE FROM users WHERE user_id = ?", old_user_id)
     conn.commit()
 

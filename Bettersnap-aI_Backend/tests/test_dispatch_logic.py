@@ -1688,6 +1688,65 @@ class RegistrationTests(unittest.TestCase):
         )
 
 
+class IdentityMigrationTests(unittest.TestCase):
+    """Supabase->Entra self-heal (_migrate_identity) must repoint EVERY user-scoped table to the
+    new oid before deleting the old users row, or a returning user strands data (and, for an
+    FK-enforced table, the DELETE would FK-block and 500 the whole self-heal). This locks in:
+      1. all enforced-FK child tables are repointed unconditionally,
+      2. the newer, no-FK tables (lora_trainings/pending_purchases/admin_user_notes) are repointed
+         under an OBJECT_ID existence guard (so a partial env without them still migrates),
+      3. DELETE FROM users runs LAST (FK-safe order), and commit fires exactly once."""
+
+    class _Cursor:
+        def __init__(self):
+            self.executed = []   # list of (normalized_sql, params)
+
+        def execute(self, sql, *params):
+            self.executed.append((" ".join(sql.split()), params))
+
+    class _Conn:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    def _run(self):
+        conn, cur = self._Conn(), self._Cursor()
+        function_app._migrate_identity(conn, cur, "old-id-123", "new-oid-456", "e@x.com")
+        return conn, cur
+
+    def test_enforced_children_repointed_to_new_oid(self):
+        _, cur = self._run()
+        for tbl in function_app._USER_CHILD_TABLES:
+            hits = [(s, p) for s, p in cur.executed
+                    if f"update {tbl} set user_id" in s.lower()]
+            self.assertEqual(len(hits), 1, f"{tbl} must be repointed exactly once")
+            self.assertEqual(hits[0][1], ("new-oid-456", "old-id-123"))
+
+    def test_optional_children_repointed_under_existence_guard(self):
+        _, cur = self._run()
+        for tbl in function_app._USER_CHILD_TABLES_OPTIONAL:
+            hits = [(s, p) for s, p in cur.executed
+                    if f"update dbo.{tbl} set user_id" in s.lower()]
+            self.assertEqual(len(hits), 1, f"{tbl} must be repointed exactly once")
+            # Guarded so a missing table can't fail the migration.
+            self.assertIn(f"object_id('dbo.{tbl}', 'u') is not null", hits[0][0].lower())
+            self.assertEqual(hits[0][1], ("new-oid-456", "old-id-123"))
+
+    def test_delete_users_runs_after_all_repoints(self):
+        _, cur = self._run()
+        order = [s.lower() for s, _ in cur.executed]
+        del_idx = next(i for i, s in enumerate(order) if s.startswith("delete from users"))
+        last_update = max(i for i, s in enumerate(order) if "set user_id" in s)
+        self.assertGreater(del_idx, last_update,
+                           "DELETE FROM users must run after every child repoint (FK-safe)")
+
+    def test_commits_exactly_once(self):
+        conn, _ = self._run()
+        self.assertEqual(conn.commits, 1)
+
+
 class PublicCatalogPrivacyTests(unittest.TestCase):
     class Cursor:
         def __init__(self, rows):
