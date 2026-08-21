@@ -3,6 +3,7 @@ import os
 import hmac
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 # ── GPU cost ceilings (override via app settings) ─────────────────────────
@@ -62,9 +63,13 @@ from shared.plans import (
 from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
-    create_onetime_checkout, create_monthly_checkout,
+    create_onetime_checkout, create_monthly_checkout, create_org_checkout,
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
+
+# ── Teams / Organizations (one-time-purchase model) ───────────────────────
+ORG_CREDITS_PER_SEAT = int(os.environ.get("ORG_CREDITS_PER_SEAT", "10"))
+ORG_PRICE_PER_SEAT_CENTS = int(os.environ.get("ORG_PRICE_PER_SEAT_CENTS", "2000"))
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -155,6 +160,188 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=201
     )
+
+
+# ── Organizations: Create ──────────────────────────────────────────────
+@app.route(route="orgs", methods=["POST"])
+def create_organization(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        admin_user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    name = (body.get("name") or "").strip()
+    seats_purchased = body.get("seats_purchased")
+
+    if not name:
+        return func.HttpResponse(
+            json.dumps({"error": "name is required"}),
+            mimetype="application/json", status_code=400)
+    try:
+        seats_purchased = int(seats_purchased)
+        if seats_purchased < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return func.HttpResponse(
+            json.dumps({"error": "seats_purchased must be a positive integer"}),
+            mimetype="application/json", status_code=400)
+
+    organization_id = str(uuid.uuid4())
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO organizations
+                (organization_id, name, admin_user_id, seats_purchased, credits_per_seat, status)
+               VALUES (?, ?, ?, ?, ?, 'active')""",
+            organization_id, name, admin_user_id, seats_purchased, ORG_CREDITS_PER_SEAT,
+        )
+        cur.execute(
+            """INSERT INTO organization_members
+                (membership_id, organization_id, user_id, invitation_id,
+                 credits_granted, credits_remaining, status)
+               VALUES (?, ?, ?, NULL, ?, ?, 'active')""",
+            str(uuid.uuid4()), organization_id, admin_user_id,
+            ORG_CREDITS_PER_SEAT, ORG_CREDITS_PER_SEAT,
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"create_organization failed for admin={admin_user_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Could not create organization"}),
+            mimetype="application/json", status_code=500)
+    finally:
+        conn.close()
+
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": organization_id,
+            "name": name,
+            "seats_purchased": seats_purchased,
+            "credits_per_seat": ORG_CREDITS_PER_SEAT,
+            "status": "active",
+        }),
+        mimetype="application/json", status_code=201)
+
+
+# ── Organizations: Create Stripe payment (one-time, N seats) ────────────
+@app.route(route="orgs/{organization_id}/payment-intent", methods=["POST"])
+def create_org_payment_intent(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    organization_id = req.route_params.get("organization_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    success_url = body.get("success_url", "https://bettersnap.ai/orgs/success")
+    cancel_url = body.get("cancel_url", "https://bettersnap.ai/orgs/cancel")
+    email = (payload.get("email") or payload.get("preferred_username")
+             or payload.get("upn") or "")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT admin_user_id, seats_purchased, status FROM organizations WHERE organization_id = ?",
+        organization_id,
+    )
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("Organization not found", status_code=404)
+    admin_user_id, seats_purchased, status = row
+    if admin_user_id != user_id:
+        return func.HttpResponse("Forbidden", status_code=403)
+    if status != "active":
+        return func.HttpResponse(
+            json.dumps({"error": f"Organization is '{status}', not payable"}),
+            mimetype="application/json", status_code=409)
+
+    try:
+        session = create_org_checkout(
+            organization_id, email, seats_purchased,
+            ORG_PRICE_PER_SEAT_CENTS, success_url, cancel_url,
+        )
+    except Exception as e:
+        logging.error(f"Stripe org checkout failed for org={organization_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502)
+
+    return func.HttpResponse(
+        json.dumps({"checkout_url": session["url"], "session_id": session["id"]}),
+        mimetype="application/json", status_code=200)
+
+
+# ── Organizations: Dashboard summary ─────────────────────────────────────
+@app.route(route="orgs/{organization_id}/dashboard-summary", methods=["GET"])
+def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    organization_id = req.route_params.get("organization_id")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT admin_user_id, name, seats_purchased, status FROM organizations WHERE organization_id = ?",
+        organization_id,
+    )
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("Organization not found", status_code=404)
+    admin_user_id, name, seats_purchased, status = row
+    if admin_user_id != user_id:
+        return func.HttpResponse("Forbidden", status_code=403)
+
+    cur.execute(
+        "SELECT COUNT(*) FROM organization_members WHERE organization_id = ? AND status = 'active'",
+        organization_id,
+    )
+    members_joined = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COALESCE(SUM(credits_remaining), 0) FROM organization_members "
+        "WHERE organization_id = ? AND status = 'active'",
+        organization_id,
+    )
+    credits_remaining_total = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT status, COUNT(*) FROM jobs WHERE organization_id = ? GROUP BY status",
+        organization_id,
+    )
+    job_status_counts = {r[0]: r[1] for r in cur.fetchall()}
+
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": organization_id,
+            "name": name,
+            "status": status,
+            "seats_purchased": seats_purchased,
+            "members_joined": members_joined,
+            "credits_remaining_total": credits_remaining_total,
+            "job_status_counts": job_status_counts,
+        }),
+        mimetype="application/json", status_code=200)
+
 
 # ── User Profile (alias for /profiles/me — used by frontend) ─────────────
 @app.route(route="users/profile", methods=["GET"])
@@ -2268,6 +2455,8 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
             _handle_onetime_payment(session, event_id)
         elif payment_type == "monthly":
             _handle_monthly_checkout(session, event_id)
+        elif payment_type == "org_seats":
+            _handle_org_payment(session, event_id)
 
     elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         _handle_invoice_paid(event["data"]["object"], event_id)
@@ -2338,6 +2527,50 @@ def _handle_onetime_payment(session: dict, event_id: str):
         conn.close()
 
 
+def _handle_org_payment(session: dict, event_id: str):
+    organization_id = session.get("metadata", {}).get("organization_id")
+    amount_total = session.get("amount_total")
+    currency = session.get("currency", "usd")
+    payment_intent_id = session.get("payment_intent", "")
+
+    if not organization_id or amount_total is None:
+        logging.error(f"org_seats payment missing metadata: {session}")
+        return
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        if not _claim_event(cur, event_id):
+            conn.rollback()
+            logging.info(f"Stripe event {event_id} already processed; skipping org payment.")
+            return
+        cur.execute(
+            """INSERT INTO organization_payments
+                (payment_id, organization_id, stripe_payment_intent_id, stripe_event_id,
+                 amount_cents, currency, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'succeeded')""",
+            str(uuid.uuid4()), organization_id, payment_intent_id, event_id,
+            amount_total, currency,
+        )
+        cur.execute(
+            "UPDATE organizations SET status = 'active' WHERE organization_id = ?",
+            organization_id,
+        )
+        applied = cur.rowcount
+        if applied == 0:
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (org_seats): organization_id={organization_id} "
+                f"amount={amount_total} matched 0 organization rows. "
+                f"MANUAL RECONCILIATION REQUIRED."
+            )
+            return
+        conn.commit()
+        logging.info(f"Org seat payment recorded: org={organization_id} amount={amount_total}")
+    finally:
+        conn.close()
+
+        
 def _handle_monthly_checkout(session: dict, event_id: str):
     user_id  = session.get("metadata", {}).get("user_id")
     plan     = session.get("metadata", {}).get("plan")

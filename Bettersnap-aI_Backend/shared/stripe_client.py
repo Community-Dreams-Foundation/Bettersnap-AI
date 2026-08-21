@@ -113,6 +113,21 @@ def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: st
     }, email))
 
 
+def create_org_checkout(organization_id: str, admin_email: str, seats: int,
+                         price_per_seat_cents: int, success_url: str, cancel_url: str) -> dict:
+    return _post("checkout/sessions", _maybe_email({
+        "mode": "payment",
+        "line_items[0][price_data][currency]": "usd",
+        "line_items[0][price_data][product_data][name]": "BetterSnap Teams — seats",
+        "line_items[0][price_data][unit_amount]": str(price_per_seat_cents),
+        "line_items[0][quantity]": str(seats),
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata[organization_id]": organization_id,
+        "metadata[payment_type]": "org_seats",
+    }, admin_email))
+
+
 def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("monthly", plan)
     return _post("checkout/sessions", _maybe_email({
