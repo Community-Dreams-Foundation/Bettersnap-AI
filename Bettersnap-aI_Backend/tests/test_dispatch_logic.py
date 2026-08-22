@@ -729,7 +729,7 @@ class DailyCapTests(unittest.TestCase):
             "gender": "m", "age_range": "25-29", "hair_color": "black",
             "input_blob_path": "inputs/u/in.jpg",
             "attire_ids": ["business_suit.navy_suit_tie"],
-            "background_ids": ["business_suit.studio_gray"],
+            "background_ids": ["business_suit.light_gray_studio"],
         }
         return r
 
@@ -900,8 +900,8 @@ class IdentityLoraGateTests(unittest.TestCase):
         r.get_json = lambda: {
             "gender": "f", "age_range": "25-29", "hair_color": "black",
             "input_blob_path": "inputs/u/in.jpg",
-            "attire_ids": ["business_suit.navy_suit_tie"],
-            "background_ids": ["business_suit.studio_gray"],
+            "attire_ids": ["business_suit.navy_pantsuit"],
+            "background_ids": ["business_suit.light_gray_studio"],
         }
         return r
 

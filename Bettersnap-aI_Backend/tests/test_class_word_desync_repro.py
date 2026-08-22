@@ -49,7 +49,7 @@ def _positive_prompt(effective_gender):
         billable_count=1, credit_cost=0, candidate_budget=1, acceptance_threshold=0.0,
         retry_limit=0, gender=effective_gender,
         attire_refs=("business_suit.navy_suit_tie",),
-        background_refs=("business_suit.studio_gray",), custom_prompt="",
+        background_refs=("business_suit.light_gray_studio",), custom_prompt="",
     )
     return SdxlPromptEngine(ctx, cfg, log=lambda *a, **k: None).build(plan).prompts[0].positive
 

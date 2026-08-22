@@ -1159,8 +1159,11 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         if not attire_ids or not background_ids:
             return func.HttpResponse(
                 "Select at least one attire and one background", status_code=400)
-        # Every ref must exist in the catalog (drops typos / stale ids).
-        bad = ([a for a in attire_ids if not catalog.valid_attire_ref(a)] +
+        # Every ref must exist in the catalog (drops typos / stale ids). Attires are
+        # gender-specific, so an attire ref is valid only if it exists for THIS user's gender
+        # (a male ref submitted for a female user, or vice-versa, is rejected). Backgrounds
+        # are shared across genders.
+        bad = ([a for a in attire_ids if not catalog.valid_attire_ref(a, gender)] +
                [b for b in background_ids if not catalog.valid_background_ref(b)])
         if bad:
             return func.HttpResponse(
@@ -1654,6 +1657,86 @@ def get_catalog(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200,
     )
+
+
+# ── Catalog: gender-aware attire/background fetch (from the DB catalog_* tables) ──
+# After the UI picks a category (and knows the user's gender), it pulls the gender-
+# specific attire list and the background list from these DB-backed endpoints. Public
+# (no token) like GET /catalog. Prompt phrases are NOT exposed — they're internal to
+# generation; the client only needs ref + label + image.
+_CATALOG_KINDS = {"attires": "catalog_attires", "backgrounds": "catalog_backgrounds"}
+
+
+def _catalog_gender(g):
+    """Normalize to the attire-data gender key: male | female | other. None if invalid."""
+    g = (g or "").strip().lower()
+    if g in ("male", "man", "m"):
+        return "male"
+    if g in ("female", "woman", "f"):
+        return "female"
+    if g in ("other", "neutral", "nonbinary", "non-binary", "prefer not to say"):
+        return "other"
+    return None
+
+
+def _catalog_image(gender, kind, image_key):
+    """Root-relative image path served from the frontend's /public/catalog folder."""
+    return f"/catalog/{gender}/{kind}/{image_key}_{gender}.jpg" if image_key else None
+
+
+def _category_exists(cur, category):
+    cur.execute("SELECT 1 FROM dbo.catalog_categories WHERE category_key = ? AND is_active = 1", category)
+    return cur.fetchone() is not None
+
+
+@app.route(route="catalog/{category}/attires", methods=["GET"])
+def get_catalog_attires(req: func.HttpRequest) -> func.HttpResponse:
+    category = req.route_params.get("category")
+    gender = _catalog_gender(req.params.get("gender"))
+    if gender is None:
+        return func.HttpResponse(
+            json.dumps({"error": "gender query param is required: male | female | other"}),
+            mimetype="application/json", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    if not _category_exists(cur, category):
+        return func.HttpResponse(json.dumps({"error": "unknown category"}),
+                                 mimetype="application/json", status_code=404)
+    cur.execute(
+        "SELECT ref, label, image_key FROM dbo.catalog_attires "
+        "WHERE category_key = ? AND gender = ? AND is_active = 1 ORDER BY sort_order",
+        category, gender)
+    items = [{"ref": r[0], "id": r[0].split(".", 1)[1], "label": r[1], "gender": gender,
+              "image": _catalog_image(gender, "attires", r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"category": category, "gender": gender, "attires": items}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="catalog/{category}/backgrounds", methods=["GET"])
+def get_catalog_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
+    category = req.route_params.get("category")
+    # Backgrounds are shared across genders; gender only selects the rendered image variant.
+    gender = _catalog_gender(req.params.get("gender") or "other")
+    if gender is None:
+        return func.HttpResponse(
+            json.dumps({"error": "gender must be one of: male | female | other"}),
+            mimetype="application/json", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    if not _category_exists(cur, category):
+        return func.HttpResponse(json.dumps({"error": "unknown category"}),
+                                 mimetype="application/json", status_code=404)
+    cur.execute(
+        "SELECT ref, label, image_key FROM dbo.catalog_backgrounds "
+        "WHERE category_key = ? AND is_active = 1 ORDER BY sort_order",
+        category)
+    items = [{"ref": r[0], "id": r[0].split(".", 1)[1], "label": r[1],
+              "image": _catalog_image(gender, "backgrounds", r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"category": category, "gender": gender, "backgrounds": items}),
+        mimetype="application/json", status_code=200)
+
 
 # ── Plans (pricing + selection limits) ────────────────────
 # Served from shared/plans so the frontend renders prices/limits and enforces the
