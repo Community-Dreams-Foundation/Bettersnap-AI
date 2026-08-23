@@ -102,6 +102,7 @@ COPY rrdbnet.py .
 COPY stage_runtime.py .
 COPY prompt_control.py .
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
+COPY Bettersnap-aI_Backend/shared/catalog_data.py catalog_data.py
 COPY main.py .
 # Phase 2: torch-free domain contracts + runtime engines (the orchestrated pipeline).
 COPY domain/ /app/domain/
