@@ -96,11 +96,15 @@ class _Cur:
     def __init__(self, latest=None):
         self.latest = latest  # None | ("given",...) | ("revoked",...)
         self._fetch = None
-        self.inserts = []
+        self.consent_inserts = []
+        self.audit_inserts = []
     def execute(self, sql, *params):
         s = " ".join(sql.split()).lower()
         if "insert into dbo.biometric_consent" in s:
-            self.inserts.append(params)
+            self.consent_inserts.append(params)
+            self._fetch = None
+        elif "insert into dbo.audit_log" in s:
+            self.audit_inserts.append(params)
             self._fetch = None
         elif "select top 1 event, consent_version" in s:   # status
             self._fetch = self.latest
@@ -144,7 +148,7 @@ class ConsentEndpoints(unittest.TestCase):
         with _db(cur):
             resp = function_app.give_biometric_consent(_Req(body={"consent_version": "v1.0"}))
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(cur.inserts), 1)
+        self.assertEqual(len(cur.consent_inserts), 1)
         self.assertTrue(json.loads(resp.body)["consent_given"])
 
     def test_revoke_records_event(self):
@@ -152,7 +156,7 @@ class ConsentEndpoints(unittest.TestCase):
         with _db(cur):
             resp = function_app.revoke_biometric_consent(_Req(body={"reason": "user request"}))
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(cur.inserts), 1)
+        self.assertEqual(len(cur.consent_inserts), 1)
         self.assertFalse(json.loads(resp.body)["consent_given"])
 
     def test_status_none_when_no_record(self):
@@ -181,6 +185,31 @@ class UploadTrainGuard(unittest.TestCase):
         # Default off -> no consent check -> "No photo provided" (400), never 403.
         resp = self._run_upload(required=False, latest=None)
         self.assertEqual(resp.status_code, 400)
+
+
+class AuditEvent(unittest.TestCase):
+    """_write_event (audit_log, migration 029): inserts one row, best-effort, never raises."""
+
+    def test_writes_row(self):
+        cur = _Cur()
+        with _db(cur):
+            function_app._write_event("user-1", "photo.upload", target="blob-x", detail={"k": 1})
+        self.assertEqual(len(cur.audit_inserts), 1)
+        params = cur.audit_inserts[0]
+        self.assertEqual(params[0], "user-1")          # user_id
+        self.assertEqual(params[1], "photo.upload")    # event_type
+        self.assertEqual(params[2], "blob-x")          # target
+
+    def test_never_raises_on_db_failure(self):
+        with mock.patch.object(function_app, "get_db", side_effect=RuntimeError("db down")):
+            # must not propagate — audit failure is logged, never fatal to the request
+            function_app._write_event("user-1", "auth.login")
+
+    def test_truncates_long_event_type(self):
+        cur = _Cur()
+        with _db(cur):
+            function_app._write_event("u", "x" * 100)
+        self.assertLessEqual(len(cur.audit_inserts[0][1]), 48)
 
 
 if __name__ == "__main__":

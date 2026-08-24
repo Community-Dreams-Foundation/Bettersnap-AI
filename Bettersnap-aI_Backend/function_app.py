@@ -132,6 +132,21 @@ BIOMETRIC_CONSENT_REQUIRED = os.environ.get("BIOMETRIC_CONSENT_REQUIRED", "0").s
 BIOMETRIC_CONSENT_PURPOSE  = "Biometric processing for AI photo generation"
 
 
+def _write_event(user_id, event_type, target=None, detail=None, ip=None):
+    """SOC-2 comprehensive audit trail (migration 029 `audit_log`). Append one event; BEST-EFFORT —
+    opens its own autocommit connection and NEVER raises into the request path. Store only refs/ids
+    and non-sensitive context in `detail`; never PII or biometric content."""
+    try:
+        get_db().cursor().execute(
+            "INSERT INTO dbo.audit_log (user_id, event_type, target, detail, ip) VALUES (?,?,?,?,?)",
+            (str(user_id) if user_id else None), str(event_type)[:48],
+            (str(target)[:256] if target is not None else None),
+            (json.dumps(detail) if detail is not None else None),
+            (str(ip)[:64] if ip else None))
+    except Exception as e:
+        logging.warning(f"audit_log write failed event={event_type}: {e}")
+
+
 def _gpu_dispatch_enabled() -> bool:
     # Emergency kill switch (read per-call so it takes effect without a redeploy).
     # A budget action group or an operator flips GPU_DISPATCH_ENABLED=false to
@@ -281,6 +296,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
 
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", user_id)
     if cursor.fetchone():
+        _write_event(user_id, "auth.login")
         return func.HttpResponse(
             json.dumps({"message": "User already exists"}),
             mimetype="application/json",
@@ -300,6 +316,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
                 f"Entra oid={user_id} (returning user, auth id changed)."
             )
             _migrate_identity(conn, cursor, prior[0], user_id, email)
+            _write_event(user_id, "auth.identity_migrated", detail={"from_id": str(prior[0])})
             return func.HttpResponse(
                 json.dumps({"message": "User migrated to current identity"}),
                 mimetype="application/json",
@@ -325,6 +342,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
          REGISTRATION_CREDITS, DEFAULT_PLAN_KEY)
     conn.commit()
 
+    _write_event(user_id, "auth.register")
     return func.HttpResponse(
         json.dumps({"message": "User registered", "credits": REGISTRATION_CREDITS}),
         mimetype="application/json",
@@ -430,6 +448,7 @@ def delete_user_model(req: func.HttpRequest) -> func.HttpResponse:
         user_id,
     )
     logging.info(f"delete_user_model: user={user_id} deleted adapter_blobs={n_lora}")
+    _write_event(user_id, "model.delete", detail={"deleted_adapters": n_lora})
     return func.HttpResponse(
         json.dumps({"status": "reset", "lora_status": "none", "deleted_adapters": n_lora}),
         mimetype="application/json", status_code=200,
@@ -678,6 +697,7 @@ def give_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
         user_id, str(version)[:32], BIOMETRIC_CONSENT_PURPOSE,
         (str(body.get("policy_version"))[:32] if body.get("policy_version") else None))
     conn.commit()
+    _write_event(user_id, "consent.biometric_given", detail={"version": str(version)[:32]})
     return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
                              mimetype="application/json", status_code=200)
 
@@ -703,6 +723,7 @@ def revoke_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
         user_id, (r[0] if r else "unknown"), BIOMETRIC_CONSENT_PURPOSE,
         (str(body.get("reason"))[:512] if body.get("reason") else None))
     conn.commit()
+    _write_event(user_id, "consent.biometric_revoked")
     return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
                              mimetype="application/json", status_code=200)
 
@@ -783,6 +804,7 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     # Clients must submit this exact value as input_blob_path to /jobs/submit.
     input_blob_path = f"inputs/{blob_name}"
 
+    _write_event(user_id, "photo.upload", target=blob_name)
     return func.HttpResponse(
         json.dumps({"url": url, "blob_name": blob_name, "input_blob_path": input_blob_path}),
         mimetype="application/json",
@@ -3703,6 +3725,8 @@ def _handle_onetime_payment(session: dict, event_id: str):
         credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_ONE_TIME)
         conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
+        _write_event(user_id, "payment.one_time", target=event_id,
+                     detail={"plan": plan, "credits": credits})
     finally:
         conn.close()
 
@@ -3778,6 +3802,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
         credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
         conn.commit()  # claim + activation + ledger row commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+        _write_event(user_id, "payment.monthly", target=event_id,
+                     detail={"plan": plan, "credits": credits})
     finally:
         conn.close()
 
@@ -4775,6 +4801,9 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
         logging.info(
             f"retention_cleanup: user={user_id} deleted photos={n_photos} lora={n_lora} "
             f"results={n_results} jobs_expired={len(job_ids)}")
+        _write_event(user_id, "retention.delete",
+                     detail={"photos": n_photos, "lora": n_lora, "results": n_results,
+                             "jobs_expired": len(job_ids)})
 
 
 # ── Monthly credit renewal ───────────────────────────────
