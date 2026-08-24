@@ -125,6 +125,12 @@ TRAINING_STUCK_MINUTES = int(os.environ.get("TRAINING_STUCK_MINUTES", "90"))
 # on each generation (last-gen + N); monthly plans on subscription end (period-end + N).
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "3"))
 
+# BIPA/GDPR: block facial-data processing (upload/train) until server-side biometric consent
+# exists. DEFAULT OFF so this can deploy before the migration + frontend consent flow are live;
+# flip BIOMETRIC_CONSENT_REQUIRED=1 to enforce once those are in place (else uploads 403).
+BIOMETRIC_CONSENT_REQUIRED = os.environ.get("BIOMETRIC_CONSENT_REQUIRED", "0").strip() == "1"
+BIOMETRIC_CONSENT_PURPOSE  = "Biometric processing for AI photo generation"
+
 
 def _gpu_dispatch_enabled() -> bool:
     # Emergency kill switch (read per-call so it takes effect without a redeploy).
@@ -613,6 +619,94 @@ def accept_terms(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
     )
 
+# ── Biometric Consent (BIPA / GDPR) ───────────────────────
+# Append-only consent log (migration 028): each POST records a 'given' or 'revoked' EVENT; the
+# user's CURRENT consent is the latest event. Required server-side before any facial-data
+# processing (see the upload/train guard, gated by BIOMETRIC_CONSENT_REQUIRED). The row history
+# is the audit trail (version, purpose, policy version, timestamp, revocation reason).
+def _biometric_consent_active(cursor, user_id) -> bool:
+    """True iff the user's most-recent biometric-consent event is 'given'."""
+    cursor.execute(
+        "SELECT TOP 1 event FROM dbo.biometric_consent WHERE user_id = ? "
+        "ORDER BY created_at DESC, consent_id DESC", user_id)
+    row = cursor.fetchone()
+    return bool(row) and row[0] == "given"
+
+
+def _biometric_consent_status(cursor, user_id) -> dict:
+    cursor.execute(
+        "SELECT TOP 1 event, consent_version, consent_purpose, policy_version, created_at "
+        "FROM dbo.biometric_consent WHERE user_id = ? ORDER BY created_at DESC, consent_id DESC", user_id)
+    row = cursor.fetchone()
+    if not row:
+        return {"consent_given": False, "event": None}
+    return {"consent_given": row[0] == "given", "event": row[0], "consent_version": row[1],
+            "consent_purpose": row[2], "policy_version": row[3], "updated_at": _utc_iso(row[4])}
+
+
+@app.route(route="users/biometric-consent", methods=["GET"])
+def biometric_consent_status(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    cursor = get_db().cursor()
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="users/biometric-consent", methods=["POST"])
+def give_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    try:
+        body = req.get_json() or {}
+    except ValueError:
+        body = {}
+    version = body.get("consent_version")
+    if not version:
+        return func.HttpResponse(json.dumps({"error": "consent_version is required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO dbo.biometric_consent (user_id, event, consent_version, consent_purpose, policy_version) "
+        "VALUES (?, 'given', ?, ?, ?)",
+        user_id, str(version)[:32], BIOMETRIC_CONSENT_PURPOSE,
+        (str(body.get("policy_version"))[:32] if body.get("policy_version") else None))
+    conn.commit()
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="users/biometric-consent/revoke", methods=["POST"])
+def revoke_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    try:
+        body = req.get_json() or {}
+    except ValueError:
+        body = {}
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT TOP 1 consent_version FROM dbo.biometric_consent WHERE user_id = ? "
+                   "ORDER BY created_at DESC, consent_id DESC", user_id)
+    r = cursor.fetchone()
+    cursor.execute(
+        "INSERT INTO dbo.biometric_consent (user_id, event, consent_version, consent_purpose, reason) "
+        "VALUES (?, 'revoked', ?, ?, ?)",
+        user_id, (r[0] if r else "unknown"), BIOMETRIC_CONSENT_PURPOSE,
+        (str(body.get("reason"))[:512] if body.get("reason") else None))
+    conn.commit()
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
 # ── Upload Photo ──────────────────────────────────────────
 @app.route(route="upload", methods=["POST"])
 def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
@@ -621,6 +715,14 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
         user_id = get_user_id(token)
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
+
+    # BIPA/GDPR guard: no facial-data upload without active server-side biometric consent.
+    # Env-gated (default off) so it can't break uploads before the consent flow + migration are live.
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "biometric_consent_required",
+                        "message": "Explicit biometric consent is required before uploading photos."}),
+            mimetype="application/json", status_code=403)
 
     file = req.files.get("photo")
     if not file:
@@ -760,6 +862,14 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
         user_id = get_user_id(token)
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
+
+    # BIPA/GDPR guard: training turns facial data into a persisted per-user model — require
+    # active server-side biometric consent (env-gated, default off).
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "biometric_consent_required",
+                        "message": "Explicit biometric consent is required before training."}),
+            mimetype="application/json", status_code=403)
 
     from shared.crops import (crop_head_and_shoulders, NoFaceError,
                               MultipleFacesError, FaceTooSmallError,
