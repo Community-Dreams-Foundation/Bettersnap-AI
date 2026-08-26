@@ -67,7 +67,7 @@ from shared.stripe_client import (
     create_onetime_checkout, create_monthly_checkout, create_org_checkout,
     cancel_subscription, reactivate_subscription, verify_webhook,
 )
-from shared.org_credits import effective_credits
+from shared.org_credits import effective_credits, get_active_membership
 from shared.invite_email import send_invite_email
 
 # ── Teams / Organizations (one-time-purchase model) ───────────────────────
