@@ -201,19 +201,32 @@ def create_organization(req: func.HttpRequest) -> func.HttpResponse:
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # LOCKED BY DEFAULT: status starts 'pending_payment', not 'active'. This is
+        # the actual payment gate — every other Teams endpoint either checks this
+        # status directly (payment-intent) or goes through _require_org_admin, which
+        # already rejects anything not 'active' with 403 ORG_NOT_ACTIVE. That check
+        # existed before but was never actually reachable, because this row used to
+        # be inserted as 'active' immediately — nothing ever had a reason to be
+        # rejected. Flipping the starting status is what actually turns the gate on.
         cur.execute(
             """INSERT INTO organizations
                 (organization_id, name, admin_user_id, seats_purchased, credits_per_seat, status)
-               VALUES (?, ?, ?, ?, ?, 'active')""",
+               VALUES (?, ?, ?, ?, ?, 'pending_payment')""",
             organization_id, name, admin_user_id, seats_purchased, ORG_CREDITS_PER_SEAT,
         )
+        # The admin's membership row is still created now, not deferred to the
+        # webhook — but with ZERO credits. This keeps GET /me/organization working
+        # immediately (the admin's own dashboard needs to find *something* to show a
+        # "complete payment" screen against), while reserve_job_slot's existing
+        # insufficient-credits check already blocks any real generation attempt,
+        # with no new logic needed there. The webhook below is what raises these
+        # from 0 to the real amount once payment actually succeeds.
         cur.execute(
             """INSERT INTO organization_members
                 (membership_id, organization_id, user_id, invitation_id,
                  credits_granted, credits_remaining, status)
-               VALUES (?, ?, ?, NULL, ?, ?, 'active')""",
+               VALUES (?, ?, ?, NULL, 0, 0, 'active')""",
             str(uuid.uuid4()), organization_id, admin_user_id,
-            ORG_CREDITS_PER_SEAT, ORG_CREDITS_PER_SEAT,
         )
         conn.commit()
     except Exception as e:
@@ -231,7 +244,7 @@ def create_organization(req: func.HttpRequest) -> func.HttpResponse:
             "name": name,
             "seats_purchased": seats_purchased,
             "credits_per_seat": ORG_CREDITS_PER_SEAT,
-            "status": "active",
+            "status": "pending_payment",
         }),
         mimetype="application/json", status_code=201)
 
@@ -266,9 +279,12 @@ def create_org_payment_intent(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("Organization not found", status_code=404)
     admin_user_id, seats_purchased, status = row
-    if str(admin_user_id).lower() != str(user_id).lower():
+    if admin_user_id != user_id:
         return func.HttpResponse("Forbidden", status_code=403)
-    if status != "active":
+    # Payable exactly once, while locked. Already-active means it was paid
+    # already (or, before this fix, was active from the moment of creation and
+    # this check never actually did anything) — either way, re-paying isn't valid.
+    if status != "pending_payment":
         return func.HttpResponse(
             json.dumps({"error": f"Organization is '{status}', not payable"}),
             mimetype="application/json", status_code=409)
@@ -311,7 +327,7 @@ def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("Organization not found", status_code=404)
     admin_user_id, name, seats_purchased, status = row
-    if str(admin_user_id).lower() != str(user_id).lower():
+    if admin_user_id != user_id:
         return func.HttpResponse("Forbidden", status_code=403)
 
     cur.execute(
@@ -2568,21 +2584,62 @@ def _handle_org_payment(session: dict, event_id: str):
             str(uuid.uuid4()), organization_id, payment_intent_id, event_id,
             amount_total, currency,
         )
+
+        # THE ACTUAL UNLOCK: read who the admin is and what they're entitled to
+        # BEFORE flipping status, so both the status change and the credit grant
+        # land together in one transaction — no window where one succeeded and the
+        # other didn't.
+        cur.execute(
+            "SELECT admin_user_id, credits_per_seat FROM organizations "
+            "WHERE organization_id = ? AND status = 'pending_payment'",
+            organization_id,
+        )
+        org_row = cur.fetchone()
+        if not org_row:
+            # Either the org doesn't exist, or status isn't 'pending_payment' anymore
+            # (already paid — a duplicate webhook that slipped past _claim_event some
+            # other way, or a genuine data problem). Don't grant credits twice.
+            conn.rollback()
+            logging.error(
+                f"PAYMENT NOT APPLIED (org_seats): organization_id={organization_id} "
+                f"amount={amount_total} — org not found or not in 'pending_payment' state. "
+                f"MANUAL RECONCILIATION REQUIRED."
+            )
+            return
+        admin_user_id, credits_per_seat = org_row
+
         cur.execute(
             "UPDATE organizations SET status = 'active' WHERE organization_id = ?",
             organization_id,
         )
-        applied = cur.rowcount
-        if applied == 0:
+
+        # Raise the admin's own membership from the 0/0 it was created with up to
+        # the real grant. This is the row that already existed from create_organization
+        # — locked at 0 credits — not a new insert.
+        cur.execute(
+            """UPDATE organization_members
+               SET credits_granted = ?, credits_remaining = ?
+               WHERE organization_id = ? AND user_id = ?""",
+            credits_per_seat, credits_per_seat, organization_id, admin_user_id,
+        )
+        if cur.rowcount == 0:
+            # The admin's own membership row is supposed to always exist (created
+            # alongside the org). If it's missing, something upstream is broken —
+            # surface it loudly rather than silently activating an org with an
+            # admin who still has no usable credits.
             conn.rollback()
             logging.error(
                 f"PAYMENT NOT APPLIED (org_seats): organization_id={organization_id} "
-                f"amount={amount_total} matched 0 organization rows. "
+                f"admin={admin_user_id} — admin membership row missing, credits not granted. "
                 f"MANUAL RECONCILIATION REQUIRED."
             )
             return
+
         conn.commit()
-        logging.info(f"Org seat payment recorded: org={organization_id} amount={amount_total}")
+        logging.info(
+            f"Org seat payment recorded and unlocked: org={organization_id} "
+            f"amount={amount_total} admin_credits={credits_per_seat}"
+        )
     finally:
         conn.close()
 
