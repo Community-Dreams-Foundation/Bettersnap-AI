@@ -180,6 +180,12 @@ class FakeCursor:
         if "sp_getapplock" in s:
             self._fetch = (self.cfg.get("applock_rc", 0),)
 
+        # ── webhook idempotency claim (_claim_event) — rowcount=1 means "claimed
+        #    it, proceed"; every _handle_org_payment test needs this to succeed
+        #    by default, same as a real first-time webhook delivery would. ──
+        elif "insert into processed_stripe_events" in s:
+            self.rowcount = self.cfg.get("claim_event_rowcount", 1)
+
         # ── org membership lookup (shared/org_credits.get_active_membership) ──
         elif "from organization_members m" in s and "join organizations o" in s:
             self._fetch = self.cfg.get("membership_row")  # None or (org_id, credits, membership_id)
@@ -219,6 +225,18 @@ class FakeCursor:
             pass  # no return value read by the caller
         elif "insert into organization_members" in s and "output inserted.membership_id" not in s:
             pass  # create_organization's admin-membership insert (no OUTPUT clause)
+
+        # ── create_org_payment_intent's own org lookup ──
+        elif "select admin_user_id, seats_purchased, status from organizations" in s:
+            self._fetch = self.cfg.get("payment_intent_org_row")  # (admin_user_id, seats_purchased, status) or None
+
+        # ── _handle_org_payment: look up who to credit, only if still locked ──
+        elif "select admin_user_id, credits_per_seat from organizations" in s and "pending_payment" in s:
+            self._fetch = self.cfg.get("webhook_org_row")  # (admin_user_id, credits_per_seat) or None
+
+        # ── _handle_org_payment: the actual unlock — raise admin credits from 0 ──
+        elif "update organization_members" in s and "set credits_granted = ?, credits_remaining = ?" in s:
+            self.rowcount = self.cfg.get("webhook_membership_rowcount", 1)
 
         # ── _require_org_admin ──
         elif "from organizations where organization_id = ? and admin_user_id" in s:
@@ -404,7 +422,12 @@ class ReserveJobSlotOrgTests(unittest.TestCase):
 # POST /orgs — create_organization
 # ═══════════════════════════════════════════════════════════════════════════
 class CreateOrganizationTests(unittest.TestCase):
-    def test_creates_org_and_admin_membership_in_one_transaction(self):
+    def test_creates_org_locked_with_admin_membership_at_zero_credits(self):
+        """PAYMENT GATING: the org must start unusable, not active. This is the
+        actual gate — every other check (payment-intent, _require_org_admin)
+        just reads this status/these credits; if creation ever goes back to
+        granting real credits immediately, the whole gate silently stops
+        mattering again, exactly like it did before this fix."""
         cfg = {}
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as("admin-1")
@@ -418,11 +441,16 @@ class CreateOrganizationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 201)
         self.assertTrue(conn.committed)
         self.assertFalse(conn.rolled_back)
+        self.assertEqual(json.loads(resp.body)["status"], "pending_payment")
 
-        executed_sql = [sql.lower() for sql, _ in cfg["executed"]]
-        self.assertTrue(any("insert into organizations" in s for s in executed_sql))
-        self.assertTrue(any("insert into organization_members" in s for s in executed_sql),
-                         "admin must get their own membership row immediately")
+        org_insert_sql = next(sql for sql, _ in cfg["executed"] if "insert into organizations" in sql.lower())
+        self.assertIn("pending_payment", org_insert_sql.lower(), "org must not start active")
+
+        member_insert = next(
+            p for sql, p in cfg["executed"] if "insert into organization_members" in sql.lower())
+        # (membership_id, organization_id, user_id) then hardcoded 0, 0 in the SQL
+        # text itself, not bound params — so the params tuple is just the three IDs.
+        self.assertEqual(len(member_insert), 3, "credits are hardcoded 0 in the SQL, not bound")
 
     def test_missing_name_returns_400_before_touching_the_db(self):
         cfg = {}
@@ -453,6 +481,113 @@ class CreateOrganizationTests(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # POST /orgs/{org_id}/invitations — create_invitations
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Payment gating — an org must be worthless until Stripe confirms payment
+# ═══════════════════════════════════════════════════════════════════════════
+class PaymentGatingTests(unittest.TestCase):
+    def test_payment_intent_blocked_once_already_active(self):
+        cfg = {"payment_intent_org_row": ("admin-1", 10, "active")}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            req = FakeRequest(route_params={"organization_id": "org-1"})
+            resp = function_app.create_org_payment_intent(req)
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+        self.assertEqual(resp.status_code, 409)
+
+    def test_payment_intent_allowed_while_locked(self):
+        cfg = {"payment_intent_org_row": ("admin-1", 10, "pending_payment")}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        checkout_patch = mock.patch.object(
+            function_app, "create_org_checkout",
+            return_value={"url": "https://stripe.test/checkout", "id": "cs_test_1"})
+        checkout_patch.start()
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            req = FakeRequest(route_params={"organization_id": "org-1"})
+            resp = function_app.create_org_payment_intent(req)
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); checkout_patch.stop()
+        self.assertEqual(resp.status_code, 200)
+
+    def test_invitations_blocked_while_org_still_pending_payment(self):
+        """This exercises the SAME gate _require_org_admin already had before this
+        fix — it just could never actually fire, because every org was created
+        'active' already. Nothing new here except that it's finally reachable."""
+        cfg = {"org_admin_row": ("org-1", 10, 10, "pending_payment", "Acme")}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        email_patch = mock.patch.object(function_app, "send_invite_email", return_value=True)
+        email_patch.start()
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            req = FakeRequest(body={"emails": ["a@acme.com"]}, route_params={"org_id": "org-1"})
+            resp = function_app.create_invitations(req)
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); email_patch.stop()
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(json.loads(resp.body)["error"], "ORG_NOT_ACTIVE")
+
+    def test_webhook_unlocks_org_and_raises_admin_credits_from_zero(self):
+        cfg = {"webhook_org_row": ("admin-1", 10), "webhook_membership_rowcount": 1}
+        conn, p1, p2 = _patched(cfg)
+        p1.start(); p2.start()
+        try:
+            function_app._handle_org_payment(
+                {"metadata": {"organization_id": "org-1"}, "amount_total": 20000,
+                 "currency": "usd", "payment_intent": "pi_1"},
+                "evt_unlock_1",
+            )
+        finally:
+            p1.stop(); p2.stop()
+        self.assertTrue(conn.committed)
+        self.assertFalse(conn.rolled_back)
+
+        executed_sql = [sql.lower() for sql, _ in cfg["executed"]]
+        self.assertTrue(any("update organizations set status = 'active'" in s for s in executed_sql))
+
+        grant_call = next(
+            p for sql, p in cfg["executed"] if "set credits_granted = ?, credits_remaining = ?" in sql.lower())
+        self.assertEqual(grant_call, (10, 10, "org-1", "admin-1"),
+                          "must raise the admin's own row from 0 to the real per-seat grant")
+
+    def test_webhook_no_op_if_org_already_active(self):
+        """A duplicate/replayed event landing after the org is already unlocked
+        must not re-grant credits — same reasoning as the individual-user
+        payment path's own duplicate protection."""
+        cfg = {"webhook_org_row": None}  # query filters WHERE status='pending_payment' — no match
+        conn, p1, p2 = _patched(cfg)
+        p1.start(); p2.start()
+        try:
+            function_app._handle_org_payment(
+                {"metadata": {"organization_id": "org-1"}, "amount_total": 20000,
+                 "currency": "usd", "payment_intent": "pi_1"},
+                "evt_dup_1",
+            )
+        finally:
+            p1.stop(); p2.stop()
+        self.assertTrue(conn.rolled_back)
+        self.assertFalse(conn.committed)
+
+    def test_webhook_missing_admin_membership_row_rolls_back_loudly(self):
+        cfg = {"webhook_org_row": ("admin-1", 10), "webhook_membership_rowcount": 0}
+        conn, p1, p2 = _patched(cfg)
+        p1.start(); p2.start()
+        try:
+            function_app._handle_org_payment(
+                {"metadata": {"organization_id": "org-1"}, "amount_total": 20000,
+                 "currency": "usd", "payment_intent": "pi_1"},
+                "evt_missing_1",
+            )
+        finally:
+            p1.stop(); p2.stop()
+        self.assertTrue(conn.rolled_back)
+        self.assertFalse(conn.committed)
+
+
 class CreateInvitationsTests(unittest.TestCase):
     def setUp(self):
         self._email_patch = mock.patch.object(
