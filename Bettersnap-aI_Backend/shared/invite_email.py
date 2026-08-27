@@ -44,10 +44,19 @@ def send_invite_email(to_email: str, org_name: str, token: str, credits: int) ->
         invite_url = build_invite_url(token)
         org = org_name or "your team"
 
+        # Configurable, not hardcoded — the sender address is tied to whichever
+        # domain is actually connected in Azure Communication Services, and
+        # that can change (moving from a free Azure subdomain to a real
+        # bettersnap.ai domain later) without needing a code change/redeploy.
+        sender_address = os.environ.get(
+            "INVITE_SENDER_ADDRESS",
+            "DoNotReply@75369587-cacf-491b-b5ab-ba6f0a34c870.azurecomm.net",
+        )
+
         acs_conn_str = get_secret("acs-connection-string")
         client = EmailClient.from_connection_string(acs_conn_str)
         client.begin_send({
-            "senderAddress": "noreply@bettersnap.ai",
+            "senderAddress": sender_address,
             "recipients": {"to": [{"address": to_email}]},
             "content": {
                 "subject": f"{org} invited you to BetterSnap AI",
