@@ -3394,15 +3394,23 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("OK", status_code=200)
 
     try:
-        if event_type == "checkout.session.completed":
+        if event_type in (
+            "checkout.session.completed",
+            "checkout.session.async_payment_succeeded",
+        ):
+            _fulfill_paid_checkout(event["data"]["object"], event_id)
+
+        elif event_type == "checkout.session.async_payment_failed":
             session = event["data"]["object"]
-            payment_type = session.get("metadata", {}).get("payment_type")
-            if payment_type == "one_time":
-                _handle_onetime_payment(session, event_id)
-            elif payment_type == "monthly":
-                _handle_monthly_checkout(session, event_id)
-            elif payment_type == "topup":
-                _handle_topup(session, event_id)
+            metadata = session.get("metadata", {})
+            if metadata.get("payment_type") == "monthly":
+                user_id = metadata.get("user_id")
+                checkout_token = metadata.get("checkout_token")
+                if user_id and checkout_token:
+                    _release_monthly_checkout(user_id, checkout_token)
+            logging.warning(
+                f"Stripe Checkout payment failed asynchronously: session={session.get('id')}"
+            )
 
         elif event_type == "checkout.session.expired":
             # Release a monthly-checkout reservation whose Stripe session expired unpaid.
@@ -3442,12 +3450,38 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse("OK", status_code=200)
 
 
+def _fulfill_paid_checkout(session: dict, event_id: str):
+    """Grant a Checkout purchase only after Stripe confirms that it is paid."""
+    payment_status = session.get("payment_status")
+    if payment_status != "paid":
+        logging.info(
+            f"Stripe Checkout not fulfilled: session={session.get('id')} "
+            f"payment_status={payment_status} event={event_id}"
+        )
+        return
+
+    session_id = session.get("id")
+    if not session_id:
+        logging.error(
+            f"Paid Stripe Checkout has no session id; refusing fulfillment: event={event_id}"
+        )
+        return
+
+    claim_id = f"checkout_session:{session_id}"
+    payment_type = session.get("metadata", {}).get("payment_type")
+    if payment_type == "one_time":
+        _handle_onetime_payment(session, claim_id)
+    elif payment_type == "monthly":
+        _handle_monthly_checkout(session, claim_id)
+    elif payment_type == "topup":
+        _handle_topup(session, claim_id)
+
+
 def _claim_event(cur, event_id: str) -> bool:
-    """Idempotency guard for Stripe webhooks. Records event_id and returns True if THIS call
-    claimed it (proceed with the grant), False if it was already processed (skip). Runs on
-    the CALLER's cursor so the claim commits in the SAME transaction as the grant — if the
-    grant rolls back, the claim rolls back too and a genuine Stripe retry can reprocess. The
-    event_id PRIMARY KEY (migration 010) is the concurrency backstop."""
+    """Idempotency guard for Stripe mutations. Checkout grants use a session-scoped key so
+    completed and async-payment events cannot both grant; other handlers use the event id.
+    The claim commits in the same transaction as the mutation, and therefore rolls back with
+    it when Stripe needs to retry. The migration 010 primary key is the concurrency backstop."""
     cur.execute(
         "INSERT INTO processed_stripe_events (event_id) "
         "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM processed_stripe_events WHERE event_id = ?)",

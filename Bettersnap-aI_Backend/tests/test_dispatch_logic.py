@@ -1728,6 +1728,95 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         release.assert_called_once_with("user-1", "expired-token")
 
+    def test_unpaid_completed_checkout_does_not_grant(self):
+        session = {
+            "id": "cs_unpaid",
+            "payment_status": "unpaid",
+            "metadata": {"payment_type": "one_time"},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_unpaid",
+            "type": "checkout.session.completed",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_handle_onetime_payment") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_not_called()
+
+    def test_paid_checkout_routes_all_purchase_types_with_session_claim(self):
+        handlers = {
+            "one_time": "_handle_onetime_payment",
+            "monthly": "_handle_monthly_checkout",
+            "topup": "_handle_topup",
+        }
+        for payment_type, handler_name in handlers.items():
+            with self.subTest(payment_type=payment_type):
+                session = {
+                    "id": f"cs_{payment_type}",
+                    "payment_status": "paid",
+                    "metadata": {"payment_type": payment_type},
+                }
+                with mock.patch.object(function_app, "verify_webhook", return_value={
+                    "id": f"evt_{payment_type}",
+                    "type": "checkout.session.completed",
+                    "data": {"object": session},
+                }), mock.patch.object(function_app, handler_name) as grant:
+                    request = self._req()
+                    request.headers = {"Stripe-Signature": "sig"}
+                    request.get_body = lambda: b"{}"
+                    response = function_app.stripe_webhook(request)
+
+                self.assertEqual(response.status_code, 200)
+                grant.assert_called_once_with(
+                    session, f"checkout_session:cs_{payment_type}"
+                )
+
+    def test_async_payment_success_fulfills_paid_checkout(self):
+        session = {
+            "id": "cs_delayed",
+            "payment_status": "paid",
+            "metadata": {"payment_type": "one_time"},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_async_paid",
+            "type": "checkout.session.async_payment_succeeded",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_handle_onetime_payment") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_called_once_with(session, "checkout_session:cs_delayed")
+
+    def test_async_monthly_payment_failure_releases_reservation(self):
+        session = {
+            "id": "cs_failed",
+            "payment_status": "unpaid",
+            "metadata": {
+                "payment_type": "monthly",
+                "user_id": "user-1",
+                "checkout_token": "checkout-token",
+            },
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_async_failed",
+            "type": "checkout.session.async_payment_failed",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_release_monthly_checkout") as release:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        release.assert_called_once_with("user-1", "checkout-token")
+
     def test_invoice_payment_succeeded_does_not_grant_renewal_credits(self):
         with mock.patch.object(function_app, "verify_webhook", return_value={
             "id": "evt_payment_succeeded",
@@ -1951,7 +2040,11 @@ class StripePaidGrantTests(unittest.TestCase):
         event = {
             "id": "evt_paid_unregistered",
             "type": "checkout.session.completed",
-            "data": {"object": {"metadata": {"payment_type": "one_time"}}},
+            "data": {"object": {
+                "id": "cs_paid_unregistered",
+                "payment_status": "paid",
+                "metadata": {"payment_type": "one_time"},
+            }},
         }
         with mock.patch.object(function_app, "verify_webhook", return_value=event), \
              mock.patch.object(
