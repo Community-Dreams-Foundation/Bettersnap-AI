@@ -1,4 +1,4 @@
--- 027_admin_audit_log.sql — immutable audit trail for super-admin mutations.
+-- 030_admin_audit_log.sql — immutable audit trail for super-admin mutations.
 -- Every admin action that changes state (credit adjust, suspend, refund, job retry, ...) appends
 -- one row here via _write_audit(). Idempotent.
 IF OBJECT_ID('dbo.admin_audit_log','U') IS NULL

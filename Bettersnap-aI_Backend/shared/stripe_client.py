@@ -209,6 +209,27 @@ def get_subscription(stripe_subscription_id: str) -> dict:
     return _get(f"subscriptions/{stripe_subscription_id}")
 
 
+def upgrade_subscription(
+    stripe_subscription_id: str,
+    subscription_item_id: str,
+    plan: str,
+) -> dict:
+    """Upgrade an existing monthly subscription and invoice the prorated difference now."""
+    price_id = _price_id("monthly", plan)
+    return _post(
+        f"subscriptions/{stripe_subscription_id}",
+        {
+            "items[0][id]": subscription_item_id,
+            "items[0][price]": price_id,
+            "proration_behavior": "always_invoice",
+            "payment_behavior": "pending_if_incomplete",
+        },
+        idempotency_key=(
+            f"monthly-upgrade-{stripe_subscription_id}-{plan}-{int(time.time() // 300)}"
+        ),
+    )
+
+
 def find_checkout_session_by_token(checkout_token: str) -> dict | None:
     """Find a recent Checkout Session by the reservation token stored in its metadata."""
     sessions = _get("checkout/sessions?limit=100").get("data", [])
@@ -228,12 +249,25 @@ def reactivate_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
-def create_billing_portal(stripe_customer_id: str, return_url: str) -> dict:
-    """Create a Stripe-hosted session where the customer can update payment details."""
-    return _post("billing_portal/sessions", {
+def create_billing_portal(
+    stripe_customer_id: str,
+    return_url: str,
+    mode: str = "payment_method_update",
+) -> dict:
+    """Create either a targeted card-update flow or the full Stripe billing portal."""
+    data = {
         "customer": stripe_customer_id,
         "return_url": return_url,
-    })
+    }
+    if mode == "payment_method_update":
+        data.update({
+            "flow_data[type]": "payment_method_update",
+            "flow_data[after_completion][type]": "redirect",
+            "flow_data[after_completion][redirect][return_url]": return_url,
+        })
+    elif mode != "manage":
+        raise ValueError("unsupported billing portal mode")
+    return _post("billing_portal/sessions", data)
 
 def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
     # env override first (features-stripe), then Key Vault (dev) — either source works.

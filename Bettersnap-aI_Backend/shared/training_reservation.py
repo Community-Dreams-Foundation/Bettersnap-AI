@@ -9,7 +9,8 @@ from . import credit_ledger
 
 class TrainingReserveResult:
     def __init__(self, ok, training_id=None, reason=None, outbox_id=None,
-                 message=None, retrain=False, credits_charged=0):
+                 message=None, retrain=False, credits_charged=0,
+                 monthly_credits_charged=0, one_time_credits_charged=0):
         self.ok = ok
         self.training_id = training_id
         self.reason = reason
@@ -17,6 +18,8 @@ class TrainingReserveResult:
         self.message = message
         self.retrain = retrain
         self.credits_charged = credits_charged
+        self.monthly_credits_charged = monthly_credits_charged
+        self.one_time_credits_charged = one_time_credits_charged
 
 
 def reserve_training_slot(user_id, files, class_word, force, free_retrains,
@@ -49,6 +52,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
         status = (row[0] or "none").strip()
         legacy = int(row[1] or 0)
         retrain_count = int(row[2] or 0)
+        # Keep this order in lockstep with the SELECT above. Stripe's split-bucket
+        # model debits monthly credits first for monthly plans, then one-time overflow.
         one_time_bal = int(row[4] or 0)
         monthly_bal = int(row[5] or 0)
         # Spendable balance = the buckets (what generation debits), NOT the legacy column: a
@@ -66,7 +71,15 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
 
         is_retrain = status in ("ready", "failed") and force
         charge = retrain_credits if is_retrain and retrain_count >= free_retrains else 0
-        if effective < charge:
+        source_type = get_plan(row[3]).plan_type
+        monthly_charge = 0
+        one_time_charge = 0
+        if source_type == "monthly":
+            monthly_charge = min(monthly_bal, charge)
+            one_time_charge = charge - monthly_charge
+        elif source_type == "one_time":
+            one_time_charge = charge
+        if effective < charge or monthly_charge > monthly_bal or one_time_charge > one_time_bal:
             conn.rollback()
             return TrainingReserveResult(False, reason="credits")
 
@@ -80,12 +93,13 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
             return TrainingReserveResult(False, reason="daily_cap")
 
         files_json = json.dumps(files)
-        source_type = get_plan(row[3]).plan_type
         cur.execute(
             "INSERT INTO lora_trainings "
-            "(user_id, status, photo_count, class_word, files_json, source_type) "
-            "OUTPUT INSERTED.training_id VALUES (?, 'queued', ?, ?, ?, ?)",
+            "(user_id, status, photo_count, class_word, files_json, source_type, "
+            "monthly_credit_cost, one_time_credit_cost) "
+            "OUTPUT INSERTED.training_id VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)",
             user_id, len(files), class_word, files_json, source_type,
+            monthly_charge, one_time_charge,
         )
         training_id = cur.fetchone()[0]
         if is_retrain:
@@ -117,6 +131,8 @@ def reserve_training_slot(user_id, files, class_word, force, free_retrains,
         return TrainingReserveResult(
             True, training_id=training_id, outbox_id=outbox_id, message=message,
             retrain=is_retrain, credits_charged=charge,
+            monthly_credits_charged=monthly_charge,
+            one_time_credits_charged=one_time_charge,
         )
     finally:
         conn.close()

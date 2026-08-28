@@ -345,6 +345,9 @@ class FakeCursor:
             self.rowcount = self.cfg.get("training_claim_rowcount", 1)
         elif "update lora_trainings set status = ?" in s:
             self.rowcount = self.cfg.get("training_finish_rowcount", 1)
+        elif ("select isnull(monthly_credit_cost" in s
+              and "from lora_trainings" in s):
+            self._fetch = self.cfg.get("training_credit_costs", (0, 0))
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
@@ -400,6 +403,20 @@ class FakeCursor:
             if "subscription_renewed_at" in s:
                 values.append(self.cfg.get("subscription_renewed_at"))
             self._fetch = tuple(values)
+        elif "select subscription_plan, subscription_type, stripe_subscription_id" in s:
+            self._fetch = (
+                self.cfg.get("subscription_plan", "pro"),
+                self.cfg.get("subscription_type"),
+                self.cfg.get("stripe_subscription_id"),
+                self.cfg.get("subscription_cancel_at"),
+            )
+        elif ("select credits_monthly_limit, monthly_credits_remaining" in s
+              and "one_time_credits_remaining" in s):
+            self._fetch = (
+                self.cfg.get("credits_monthly_limit", 200),
+                self.cfg.get("monthly_credits", 20),
+                self.cfg.get("one_time_credits", 0),
+            )
         elif "select stripe_customer_id from users" in s:
             customer_id = self.cfg.get("stripe_customer_id")
             self._fetch = (customer_id,) if customer_id else None
@@ -433,6 +450,10 @@ class FakeCursor:
             self.rowcount = self.cfg.get("subscription_update_rowcount", 1)
         elif "stripe_checkout_token   = null" in s and "update users set" in s:
             self.rowcount = self.cfg.get("monthly_activation_rowcount", 1)
+        elif ("subscription_type = 'one_time'" in s
+              and "one_time_credits_remaining" in s
+              and "update users set" in s):
+            self.rowcount = self.cfg.get("one_time_payment_rowcount", 1)
         # subscription_status: plan/type/credits/quota/renewed/failed/cancel_at
         elif "select subscription_plan, subscription_type" in s:
             self._fetch = self.cfg.get(
@@ -1009,6 +1030,22 @@ class IdentityLoraGateTests(unittest.TestCase):
         self.assertEqual(user_sets[0][0], "ready")
         sys.modules["shared.queue_client"]._send.assert_called_once()
 
+    def test_failed_paid_retrain_refunds_original_credit_buckets_once(self):
+        self._cfg["training_credit_costs"] = (4, 6)
+        with mock.patch.object(function_app, "_identity_adapter_exists", return_value=True):
+            function_app._finish_training("t-1", "user-1", ok=False, error="OOM")
+
+        bucket_refunds = [
+            params for sql, params in self._cfg["executed"]
+            if "monthly_credits_remaining = monthly_credits_remaining + ?" in sql.lower()
+        ]
+        self.assertEqual(bucket_refunds, [(4, 6, 10, "user-1")])
+        ledger_rows = [
+            params for sql, params in self._cfg["executed"]
+            if "insert into credit_transactions" in sql.lower()
+        ]
+        self.assertIn(("user-1", 10, "retrain_refund", None), ledger_rows)
+
     # A retried training message must never start a SECOND A100 for the same run.
     def test_training_dispatch_is_idempotent(self):
         tt = sys.modules["shared.training_trigger"]
@@ -1115,6 +1152,22 @@ class BillingGateTests(unittest.TestCase):
         self.assertEqual(body["add_on_credits_remaining"], 40)
         self.assertEqual(body["monthly_credits_remaining"], 120)
 
+    def test_one_time_status_hides_stale_monthly_fields(self):
+        self._cfg["sub_status_row"] = (
+            "basic", "one_time", 230, 20,
+            function_app.datetime(2026, 8, 10), None, None, 250, 200,
+        )
+
+        response = function_app.subscription_status(self._req())
+        body = json.loads(response.body)
+
+        self.assertEqual(body["credits_remaining"], 250)
+        self.assertEqual(body["one_time_credits_remaining"], 250)
+        self.assertEqual(body["monthly_credits_remaining"], 0)
+        self.assertIsNone(body["credits_monthly_limit"])
+        self.assertIsNone(body["monthly_quota"])
+        self.assertIsNone(body["subscription_renewed_at"])
+
     def test_topup_requires_active_monthly(self):
         # A non-subscriber cannot buy loose credits — they buy a plan.
         self._cfg.update(subscription_type=None, stripe_subscription_id=None)
@@ -1169,7 +1222,37 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("https://billing.stripe.test/session", response.body)
         create_portal.assert_called_once_with(
-            "cus_123", "http://localhost:5173/billing")
+            "cus_123", "http://localhost:5173/billing", "payment_method_update")
+
+    def test_billing_portal_returns_after_payment_method_update(self):
+        from shared import stripe_client
+
+        with mock.patch.object(
+            stripe_client, "_post", return_value={"url": "https://billing.stripe.test/session"}
+        ) as post:
+            stripe_client.create_billing_portal(
+                "cus_123", "https://bettersnap.ai/billing", "payment_method_update")
+
+        post.assert_called_once_with("billing_portal/sessions", {
+            "customer": "cus_123",
+            "return_url": "https://bettersnap.ai/billing",
+            "flow_data[type]": "payment_method_update",
+            "flow_data[after_completion][type]": "redirect",
+            "flow_data[after_completion][redirect][return_url]":
+                "https://bettersnap.ai/billing",
+        })
+
+    def test_full_billing_portal_shows_saved_methods_and_invoices(self):
+        from shared import stripe_client
+
+        with mock.patch.object(stripe_client, "_post", return_value={"url": "portal"}) as post:
+            stripe_client.create_billing_portal(
+                "cus_123", "https://bettersnap.ai/billing", "manage")
+
+        post.assert_called_once_with("billing_portal/sessions", {
+            "customer": "cus_123",
+            "return_url": "https://bettersnap.ai/billing",
+        })
 
     def test_b1_payment_failure_is_recorded(self):
         function_app._handle_payment_failed(
@@ -1177,10 +1260,24 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         executed = self._cfg["executed"]
         self.assertTrue(any(
-            "payment_failed_at = getutcdate()" in sql.lower()
+            "payment_failed_at = coalesce(payment_failed_at, getutcdate())" in sql.lower()
             and params == ("sub_123",)
             for sql, params in executed
         ))
+
+    def test_failed_payment_grace_removes_only_monthly_credits(self):
+        function_app.failed_payment_grace_cleanup(mock.Mock())
+
+        cleanup_sql, params = next(
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "payment_failed_at <= dateadd" in sql.lower()
+        )
+        normalized = cleanup_sql.lower()
+        self.assertIn("monthly_credits_remaining = 0", normalized)
+        self.assertIn("credits_remaining = one_time_credits_remaining", normalized)
+        self.assertNotIn("one_time_credits_remaining =", normalized)
+        self.assertIn("subscription_type = 'monthly'", normalized)
+        self.assertEqual(params, (3,))
 
     def test_local_webhook_secret_overrides_key_vault(self):
         from shared import stripe_client
@@ -1219,6 +1316,24 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             event = stripe_client.verify_webhook(payload, header)
 
         self.assertEqual(event["id"], "evt_rotating")
+
+    def test_stripe_upgrade_invoices_proration_and_preserves_cycle_anchor(self):
+        from shared import stripe_client
+
+        with mock.patch.object(
+            stripe_client, "_price_id", return_value="price_monthly_pro",
+        ), mock.patch.object(
+            stripe_client, "_post", return_value={"id": "sub_123"},
+        ) as post:
+            stripe_client.upgrade_subscription("sub_123", "si_123", "pro")
+
+        path, params = post.call_args.args[:2]
+        self.assertEqual(path, "subscriptions/sub_123")
+        self.assertEqual(params["items[0][id]"], "si_123")
+        self.assertEqual(params["items[0][price]"], "price_monthly_pro")
+        self.assertEqual(params["proration_behavior"], "always_invoice")
+        self.assertEqual(params["payment_behavior"], "pending_if_incomplete")
+        self.assertNotIn("billing_cycle_anchor", params)
 
     def test_cancel_subscription_reads_period_end_from_stripe_items(self):
         self._cfg.update(
@@ -1310,7 +1425,12 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         )
         self.assertIsNotNone(update_params[3])
 
-    def test_b2_active_subscription_update_syncs_plan_without_resetting_credits(self):
+    def test_active_subscription_upgrade_adds_only_plan_credit_delta(self):
+        self._cfg.update(
+            credits_monthly_limit=200,
+            monthly_credits=75,
+            one_time_credits=250,
+        )
         subscription = {
             "id": "sub_123",
             "status": "active",
@@ -1325,13 +1445,71 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         updates = [
             (sql, params) for sql, params in self._cfg["executed"]
             if "credits_monthly_limit" in sql.lower()
+            and "update users set" in sql.lower()
             and "where stripe_subscription_id = ?" in sql.lower()
         ]
         self.assertEqual(len(updates), 1)
         sql, params = updates[0]
-        self.assertNotIn("credits_remaining", sql.lower())
+        self.assertIn("credits_remaining", sql.lower())
         self.assertEqual(params[0], "expert")
+        self.assertEqual(params[2], 425)
+        self.assertEqual(params[3], 175)
+        self.assertEqual(params[4], 300)
         self.assertEqual(params[-1], "sub_123")
+
+    def test_prorated_upgrade_invoice_does_not_reset_spent_credits(self):
+        function_app._handle_invoice_paid(
+            {
+                "subscription": "sub_123",
+                "billing_reason": "subscription_update",
+            },
+            "evt_upgrade_invoice",
+        )
+
+        sqls = [sql.lower() for sql, _ in self._cfg["executed"]]
+        self.assertFalse(any(
+            "monthly_credits_remaining = credits_monthly_limit" in sql
+            for sql in sqls
+        ))
+        self.assertTrue(any("payment_failed_at = null" in sql for sql in sqls))
+
+    def test_upgrade_endpoint_prorates_existing_subscription(self):
+        self._cfg.update(
+            subscription_plan="basic",
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+        stripe_subscription = {
+            "id": "sub_123",
+            "items": {"data": [{"id": "si_123"}]},
+        }
+        with mock.patch.object(
+            function_app, "get_subscription", return_value=stripe_subscription,
+        ), mock.patch.object(
+            function_app,
+            "upgrade_subscription",
+            return_value={"id": "sub_123", "pending_update": None},
+        ) as upgrade:
+            response = function_app.upgrade_user_subscription(
+                self._req({"plan": "pro"})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upgrade.assert_called_once_with("sub_123", "si_123", "pro")
+
+    def test_upgrade_endpoint_rejects_same_or_lower_plan(self):
+        self._cfg.update(
+            subscription_plan="pro",
+            subscription_type="monthly",
+            stripe_subscription_id="sub_123",
+        )
+
+        response = function_app.upgrade_user_subscription(
+            self._req({"plan": "basic"})
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("not_an_upgrade", response.body)
 
     def test_monthly_checkout_parks_existing_one_time_balance(self):
         function_app._handle_monthly_checkout(
@@ -1362,6 +1540,29 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             "credits_remaining = ? +",
             activation_sql.lower(),
         )
+
+    def test_repeated_one_time_purchase_rebuilds_total_and_clears_monthly_state(self):
+        function_app._handle_onetime_payment(
+            {"metadata": {"user_id": "user-1", "plan": "basic"}},
+            "evt_one_time_again",
+        )
+
+        sql, params = next(
+            (sql, params) for sql, params in self._cfg["executed"]
+            if "subscription_type = 'one_time'" in sql.lower()
+            and "one_time_credits_remaining" in sql.lower()
+            and "update users set" in sql.lower()
+        )
+        normalized = sql.lower()
+        self.assertIn(
+            "credits_remaining = one_time_credits_remaining + ?",
+            normalized,
+        )
+        self.assertIn("monthly_credits_remaining = 0", normalized)
+        self.assertIn("credits_monthly_limit = null", normalized)
+        self.assertIn("subscription_renewed_at = null", normalized)
+        self.assertEqual(params[2], 30)
+        self.assertEqual(params[3], 30)
 
     def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
         function_app._handle_subscription_ended(
@@ -1533,6 +1734,95 @@ class SubscriptionReliabilityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         release.assert_called_once_with("user-1", "expired-token")
+
+    def test_unpaid_completed_checkout_does_not_grant(self):
+        session = {
+            "id": "cs_unpaid",
+            "payment_status": "unpaid",
+            "metadata": {"payment_type": "one_time"},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_unpaid",
+            "type": "checkout.session.completed",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_handle_onetime_payment") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_not_called()
+
+    def test_paid_checkout_routes_all_purchase_types_with_session_claim(self):
+        handlers = {
+            "one_time": "_handle_onetime_payment",
+            "monthly": "_handle_monthly_checkout",
+            "topup": "_handle_topup",
+        }
+        for payment_type, handler_name in handlers.items():
+            with self.subTest(payment_type=payment_type):
+                session = {
+                    "id": f"cs_{payment_type}",
+                    "payment_status": "paid",
+                    "metadata": {"payment_type": payment_type},
+                }
+                with mock.patch.object(function_app, "verify_webhook", return_value={
+                    "id": f"evt_{payment_type}",
+                    "type": "checkout.session.completed",
+                    "data": {"object": session},
+                }), mock.patch.object(function_app, handler_name) as grant:
+                    request = self._req()
+                    request.headers = {"Stripe-Signature": "sig"}
+                    request.get_body = lambda: b"{}"
+                    response = function_app.stripe_webhook(request)
+
+                self.assertEqual(response.status_code, 200)
+                grant.assert_called_once_with(
+                    session, f"checkout_session:cs_{payment_type}"
+                )
+
+    def test_async_payment_success_fulfills_paid_checkout(self):
+        session = {
+            "id": "cs_delayed",
+            "payment_status": "paid",
+            "metadata": {"payment_type": "one_time"},
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_async_paid",
+            "type": "checkout.session.async_payment_succeeded",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_handle_onetime_payment") as grant:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        grant.assert_called_once_with(session, "checkout_session:cs_delayed")
+
+    def test_async_monthly_payment_failure_releases_reservation(self):
+        session = {
+            "id": "cs_failed",
+            "payment_status": "unpaid",
+            "metadata": {
+                "payment_type": "monthly",
+                "user_id": "user-1",
+                "checkout_token": "checkout-token",
+            },
+        }
+        with mock.patch.object(function_app, "verify_webhook", return_value={
+            "id": "evt_async_failed",
+            "type": "checkout.session.async_payment_failed",
+            "data": {"object": session},
+        }), mock.patch.object(function_app, "_release_monthly_checkout") as release:
+            request = self._req()
+            request.headers = {"Stripe-Signature": "sig"}
+            request.get_body = lambda: b"{}"
+            response = function_app.stripe_webhook(request)
+
+        self.assertEqual(response.status_code, 200)
+        release.assert_called_once_with("user-1", "checkout-token")
 
     def test_invoice_payment_succeeded_does_not_grant_renewal_credits(self):
         with mock.patch.object(function_app, "verify_webhook", return_value={
@@ -1821,7 +2111,11 @@ class StripePaidGrantTests(unittest.TestCase):
         event = {
             "id": "evt_paid_unregistered",
             "type": "checkout.session.completed",
-            "data": {"object": {"metadata": {"payment_type": "one_time"}}},
+            "data": {"object": {
+                "id": "cs_paid_unregistered",
+                "payment_status": "paid",
+                "metadata": {"payment_type": "one_time"},
+            }},
         }
         with mock.patch.object(function_app, "verify_webhook", return_value=event), \
              mock.patch.object(
@@ -1923,6 +2217,93 @@ class StripePaidGrantTests(unittest.TestCase):
             "when credits_remaining > credits_monthly_limit", renewal_sql,
         )
         self.assertTrue(conn.committed)
+
+
+class RetentionCleanupTests(unittest.TestCase):
+    class DueCursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.sql = ""
+
+        def execute(self, sql, *_params):
+            self.sql = " ".join(sql.lower().split())
+            return self
+
+        def fetchall(self):
+            return self.rows
+
+    class DueConnection:
+        def __init__(self, rows):
+            self.cur = RetentionCleanupTests.DueCursor(rows)
+
+        def cursor(self):
+            return self.cur
+
+    class EligibilityCursor:
+        def __init__(self, eligible):
+            self.eligible = eligible
+            self.executed = []
+            self._eligibility_query = False
+
+        def execute(self, sql, *params):
+            normalized = " ".join(sql.lower().split())
+            self.executed.append((normalized, params))
+            self._eligibility_query = normalized.startswith(
+                "select user_id from users with (updlock, holdlock)"
+            )
+            return self
+
+        def fetchone(self):
+            return ("user-1",) if self._eligibility_query and self.eligible else None
+
+        def fetchall(self):
+            return []
+
+    class EligibilityConnection:
+        def __init__(self, eligible):
+            self.cur = RetentionCleanupTests.EligibilityCursor(eligible)
+            self.committed = False
+            self.rolled_back = False
+            self.closed = False
+            self.autocommit = True
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            self.closed = True
+
+    def test_due_query_preserves_users_with_paid_credit_buckets(self):
+        due_conn = self.DueConnection([])
+        with mock.patch.object(function_app, "get_db", return_value=due_conn), \
+                mock.patch.object(function_app, "new_connection") as new_connection:
+            function_app.retention_cleanup(None)
+
+        self.assertIn("isnull(monthly_credits_remaining, 0) <= 0", due_conn.cur.sql)
+        self.assertIn("isnull(one_time_credits_remaining, 0) <= 0", due_conn.cur.sql)
+        new_connection.assert_not_called()
+
+    def test_active_job_blocks_blob_deletion(self):
+        due_conn = self.DueConnection([("user-1",)])
+        eligibility_conn = self.EligibilityConnection(eligible=False)
+        with mock.patch.object(function_app, "get_db", return_value=due_conn), \
+                mock.patch.object(
+                    function_app, "new_connection", return_value=eligibility_conn
+                ), mock.patch.object(function_app, "_delete_blobs") as delete_blobs:
+            function_app.retention_cleanup(None)
+
+        eligibility_sql = eligibility_conn.cur.executed[0][0]
+        self.assertIn("status not in ('completed', 'failed')", eligibility_sql)
+        self.assertTrue(eligibility_conn.rolled_back)
+        self.assertTrue(eligibility_conn.closed)
+        self.assertFalse(eligibility_conn.committed)
+        delete_blobs.assert_not_called()
 
 
 if __name__ == "__main__":

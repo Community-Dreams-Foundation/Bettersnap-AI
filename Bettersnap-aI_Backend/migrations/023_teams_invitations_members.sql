@@ -1,7 +1,7 @@
--- 016: Teams layer, part 2 — invitations and organization_members.
+-- 023: Teams layer, part 2 — invitations and organization_members.
 --
--- DEPENDS ON 015 (organizations, organization_payments). Both tables here carry an FK
--- to dbo.organizations, so 015 must run first. The runner applies files in filename
+-- DEPENDS ON 022 (organizations, organization_payments). Both tables here carry an FK
+-- to dbo.organizations, so 022 must run first. The runner applies files in filename
 -- order, so this must keep a higher number than the file that creates organizations.
 --
 -- MODEL: an admin buys a plan covering N employees and emails each an invite link.

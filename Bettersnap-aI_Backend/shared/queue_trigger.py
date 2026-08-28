@@ -79,6 +79,24 @@ def find_execution_for_job(job_id: str, job_name: str = JOB_NAME) -> str:
     return None
 
 
+def get_job_execution_outcome(execution_id: str, job_name: str = JOB_NAME) -> dict:
+    """Return ACA's authoritative status for one job execution.
+
+    The preflight diagnostic blob describes only the GPU probe subprocess. A successful
+    preflight therefore cannot prove the inference container later completed. ACA's job
+    execution resource is the control-plane source of truth for the whole container run.
+    """
+    credential = DefaultAzureCredential()
+    client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
+    execution = client.job_execution(RESOURCE_GROUP, job_name, execution_id)
+    return {
+        "execution_id": getattr(execution, "name", None) or execution_id,
+        "execution_status": (getattr(execution, "status", "") or "").lower(),
+        "start_time": getattr(execution, "start_time", None),
+        "end_time": getattr(execution, "end_time", None),
+    }
+
+
 def _start_execution(owned_env_keys, env_overrides, job_name: str = JOB_NAME) -> str:
     """Start ONE execution of `job_name`. Extracted verbatim from the two dispatchers
     (inference + training) — NO behavior change; only the per-run env policy differs and

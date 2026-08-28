@@ -26,6 +26,7 @@ REASON_JOB_RESERVE = "job_reserve"         # spend at submit (negative)
 REASON_JOB_REFUND = "job_refund"           # refund on no-fault failure (positive)
 REASON_JOB_REFUND_WAITING = "job_refund_waiting"  # refund of parked waiting_lora jobs
 REASON_RETRAIN_CHARGE = "retrain_charge"   # spend for a retrain (negative)
+REASON_RETRAIN_REFUND = "retrain_refund"   # failed retrain reversal (positive)
 
 
 def record(cur, user_id, amount, transaction_type, job_id=None):

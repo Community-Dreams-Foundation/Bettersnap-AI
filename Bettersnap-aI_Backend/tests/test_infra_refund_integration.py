@@ -19,7 +19,8 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 # ── in-memory DB + blob the fakes operate on ─────────────────────────────────
-STATE = {"jobs": {}, "users": {}, "blobs": {}, "user_updates": 0}
+STATE = {"jobs": {}, "users": {}, "blobs": {}, "user_updates": 0,
+         "execution_status": "failed"}
 
 
 class FakeCursor:
@@ -36,6 +37,14 @@ class FakeCursor:
             jid = params[0]
             if J[jid]["status"] not in ("failed", "completed"):
                 J[jid]["status"] = "failed"
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+        elif "update jobs set status = 'completed'" in s:
+            output_paths, jid = params[0], params[1]
+            if J[jid]["status"] not in ("failed", "completed"):
+                J[jid]["status"] = "completed"
+                J[jid]["output_blob_path"] = output_paths
                 self.rowcount = 1
             else:
                 self.rowcount = 0
@@ -118,7 +127,8 @@ if "function_app" not in sys.modules:
          get_blob_client=mock.Mock())
     _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
     _mod("shared.queue_trigger", trigger_container_job=mock.Mock(return_value="e"),
-         count_active_job_executions=mock.Mock(return_value=0))
+         count_active_job_executions=mock.Mock(return_value=0),
+         get_job_execution_outcome=mock.Mock())
     _mod("shared.crops", crop_head_and_shoulders=mock.Mock(return_value=b"jpeg"),
          NoFaceError=type("NoFaceError", (Exception,), {}))
     _mod("shared.training_trigger", trigger_training_job=mock.Mock(return_value="t"),
@@ -145,6 +155,14 @@ class InfraRefundIntegrationTests(unittest.TestCase):
     def setUp(self):
         STATE["jobs"].clear(); STATE["users"].clear(); STATE["blobs"].clear()
         STATE["user_updates"] = 0
+        STATE["execution_status"] = "failed"
+        queue_trigger = sys.modules["shared.queue_trigger"]
+        if not hasattr(queue_trigger, "get_job_execution_outcome"):
+            queue_trigger.get_job_execution_outcome = mock.Mock()
+        queue_trigger.get_job_execution_outcome.side_effect = lambda execution_id: {
+            "execution_id": execution_id,
+            "execution_status": STATE["execution_status"],
+        }
         # Override ONLY the two functions we need, scoped to this test (auto-restored),
         # regardless of what the initial import bound them to.
         self._patchers = [
@@ -165,7 +183,7 @@ class InfraRefundIntegrationTests(unittest.TestCase):
     def _reconcile_once(self):
         exec_data = function_app._fetch_execution_outcome("J1")
         self.assertIsNotNone(exec_data, "diag blob should be read")
-        self.assertEqual(exec_data["exit_code"], 43)
+        self.assertEqual(exec_data["preflight_exit_code"], 43)
         return function_app._reconcile_execution_outcome("J1", exec_data, now=0)
 
     def test_full_flow_refund_exactly_once(self):
@@ -190,18 +208,57 @@ class InfraRefundIntegrationTests(unittest.TestCase):
         self.assertEqual(STATE["user_updates"], 1, "still exactly one credit mutation")
         self.assertEqual(STATE["jobs"]["J1"]["status"], "failed")
 
-    def test_success_blob_does_not_refund(self):
+    def test_aca_success_with_results_recovers_without_refund(self):
+        STATE["execution_status"] = "succeeded"
         STATE["blobs"]["preflight/exec-J1.json"] = _preflight_blob("exec-J1", 0, "ok")
-        # a passing preflight would not normally write a fail record, but prove the guard:
         exec_data = function_app._fetch_execution_outcome("J1")
-        decision = function_app._reconcile_execution_outcome("J1", exec_data, now=0)
-        self.assertEqual(decision["action"], function_app.exec_reconcile.ACTION_NONE)
+        decision = function_app._reconcile_execution_outcome(
+            "J1", exec_data, now=0,
+            list_results=lambda _job_id: ["results/J1/headshot_1.png"],
+        )
+        self.assertEqual(decision["action"], function_app.exec_reconcile.ACTION_RECOVER)
+        self.assertEqual(STATE["jobs"]["J1"]["status"], "completed")
+        self.assertEqual(
+            json.loads(STATE["jobs"]["J1"]["output_blob_path"]),
+            ["results/J1/headshot_1.png"],
+        )
         self.assertEqual(STATE["users"]["u1"], 60, "no refund on success")
         self.assertEqual(STATE["user_updates"], 0)
 
-    def test_fetch_returns_none_when_no_blob(self):
+    def test_aca_success_without_results_fails_and_refunds(self):
+        STATE["execution_status"] = "succeeded"
+        STATE["blobs"]["preflight/exec-J1.json"] = _preflight_blob("exec-J1", 0, "ok")
+        exec_data = function_app._fetch_execution_outcome("J1")
+
+        decision = function_app._reconcile_execution_outcome(
+            "J1", exec_data, now=0, list_results=lambda _job_id: []
+        )
+
+        self.assertEqual(decision["action"], function_app.exec_reconcile.ACTION_REFUND)
+        self.assertEqual(
+            decision["failure_class"], function_app.exec_reconcile.CLASS_DELIVERY_MISSING
+        )
+        self.assertEqual(STATE["jobs"]["J1"]["status"], "failed")
+        self.assertEqual(STATE["users"]["u1"], 100)
+
+    def test_aca_success_storage_check_error_waits_for_retry(self):
+        STATE["execution_status"] = "succeeded"
+        exec_data = function_app._fetch_execution_outcome("J1")
+
+        decision = function_app._reconcile_execution_outcome(
+            "J1", exec_data, now=0, list_results=lambda _job_id: None
+        )
+
+        self.assertEqual(decision["action"], function_app.exec_reconcile.ACTION_NONE)
+        self.assertEqual(decision["failure_class"], function_app.exec_reconcile.CLASS_PENDING)
+        self.assertEqual(STATE["jobs"]["J1"]["status"], "processing")
+        self.assertEqual(STATE["users"]["u1"], 60)
+
+    def test_missing_preflight_blob_does_not_hide_aca_failure(self):
         STATE["blobs"].clear()
-        self.assertIsNone(function_app._fetch_execution_outcome("J1"))
+        outcome = function_app._fetch_execution_outcome("J1")
+        self.assertEqual(outcome["execution_status"], "failed")
+        self.assertNotIn("preflight_exit_code", outcome)
 
 
 class ReaperWiringTests(unittest.TestCase):

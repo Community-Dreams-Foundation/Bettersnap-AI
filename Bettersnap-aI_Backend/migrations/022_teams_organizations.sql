@@ -1,9 +1,9 @@
--- 021: Teams layer, part 1 — organizations, organization_payments, and the org link on jobs.
+-- 022: Teams layer, part 1 — organizations, organization_payments, and the org link on jobs.
 --
 -- RECOVERED from the original single-file Teams migration (Features_team 015_teams_schema.sql,
 -- commit 8ba1e55), which was dropped when Features_team merged into development (its 015 number
 -- collided with development's 015_dispatched_at). Part 2 — invitations + organization_members —
--- survives as 022_teams_invitations_members.sql, whose FKs reference dbo.organizations, so this
+-- survives as 023_teams_invitations_members.sql, whose FKs reference dbo.organizations, so this
 -- file (which creates it) MUST keep a lower number. These two files are DISJOINT: 021 creates
 -- organizations/organization_payments/jobs.organization_id; 022 creates invitations/members.
 --

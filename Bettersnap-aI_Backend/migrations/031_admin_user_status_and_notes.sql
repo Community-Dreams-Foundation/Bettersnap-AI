@@ -1,4 +1,4 @@
--- 028_admin_user_status_and_notes.sql — user account status (suspend) + internal support notes.
+-- 031_admin_user_status_and_notes.sql — user account status (suspend) + internal support notes.
 IF COL_LENGTH('dbo.users','suspended_at') IS NULL
     ALTER TABLE dbo.users ADD suspended_at DATETIME2 NULL;  -- NULL = active
 GO

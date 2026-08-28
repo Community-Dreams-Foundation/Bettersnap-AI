@@ -71,6 +71,8 @@ class DatabaseSessionOptionTests(unittest.TestCase):
         self.assertIn("SET QUOTED_IDENTIFIER ON", sql)
         self.assertIn("SET ANSI_NULLS ON", sql)
         self.assertIn("SESSIONPROPERTY('QUOTED_IDENTIFIER')", sql)
+        self.assertIn("CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS INT)", sql)
+        self.assertIn("CAST(SESSIONPROPERTY('ANSI_NULLS') AS INT)", sql)
         self.assertEqual(fake_pyodbc.calls[0][1], {"autocommit": True})
 
     def test_new_connection_enables_same_options_without_autocommit(self):
