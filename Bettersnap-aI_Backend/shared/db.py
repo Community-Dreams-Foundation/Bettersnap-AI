@@ -52,9 +52,12 @@ def _connect(*, autocommit=False):
     try:
         cur = conn.cursor()
         cur.execute(_REQUIRED_SESSION_OPTIONS)
+        # CAST to int: SESSIONPROPERTY() returns sql_variant, which ODBC Driver 18 + pyodbc
+        # surface as SQL type -16 and CANNOT decode ("ODBC SQL type -16 is not yet supported"),
+        # throwing on fetch and 500-ing EVERY DB-backed endpoint. Casting yields a plain int.
         cur.execute(
-            "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS INT), "
-            "CAST(SESSIONPROPERTY('ANSI_NULLS') AS INT)"
+            "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int), "
+            "CAST(SESSIONPROPERTY('ANSI_NULLS') AS int)"
         )
         if tuple(cur.fetchone()) != (1, 1):
             raise RuntimeError("required SQL session options are not enabled")

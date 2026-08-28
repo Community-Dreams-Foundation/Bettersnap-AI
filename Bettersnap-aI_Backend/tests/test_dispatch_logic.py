@@ -94,7 +94,9 @@ _mod("requests", post=mock.Mock(), get=mock.Mock())
 # Stub the heavy LEAF modules so importing function_app never pulls pyodbc / jwt
 # / azure-mgmt. NOTE: 'shared' itself and shared.job_reservation are left REAL so
 # the tests exercise the real reservation logic (it uses the stubbed shared.db).
-_mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"))
+_mod("shared.auth", validate_token=mock.Mock(), get_user_id=mock.Mock(return_value="user-1"),
+     require_admin=mock.Mock(return_value={"oid": "admin", "email": "admin@test", "name": "Admin", "roles": ["Admin"]}),
+     NotAdminError=type("NotAdminError", (Exception,), {}))
 _mod("shared.db", get_db=mock.Mock(), new_connection=mock.Mock())
 _mod("shared.queue_client",
      enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock(),
@@ -108,7 +110,9 @@ _mod("shared.keyvault", get_secret=mock.Mock(return_value="secret"))
 _mod("shared.queue_trigger",
      trigger_container_job=mock.Mock(return_value="exec-123"),
      count_active_job_executions=mock.Mock(return_value=0),
-     find_execution_for_job=mock.Mock(return_value=None))
+     find_execution_for_job=mock.Mock(return_value=None),
+     execution_status=mock.Mock(return_value="running"),
+     stop_execution=mock.Mock(return_value=True))
 
 
 # Identity-LoRA training deps. crops pulls opencv and training_trigger pulls
@@ -327,6 +331,8 @@ class FakeCursor:
             )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
+        elif "where status = 'processing' and external_execution_id is not null" in s:
+            self._fetchall = self.cfg.get("reaper_processing_with_exec", [])
         elif "select job_id from jobs where status = 'processing'" in s:
             self._fetchall = self.cfg.get("reaper_processing", [])
         elif "select job_id, external_execution_id from jobs where status = 'dispatching'" in s:
@@ -350,7 +356,8 @@ class FakeCursor:
             self._fetch = (self.cfg.get("plan_name", "basic"),
                            self.cfg.get("lora_status", "ready"),
                            self.cfg.get("credits", 20),
-                           self.cfg.get("one_time_credits", 0))
+                           self.cfg.get("one_time_credits", 0),
+                           self.cfg.get("suspended_at"))  # None = active (submit_job suspend gate)
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
         elif "select job_params, user_id, source_type from jobs" in s:
             self._fetch = (self.cfg.get("job_params",
@@ -743,7 +750,7 @@ class DailyCapTests(unittest.TestCase):
             "gender": "m", "age_range": "25-29", "hair_color": "black",
             "input_blob_path": "inputs/u/in.jpg",
             "attire_ids": ["business_suit.navy_suit_tie"],
-            "background_ids": ["business_suit.studio_gray"],
+            "background_ids": ["business_suit.light_gray_studio"],
         }
         return r
 
@@ -914,8 +921,8 @@ class IdentityLoraGateTests(unittest.TestCase):
         r.get_json = lambda: {
             "gender": "f", "age_range": "25-29", "hair_color": "black",
             "input_blob_path": "inputs/u/in.jpg",
-            "attire_ids": ["business_suit.navy_suit_tie"],
-            "background_ids": ["business_suit.studio_gray"],
+            "attire_ids": ["business_suit.navy_pantsuit"],
+            "background_ids": ["business_suit.light_gray_studio"],
         }
         return r
 
@@ -1901,8 +1908,13 @@ class ReaperTests(unittest.TestCase):
         disp = [s for s in sqls if "status = 'dispatching'" in s]
         self.assertTrue(proc, "reaper did not scan 'processing'")
         self.assertTrue(disp, "reaper did not scan 'dispatching'")
-        # Both scans must age from COALESCE(dispatched_at, created_at)...
-        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in proc + disp))
+        # The DEADLINE-based scans (those with a DATEADD window) must age from
+        # COALESCE(dispatched_at, created_at). The execution-status early-reconcile scan is
+        # deliberately deadline-free (it reconciles on terminal ACA status, not elapsed time),
+        # so it is excluded from this check.
+        deadline = [s for s in proc + disp if "dateadd" in s]
+        self.assertTrue(deadline, "reaper had no deadline-based scan")
+        self.assertTrue(all("coalesce(dispatched_at, created_at)" in s for s in deadline))
         # ...and must NOT age from the bare submit-time column.
         self.assertFalse(any("and created_at < dateadd" in s for s in sqls),
                          "reaper still measures from created_at (submit time)")
@@ -1964,6 +1976,65 @@ class RegistrationTests(unittest.TestCase):
             returned, granted,
             "register response 'credits' must match the granted/persisted balance",
         )
+
+
+class IdentityMigrationTests(unittest.TestCase):
+    """Supabase->Entra self-heal (_migrate_identity) must repoint EVERY user-scoped table to the
+    new oid before deleting the old users row, or a returning user strands data (and, for an
+    FK-enforced table, the DELETE would FK-block and 500 the whole self-heal). This locks in:
+      1. all enforced-FK child tables are repointed unconditionally,
+      2. the newer, no-FK tables (lora_trainings/pending_purchases/admin_user_notes) are repointed
+         under an OBJECT_ID existence guard (so a partial env without them still migrates),
+      3. DELETE FROM users runs LAST (FK-safe order), and commit fires exactly once."""
+
+    class _Cursor:
+        def __init__(self):
+            self.executed = []   # list of (normalized_sql, params)
+
+        def execute(self, sql, *params):
+            self.executed.append((" ".join(sql.split()), params))
+
+    class _Conn:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    def _run(self):
+        conn, cur = self._Conn(), self._Cursor()
+        function_app._migrate_identity(conn, cur, "old-id-123", "new-oid-456", "e@x.com")
+        return conn, cur
+
+    def test_enforced_children_repointed_to_new_oid(self):
+        _, cur = self._run()
+        for tbl in function_app._USER_CHILD_TABLES:
+            hits = [(s, p) for s, p in cur.executed
+                    if f"update {tbl} set user_id" in s.lower()]
+            self.assertEqual(len(hits), 1, f"{tbl} must be repointed exactly once")
+            self.assertEqual(hits[0][1], ("new-oid-456", "old-id-123"))
+
+    def test_optional_children_repointed_under_existence_guard(self):
+        _, cur = self._run()
+        for tbl in function_app._USER_CHILD_TABLES_OPTIONAL:
+            hits = [(s, p) for s, p in cur.executed
+                    if f"update dbo.{tbl} set user_id" in s.lower()]
+            self.assertEqual(len(hits), 1, f"{tbl} must be repointed exactly once")
+            # Guarded so a missing table can't fail the migration.
+            self.assertIn(f"object_id('dbo.{tbl}', 'u') is not null", hits[0][0].lower())
+            self.assertEqual(hits[0][1], ("new-oid-456", "old-id-123"))
+
+    def test_delete_users_runs_after_all_repoints(self):
+        _, cur = self._run()
+        order = [s.lower() for s, _ in cur.executed]
+        del_idx = next(i for i, s in enumerate(order) if s.startswith("delete from users"))
+        last_update = max(i for i, s in enumerate(order) if "set user_id" in s)
+        self.assertGreater(del_idx, last_update,
+                           "DELETE FROM users must run after every child repoint (FK-safe)")
+
+    def test_commits_exactly_once(self):
+        conn, _ = self._run()
+        self.assertEqual(conn.commits, 1)
 
 
 class PublicCatalogPrivacyTests(unittest.TestCase):

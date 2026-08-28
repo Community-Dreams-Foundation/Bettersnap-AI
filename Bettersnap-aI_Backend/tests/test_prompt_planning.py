@@ -48,21 +48,21 @@ class PromptPlanning(unittest.TestCase):
     def test_build_combos_global_cartesian_cross_category(self):
         # A Pro/Expert selection mixes categories — a professional attire with a
         # personal (beach) background, etc. Planning is their cartesian product.
-        attire = ["business_suit.navy_suit_tie", "dating.knit_sweater"]
-        bg = ["business_suit.studio_gray", "beach_sunset.beach_sunset"]
+        attire = ["business_suit.navy_suit_tie", "dating.crew_neck_sweater"]
+        bg = ["business_suit.light_gray_studio", "beach_sunset.golden_hour_beach"]
         combos = catalog.build_combos_global(attire, bg)
         self.assertEqual(len(combos), 4)
         self.assertIn(
-            ("business_suit.navy_suit_tie", "beach_sunset.beach_sunset"), combos
+            ("business_suit.navy_suit_tie", "beach_sunset.golden_hour_beach"), combos
         )
 
     def test_build_combos_global_drops_invalid_refs(self):
         combos = catalog.build_combos_global(
             ["business_suit.navy_suit_tie", "business_suit.NOPE", "bad_ref_no_dot"],
-            ["business_suit.studio_gray", "nope.nope"],
+            ["business_suit.light_gray_studio", "nope.nope"],
         )
         self.assertEqual(
-            combos, [("business_suit.navy_suit_tie", "business_suit.studio_gray")]
+            combos, [("business_suit.navy_suit_tie", "business_suit.light_gray_studio")]
         )
 
     def test_build_combos_global_empty_and_none(self):
@@ -70,13 +70,16 @@ class PromptPlanning(unittest.TestCase):
         self.assertEqual(catalog.build_combos_global(None, None), [])
 
     def test_attire_phrase_ref_is_gender_aware(self):
-        ref = "business_suit.navy_suit_tie"
-        male = catalog.attire_phrase_ref(ref, "male")
-        female = catalog.attire_phrase_ref(ref, "female")
+        # Attires are gender-specific LISTS now: each gender has its own refs, and each
+        # ref resolves to that gender's phrase. (navy_suit_tie is male; navy_pantsuit female.)
+        male = catalog.attire_phrase_ref("business_suit.navy_suit_tie", "male")
+        female = catalog.attire_phrase_ref("business_suit.navy_pantsuit", "female")
         self.assertIn("tie", male)
+        self.assertIn("pantsuit", female)
         self.assertNotEqual(male, female)
-        # Unknown gender key falls back to neutral, never crashes.
-        self.assertTrue(catalog.attire_phrase_ref(ref, "nonsense"))
+        # A cross-gender or unknown gender key falls back safely, never crashes.
+        self.assertTrue(catalog.attire_phrase_ref("business_suit.navy_suit_tie", "female"))
+        self.assertTrue(catalog.attire_phrase_ref("business_suit.navy_suit_tie", "nonsense"))
 
     def test_attire_phrase_ref_unknown_ref_falls_back(self):
         # A dropped/unknown ref must return a safe default, never raise.
@@ -84,13 +87,13 @@ class PromptPlanning(unittest.TestCase):
 
     def test_background_phrase_ref(self):
         self.assertIn("beach", catalog.background_phrase_ref(
-            "beach_sunset.beach_sunset").lower())
+            "beach_sunset.golden_hour_beach").lower())
         self.assertTrue(catalog.background_phrase_ref("nope.nope"))  # safe default
 
     def test_lead_phrase_follows_background_category(self):
         # Style/lead is DERIVED from the background's category: a beach bg reads
         # lifestyle/candid, an office bg corporate — even if attire came from elsewhere.
-        beach = catalog.lead_for_background_ref("beach_sunset.beach_sunset")
+        beach = catalog.lead_for_background_ref("beach_sunset.golden_hour_beach")
         office = catalog.lead_for_background_ref("business_suit.modern_office")
         self.assertNotEqual(beach, office)
         self.assertIn("photograph", beach.lower())
@@ -99,18 +102,18 @@ class PromptPlanning(unittest.TestCase):
         default = ["neutral studio lighting"]
         # beach_sunset overrides lighting (golden/sunset) -> not the default.
         beach = catalog.lighting_for_background_ref(
-            "beach_sunset.beach_sunset", default)
+            "beach_sunset.golden_hour_beach", default)
         self.assertNotEqual(beach, default)
         # A category with no lighting override returns the caller's default.
         self.assertEqual(
-            catalog.lighting_for_background_ref("business_suit.studio_gray", default),
+            catalog.lighting_for_background_ref("business_suit.light_gray_studio", default),
             default,
         )
 
     def test_ref_validation_helpers(self):
         self.assertTrue(catalog.valid_attire_ref("business_suit.navy_suit_tie"))
         self.assertFalse(catalog.valid_attire_ref("business_suit.NOPE"))
-        self.assertTrue(catalog.valid_background_ref("beach_sunset.beach_sunset"))
+        self.assertTrue(catalog.valid_background_ref("beach_sunset.golden_hour_beach"))
         self.assertEqual(catalog.split_ref("a.b"), ("a", "b"))
 
 

@@ -92,6 +92,10 @@ TRAIN_FUSE_HEAD_START = int(os.environ.get("TRAIN_FUSE_HEAD_START", "25"))
 # less aggressive than the GPU's hard cap, so it can NEVER false-fail a healthy run. (Was
 # 45, which — measured from submit — could reap a large job that merely waited in queue.)
 REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "130"))
+# How long after submit a user may cancel their own job. Enforced server-side (the UI also
+# hides the button past this) so a late cancel on a job that's already deep into generation
+# can't be forced. Measured from created_at.
+CANCEL_WINDOW_MINUTES      = int(os.environ.get("CANCEL_WINDOW_MINUTES", "5"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
 # ── Identity-LoRA training ────────────────────────────────────────────────
@@ -124,6 +128,27 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "3"))
 # A later invoice.paid restores the normal monthly allowance automatically.
 FAILED_PAYMENT_GRACE_DAYS = int(os.environ.get("FAILED_PAYMENT_GRACE_DAYS", "3"))
 
+# BIPA/GDPR: block facial-data processing (upload/train) until server-side biometric consent
+# exists. DEFAULT OFF so this can deploy before the migration + frontend consent flow are live;
+# flip BIOMETRIC_CONSENT_REQUIRED=1 to enforce once those are in place (else uploads 403).
+BIOMETRIC_CONSENT_REQUIRED = os.environ.get("BIOMETRIC_CONSENT_REQUIRED", "0").strip() == "1"
+BIOMETRIC_CONSENT_PURPOSE  = "Biometric processing for AI photo generation"
+
+
+def _write_event(user_id, event_type, target=None, detail=None, ip=None):
+    """SOC-2 comprehensive audit trail (migration 029 `audit_log`). Append one event; BEST-EFFORT —
+    opens its own autocommit connection and NEVER raises into the request path. Store only refs/ids
+    and non-sensitive context in `detail`; never PII or biometric content."""
+    try:
+        get_db().cursor().execute(
+            "INSERT INTO dbo.audit_log (user_id, event_type, target, detail, ip) VALUES (?,?,?,?,?)",
+            (str(user_id) if user_id else None), str(event_type)[:48],
+            (str(target)[:256] if target is not None else None),
+            (json.dumps(detail) if detail is not None else None),
+            (str(ip)[:64] if ip else None))
+    except Exception as e:
+        logging.warning(f"audit_log write failed event={event_type}: {e}")
+
 
 def _gpu_dispatch_enabled() -> bool:
     # Emergency kill switch (read per-call so it takes effect without a redeploy).
@@ -131,7 +156,7 @@ def _gpu_dispatch_enabled() -> bool:
     # halt ALL A100 spend. Budgets only alert; this actually stops dispatch.
     return os.environ.get("GPU_DISPATCH_ENABLED", "true").lower() == "true"
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-from shared.auth import validate_token, get_user_id
+from shared.auth import validate_token, get_user_id, require_admin, NotAdminError
 from shared.db import get_db, new_connection
 from shared.job_reservation import reserve_job_slot
 from shared.training_reservation import reserve_training_slot
@@ -184,10 +209,18 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=status)
 
 # ── User Registration ─────────────────────────────────────
-# Tables whose user_id FKs to users.user_id. A returning user's whole history/credits/
-# subscriptions hang off these, so an identity migration MUST move them too or it strands
-# the data (and leaves FK-orphan rows). Keep in sync with the schema (sys.foreign_keys).
+# Tables whose user_id has an ENFORCED FK to users.user_id (see sys.foreign_keys). These
+# always exist and MUST be repointed in an identity migration, or the closing DELETE FROM
+# users FK-blocks and the whole self-heal rolls back (the returning user 500s anyway).
 _USER_CHILD_TABLES = ("jobs", "lora_models", "credit_transactions", "subscriptions")
+
+# Additional user-scoped tables that carry a user_id but have NO enforced FK to users (so the
+# DELETE would not block on them) — yet a returning user's rows here still belong to them and
+# must follow the migration or they strand under the old id. pending_purchases in particular can
+# strand a paid-but-uncommitted purchase. These tables post-date the baseline, so repoint each
+# only IF it exists (OBJECT_ID guard) — a fresh/partial environment without them must not fail
+# the migration. Names are hardcoded constants, never user input, so the f-string is injection-safe.
+_USER_CHILD_TABLES_OPTIONAL = ("lora_trainings", "pending_purchases", "admin_user_notes")
 
 
 def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
@@ -222,6 +255,13 @@ def _migrate_identity(conn, cursor, old_user_id, new_oid, email):
     """, new_oid, email, old_user_id)
     for tbl in _USER_CHILD_TABLES:
         cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE user_id = ?", new_oid, old_user_id)
+    # Optional user-scoped tables: repoint only if present, so an environment missing a newer
+    # table (e.g. pending_purchases/admin_user_notes) still migrates cleanly instead of erroring.
+    for tbl in _USER_CHILD_TABLES_OPTIONAL:
+        cursor.execute(
+            f"IF OBJECT_ID('dbo.{tbl}', 'U') IS NOT NULL "
+            f"UPDATE dbo.{tbl} SET user_id = ? WHERE user_id = ?",
+            new_oid, old_user_id)
     cursor.execute("DELETE FROM users WHERE user_id = ?", old_user_id)
     conn.commit()
 
@@ -259,6 +299,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
 
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", user_id)
     if cursor.fetchone():
+        _write_event(user_id, "auth.login")
         return func.HttpResponse(
             json.dumps({"message": "User already exists"}),
             mimetype="application/json",
@@ -278,6 +319,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
                 f"Entra oid={user_id} (returning user, auth id changed)."
             )
             _migrate_identity(conn, cursor, prior[0], user_id, email)
+            _write_event(user_id, "auth.identity_migrated", detail={"from_id": str(prior[0])})
             return func.HttpResponse(
                 json.dumps({"message": "User migrated to current identity"}),
                 mimetype="application/json",
@@ -303,6 +345,7 @@ def register_user(req: func.HttpRequest) -> func.HttpResponse:
          REGISTRATION_CREDITS, DEFAULT_PLAN_KEY)
     conn.commit()
 
+    _write_event(user_id, "auth.register")
     return func.HttpResponse(
         json.dumps({"message": "User registered", "credits": REGISTRATION_CREDITS}),
         mimetype="application/json",
@@ -351,15 +394,67 @@ def user_credits(req: func.HttpRequest) -> func.HttpResponse:
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT credits_remaining FROM users WHERE user_id = ?", user_id)
+    cursor.execute(
+        "SELECT credits_remaining, one_time_credits_remaining, monthly_credits_remaining "
+        "FROM users WHERE user_id = ?",
+        user_id,
+    )
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
 
+    # Separate-balance model: spendable credits live in the one_time/monthly BUCKET columns —
+    # that is what reserve_job_slot actually debits. The legacy `credits_remaining` column is
+    # stale for any user who purchased/renewed after the split (e.g. a one-time top-up lands in
+    # one_time_credits_remaining, leaving credits_remaining at 0), which made the dashboard show
+    # 0 despite a paid balance. Report the effective bucket total; fall back to the legacy column
+    # only when both buckets are empty (pre-migration users whose balance never moved to a bucket).
+    legacy = int(row[0] or 0)
+    one_time = int(row[1] or 0)
+    monthly = int(row[2] or 0)
+    bucket_total = one_time + monthly
+    effective = bucket_total if bucket_total > 0 else legacy
+
     return func.HttpResponse(
-        json.dumps({"credits_remaining": row[0]}),
+        json.dumps({
+            "credits_remaining": effective,
+            "one_time_credits_remaining": one_time,
+            "monthly_credits_remaining": monthly,
+        }),
         mimetype="application/json",
         status_code=200
+    )
+
+# ── Reset model (the "New LoRA" path of the one-time re-purchase flow) ──────
+@app.route(route="users/model", methods=["DELETE"])
+def delete_user_model(req: func.HttpRequest) -> func.HttpResponse:
+    """Wipe the caller's trained model so they can build a brand-new one.
+
+    This is the backend for the 'New model' choice a one-time user makes after buying another
+    pack: it deletes the adapter blob and resets lora_status -> 'none' + retrain_count -> 0, so
+    the next /train is a fresh FIRST train (free, included in the pack) rather than a charged
+    retrain (FREE_RETRAINS=1 would otherwise bill the 2nd model). Scoped strictly to the caller's
+    own user_id — a user can only reset THEIR model. Idempotent: resetting an already-'none'
+    account is a no-op that still returns 200. Generation is unaffected until they retrain."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    # Adapter blobs live under the LOWERCASED user_id prefix (training writes lowercase; the
+    # generation lookup is case-sensitive — see _delete_blobs's case note / the lora-case fix).
+    n_lora = _delete_blobs("lora-weights", f"identity/{user_id.lower()}/")
+    conn = get_db()
+    conn.cursor().execute(
+        "UPDATE users SET lora_status = 'none', retrain_count = 0 WHERE user_id = ?",
+        user_id,
+    )
+    logging.info(f"delete_user_model: user={user_id} deleted adapter_blobs={n_lora}")
+    _write_event(user_id, "model.delete", detail={"deleted_adapters": n_lora})
+    return func.HttpResponse(
+        json.dumps({"status": "reset", "lora_status": "none", "deleted_adapters": n_lora}),
+        mimetype="application/json", status_code=200,
     )
 
 # ── Profile: Get ──────────────────────────────────────────
@@ -546,6 +641,96 @@ def accept_terms(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
     )
 
+# ── Biometric Consent (BIPA / GDPR) ───────────────────────
+# Append-only consent log (migration 028): each POST records a 'given' or 'revoked' EVENT; the
+# user's CURRENT consent is the latest event. Required server-side before any facial-data
+# processing (see the upload/train guard, gated by BIOMETRIC_CONSENT_REQUIRED). The row history
+# is the audit trail (version, purpose, policy version, timestamp, revocation reason).
+def _biometric_consent_active(cursor, user_id) -> bool:
+    """True iff the user's most-recent biometric-consent event is 'given'."""
+    cursor.execute(
+        "SELECT TOP 1 event FROM dbo.biometric_consent WHERE user_id = ? "
+        "ORDER BY created_at DESC, consent_id DESC", user_id)
+    row = cursor.fetchone()
+    return bool(row) and row[0] == "given"
+
+
+def _biometric_consent_status(cursor, user_id) -> dict:
+    cursor.execute(
+        "SELECT TOP 1 event, consent_version, consent_purpose, policy_version, created_at "
+        "FROM dbo.biometric_consent WHERE user_id = ? ORDER BY created_at DESC, consent_id DESC", user_id)
+    row = cursor.fetchone()
+    if not row:
+        return {"consent_given": False, "event": None}
+    return {"consent_given": row[0] == "given", "event": row[0], "consent_version": row[1],
+            "consent_purpose": row[2], "policy_version": row[3], "updated_at": _utc_iso(row[4])}
+
+
+@app.route(route="users/biometric-consent", methods=["GET"])
+def biometric_consent_status(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    cursor = get_db().cursor()
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="users/biometric-consent", methods=["POST"])
+def give_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    try:
+        body = req.get_json() or {}
+    except ValueError:
+        body = {}
+    version = body.get("consent_version")
+    if not version:
+        return func.HttpResponse(json.dumps({"error": "consent_version is required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO dbo.biometric_consent (user_id, event, consent_version, consent_purpose, policy_version) "
+        "VALUES (?, 'given', ?, ?, ?)",
+        user_id, str(version)[:32], BIOMETRIC_CONSENT_PURPOSE,
+        (str(body.get("policy_version"))[:32] if body.get("policy_version") else None))
+    conn.commit()
+    _write_event(user_id, "consent.biometric_given", detail={"version": str(version)[:32]})
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="users/biometric-consent/revoke", methods=["POST"])
+def revoke_biometric_consent(req: func.HttpRequest) -> func.HttpResponse:
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    try:
+        body = req.get_json() or {}
+    except ValueError:
+        body = {}
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT TOP 1 consent_version FROM dbo.biometric_consent WHERE user_id = ? "
+                   "ORDER BY created_at DESC, consent_id DESC", user_id)
+    r = cursor.fetchone()
+    cursor.execute(
+        "INSERT INTO dbo.biometric_consent (user_id, event, consent_version, consent_purpose, reason) "
+        "VALUES (?, 'revoked', ?, ?, ?)",
+        user_id, (r[0] if r else "unknown"), BIOMETRIC_CONSENT_PURPOSE,
+        (str(body.get("reason"))[:512] if body.get("reason") else None))
+    conn.commit()
+    _write_event(user_id, "consent.biometric_revoked")
+    return func.HttpResponse(json.dumps(_biometric_consent_status(cursor, user_id)),
+                             mimetype="application/json", status_code=200)
+
+
 # ── Upload Photo ──────────────────────────────────────────
 @app.route(route="upload", methods=["POST"])
 def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
@@ -554,6 +739,14 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
         user_id = get_user_id(token)
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
+
+    # BIPA/GDPR guard: no facial-data upload without active server-side biometric consent.
+    # Env-gated (default off) so it can't break uploads before the consent flow + migration are live.
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "biometric_consent_required",
+                        "message": "Explicit biometric consent is required before uploading photos."}),
+            mimetype="application/json", status_code=403)
 
     file = req.files.get("photo")
     if not file:
@@ -614,6 +807,7 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     # Clients must submit this exact value as input_blob_path to /jobs/submit.
     input_blob_path = f"inputs/{blob_name}"
 
+    _write_event(user_id, "photo.upload", target=blob_name)
     return func.HttpResponse(
         json.dumps({"url": url, "blob_name": blob_name, "input_blob_path": input_blob_path}),
         mimetype="application/json",
@@ -694,6 +888,14 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
+    # BIPA/GDPR guard: training turns facial data into a persisted per-user model — require
+    # active server-side biometric consent (env-gated, default off).
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "biometric_consent_required",
+                        "message": "Explicit biometric consent is required before training."}),
+            mimetype="application/json", status_code=403)
+
     from shared.crops import (crop_head_and_shoulders, NoFaceError,
                               MultipleFacesError, FaceTooSmallError,
                               EyesOccludedError)
@@ -709,14 +911,20 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT lora_status, credits_remaining, retrain_count, plan_name FROM users WHERE user_id = ?",
+        "SELECT lora_status, credits_remaining, retrain_count, plan_name, "
+        "one_time_credits_remaining, monthly_credits_remaining FROM users WHERE user_id = ?",
         user_id,
     )
     row = cur.fetchone()
     if not row:
         return func.HttpResponse("User not found", status_code=404)
     lora_status = (row[0] or "none").strip()
-    credits, retrain_count = int(row[1] or 0), int(row[2] or 0)
+    retrain_count = int(row[2] or 0)
+    # Effective spendable = the buckets (what the retrain charge actually debits), NOT the legacy
+    # credits_remaining column — else a fully-funded one-time account (balance in one_time bucket,
+    # legacy 0) is wrongly told "Not enough credits to retrain". Mirrors reserve_training_slot.
+    _bucket_total = int(row[4] or 0) + int(row[5] or 0)
+    credits = _bucket_total if _bucket_total > 0 else int(row[1] or 0)
     if lora_status == "training":
         return func.HttpResponse(
             json.dumps({"status": "training", "message": "Training already in progress"}),
@@ -915,8 +1123,17 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     # generation job so _dispatch_training can fuse it into this same container. The
     # transactional-outbox guarantee is unaffected: the row is already committed, and
     # outbox_dispatch_pending still backstops a failed send.
-    outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg,
-                        visibility_timeout=TRAIN_FUSE_HEAD_START or None)
+    # Reservation already committed (training row + credit charge + outbox message) — the
+    # request has succeeded and outbox_dispatch_pending backstops delivery, so a fast-path
+    # hiccup here must NOT 500 a training that already started. Guard and return 202.
+    try:
+        outbox_try_send_now(outbox_tid, TRAINING_QUEUE, train_msg,
+                            visibility_timeout=TRAIN_FUSE_HEAD_START or None)
+    except Exception as e:
+        logging.warning(
+            f"training outbox fast-path failed for training_id={training_id} "
+            f"(non-fatal; the dispatcher will deliver): {e}"
+        )
     logging.info(
         f"training queued: training_id={training_id} user={user_id} "
         f"photos={len(files)} class_word={cword} head_start={TRAIN_FUSE_HEAD_START}s"
@@ -1031,12 +1248,18 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     cur0 = conn0.cursor()
     cur0.execute(
         "SELECT plan_name, lora_status, credits_remaining, "
-        "one_time_credits_remaining FROM users WHERE user_id = ?",
+        "one_time_credits_remaining, suspended_at FROM users WHERE user_id = ?",
         user_id,
     )
     prow = cur0.fetchone()
     if not prow:
         return func.HttpResponse("User not found", status_code=404)
+    # A super-admin can suspend an account; a suspended user cannot start new generations.
+    if prow[4] is not None:
+        return func.HttpResponse(
+            json.dumps({"error": "account_suspended",
+                        "message": "This account is suspended. Contact support."}),
+            mimetype="application/json", status_code=403)
     plan = get_plan(prow[0])
     lora_status = (prow[1] or "none").strip()
     credits_remaining = int(prow[2] or 0)
@@ -1069,8 +1292,11 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         if not attire_ids or not background_ids:
             return func.HttpResponse(
                 "Select at least one attire and one background", status_code=400)
-        # Every ref must exist in the catalog (drops typos / stale ids).
-        bad = ([a for a in attire_ids if not catalog.valid_attire_ref(a)] +
+        # Every ref must exist in the catalog (drops typos / stale ids). Attires are
+        # gender-specific, so an attire ref is valid only if it exists for THIS user's gender
+        # (a male ref submitted for a female user, or vice-versa, is rejected). Backgrounds
+        # are shared across genders.
+        bad = ([a for a in attire_ids if not catalog.valid_attire_ref(a, gender)] +
                [b for b in background_ids if not catalog.valid_background_ref(b)])
         if bad:
             return func.HttpResponse(
@@ -1223,10 +1449,23 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
     # into the outbox IN THE SAME TRANSACTION as the job row + credit charge, so the send can
     # no longer be lost. Fast-path it now; if the queue is briefly down the outbox_dispatcher
     # delivers it — the job is neither failed nor refunded, it just starts a little later.
-    outbox_try_send_now(
-        result.outbox_id, INFERENCE_QUEUE,
-        {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
-    )
+    # Once the reservation has COMMITTED (job row + credit charge + outbox message, atomically),
+    # the request has succeeded — the job WILL run, because the outbox_dispatcher delivers the
+    # queue message even if this fast-path send (or its bookkeeping) hiccups. So this tail must
+    # never turn a committed job into a 500: a false failure makes the user retry and double-pay,
+    # and (as seen in prod) shows "Submit failed" for a job that generates all its images.
+    # outbox_try_send_now already swallows send failures, but its _mark_delivered/_record_failure
+    # DB writes can still raise — guard the whole call and always return 202.
+    try:
+        outbox_try_send_now(
+            result.outbox_id, INFERENCE_QUEUE,
+            {"job_id": str(job_id), "user_id": str(user_id), "job_params": job_params},
+        )
+    except Exception as e:
+        logging.warning(
+            f"outbox fast-path failed for job_id={job_id} (non-fatal; the dispatcher will "
+            f"deliver the queued message): {e}"
+        )
 
     return func.HttpResponse(
         json.dumps({"job_id": str(job_id), "status": "queued"}),
@@ -1342,6 +1581,69 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
 # Owner-only hard delete: remove the jobs row AND its result blobs
 # (outputs/results/<job_id>/*). 404 if the job doesn't exist, 403 if it isn't the
 # caller's. Route is /jobs/{job_id} (NOT under a reserved prefix like admin/*).
+@app.route(route="jobs/{job_id}/cancel", methods=["POST"])
+def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
+    """Cancel the caller's own in-flight job so it reflects 'failed' + refunds WITHIN SECONDS,
+    instead of waiting up to ~10 min for the reaper. Stops the running container (frees the single
+    A100) and marks the job failed + refunds SYNCHRONOUSLY via _mark_failed (guarded, exactly-once).
+    A job already 'completed'/'failed' is a no-op (idempotent)."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    # Ownership gate: 404 if missing, 403 if not the caller's job. age_sec = seconds since submit,
+    # computed in SQL (both created_at and GETUTCDATE are UTC) to avoid client/server clock skew.
+    cursor.execute(
+        "SELECT user_id, status, external_execution_id, "
+        "DATEDIFF(SECOND, created_at, GETUTCDATE()) FROM jobs WHERE job_id = ?", job_id)
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    if row[0] != user_id:
+        return func.HttpResponse("Forbidden", status_code=403)
+    status, exec_id, age_sec = (row[1] or "").strip(), row[2], int(row[3] or 0)
+
+    if status in ("completed", "failed"):
+        # Nothing to cancel; report current state so the client just refreshes.
+        return func.HttpResponse(
+            json.dumps({"job_id": str(job_id), "status": status, "cancelled": False}),
+            mimetype="application/json", status_code=200)
+
+    # Cancel window: only within the first CANCEL_WINDOW_MINUTES after submit. Past that the job is
+    # committed (deep into training/generation), so a late cancel is rejected server-side.
+    if age_sec > CANCEL_WINDOW_MINUTES * 60:
+        return func.HttpResponse(
+            json.dumps({"error": "cancel_window_expired",
+                        "message": f"Jobs can only be cancelled within {CANCEL_WINDOW_MINUTES} "
+                                   f"minutes of starting.",
+                        "window_minutes": CANCEL_WINDOW_MINUTES, "age_seconds": age_sec}),
+            mimetype="application/json", status_code=409)
+
+    # 1) Free the GPU immediately: best-effort stop the live container (if its execution is known).
+    if exec_id:
+        try:
+            from shared.queue_trigger import stop_execution
+            stop_execution(exec_id)
+        except Exception as e:
+            logging.warning(f"cancel_job: stop_execution failed for job_id={job_id}: {e}")
+
+    # 2) Mark failed + refund SYNCHRONOUSLY (guarded transition, one-time refund).
+    _mark_failed(job_id)
+
+    logging.info(f"cancel_job: user={user_id} cancelled job_id={job_id} (was '{status}')")
+    return func.HttpResponse(
+        json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
+        mimetype="application/json", status_code=200)
+
+
 @app.route(route="jobs/{job_id}", methods=["DELETE"])
 def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -1488,6 +1790,86 @@ def get_catalog(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200,
     )
+
+
+# ── Catalog: gender-aware attire/background fetch (from the DB catalog_* tables) ──
+# After the UI picks a category (and knows the user's gender), it pulls the gender-
+# specific attire list and the background list from these DB-backed endpoints. Public
+# (no token) like GET /catalog. Prompt phrases are NOT exposed — they're internal to
+# generation; the client only needs ref + label + image.
+_CATALOG_KINDS = {"attires": "catalog_attires", "backgrounds": "catalog_backgrounds"}
+
+
+def _catalog_gender(g):
+    """Normalize to the attire-data gender key: male | female | other. None if invalid."""
+    g = (g or "").strip().lower()
+    if g in ("male", "man", "m"):
+        return "male"
+    if g in ("female", "woman", "f"):
+        return "female"
+    if g in ("other", "neutral", "nonbinary", "non-binary", "prefer not to say"):
+        return "other"
+    return None
+
+
+def _catalog_image(gender, kind, image_key):
+    """Root-relative image path served from the frontend's /public/catalog folder."""
+    return f"/catalog/{gender}/{kind}/{image_key}_{gender}.jpg" if image_key else None
+
+
+def _category_exists(cur, category):
+    cur.execute("SELECT 1 FROM dbo.catalog_categories WHERE category_key = ? AND is_active = 1", category)
+    return cur.fetchone() is not None
+
+
+@app.route(route="catalog/{category}/attires", methods=["GET"])
+def get_catalog_attires(req: func.HttpRequest) -> func.HttpResponse:
+    category = req.route_params.get("category")
+    gender = _catalog_gender(req.params.get("gender"))
+    if gender is None:
+        return func.HttpResponse(
+            json.dumps({"error": "gender query param is required: male | female | other"}),
+            mimetype="application/json", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    if not _category_exists(cur, category):
+        return func.HttpResponse(json.dumps({"error": "unknown category"}),
+                                 mimetype="application/json", status_code=404)
+    cur.execute(
+        "SELECT ref, label, image_key FROM dbo.catalog_attires "
+        "WHERE category_key = ? AND gender = ? AND is_active = 1 ORDER BY sort_order",
+        category, gender)
+    items = [{"ref": r[0], "id": r[0].split(".", 1)[1], "label": r[1], "gender": gender,
+              "image": _catalog_image(gender, "attires", r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"category": category, "gender": gender, "attires": items}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="catalog/{category}/backgrounds", methods=["GET"])
+def get_catalog_backgrounds(req: func.HttpRequest) -> func.HttpResponse:
+    category = req.route_params.get("category")
+    # Backgrounds are shared across genders; gender only selects the rendered image variant.
+    gender = _catalog_gender(req.params.get("gender") or "other")
+    if gender is None:
+        return func.HttpResponse(
+            json.dumps({"error": "gender must be one of: male | female | other"}),
+            mimetype="application/json", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    if not _category_exists(cur, category):
+        return func.HttpResponse(json.dumps({"error": "unknown category"}),
+                                 mimetype="application/json", status_code=404)
+    cur.execute(
+        "SELECT ref, label, image_key FROM dbo.catalog_backgrounds "
+        "WHERE category_key = ? AND is_active = 1 ORDER BY sort_order",
+        category)
+    items = [{"ref": r[0], "id": r[0].split(".", 1)[1], "label": r[1],
+              "image": _catalog_image(gender, "backgrounds", r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"category": category, "gender": gender, "backgrounds": items}),
+        mimetype="application/json", status_code=200)
+
 
 # ── Plans (pricing + selection limits) ────────────────────
 # Served from shared/plans so the frontend renders prices/limits and enforces the
@@ -2413,7 +2795,15 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         # Fast-path each release (visibility 0, so the GPU picks them up at once); whatever
         # doesn't send now, the outbox_dispatcher delivers on its next tick.
         for outbox_id, msg in released:
-            outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
+            # Per-job guard: a fast-path failure on ONE parked job must not abort releasing the
+            # rest (the outbox_dispatcher backstops any that don't send here).
+            try:
+                outbox_try_send_now(outbox_id, INFERENCE_QUEUE, msg)
+            except Exception as e:
+                logging.warning(
+                    f"release fast-path failed for job_id={msg['job_id']} "
+                    f"(non-fatal; dispatcher will deliver): {e}"
+                )
             logging.info(f"released parked job_id={msg['job_id']} for user={user_id}")
     else:
         # Never leave a user waiting on an adapter that will never exist.
@@ -2473,9 +2863,9 @@ def handle_poison_job(msg: func.QueueMessage):
 # Both paths call _mark_failed: guarded transition + one-time credit refund.
 # An OOM SIGKILL (exit 137) leaves the row in 'processing' because the process
 # is killed before it can write — this reaper is the ONLY thing that clears it.
-@app.timer_trigger(schedule="0 */10 * * * *", arg_name="timer", run_on_startup=False)
+@app.timer_trigger(schedule="0 */2 * * * *", arg_name="timer", run_on_startup=False)
 def reaper(timer: func.TimerRequest):
-    from shared.queue_trigger import find_execution_for_job
+    from shared.queue_trigger import find_execution_for_job, execution_status
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -2495,8 +2885,36 @@ def reaper(timer: func.TimerRequest):
             -REAPER_DISPATCHING_MINUTES,
         )
         dispatching = [(str(r[0]), r[1]) for r in cur.fetchall()]
+
+        # EARLY reconcile: a 'processing' job whose ACA execution has ALREADY gone terminal
+        # (killed / crashed / operator-stopped) is definitively dead — don't make it wait out the
+        # full REAPER_STUCK_MINUTES healthy-run window. Bounded to rows with a known execution id;
+        # the per-execution status read (an ACA call) is done below, after the DB conn closes.
+        cur.execute(
+            "SELECT job_id, external_execution_id FROM jobs "
+            "WHERE status = 'processing' AND external_execution_id IS NOT NULL"
+        )
+        processing_with_exec = [(str(r[0]), r[1]) for r in cur.fetchall()]
     finally:
         conn.close()
+
+    # A terminal-but-not-successful execution means the container is gone without delivering —
+    # fail+refund now. 'Succeeded' is deliberately excluded: the container writes 'completed'
+    # itself, so a Succeeded execution whose row still reads 'processing' is a write race, NOT a
+    # refund case (refunding it would hand the user both a refund AND the delivered images).
+    _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
+    _stuck_seen = set(stuck)
+    for job_id, exec_id in processing_with_exec:
+        if job_id in _stuck_seen:
+            continue
+        state = (execution_status(exec_id) or "").lower()
+        if state in _DEAD_EXEC_STATES:
+            logging.warning(
+                f"REAPER: processing job_id={job_id} has terminal execution status='{state}' "
+                f"— reconciling early (not waiting REAPER_STUCK_MINUTES)"
+            )
+            stuck.append(job_id)
+            _stuck_seen.add(job_id)
 
     for job_id, exec_id in dispatching:
         if not exec_id:
@@ -3542,6 +3960,8 @@ def _handle_onetime_payment(session: dict, event_id: str):
         credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_ONE_TIME)
         conn.commit()  # claim + grant + ledger row commit atomically
         logging.info(f"One-time purchase: user={user_id} plan={plan} +{credits} credits")
+        _write_event(user_id, "payment.one_time", target=event_id,
+                     detail={"plan": plan, "credits": credits})
     finally:
         conn.close()
 
@@ -3617,6 +4037,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
         credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
         conn.commit()  # claim + activation + ledger row commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
+        _write_event(user_id, "payment.monthly", target=event_id,
+                     detail={"plan": plan, "credits": credits})
     finally:
         conn.close()
 
@@ -3977,6 +4399,662 @@ def _delete_blobs(container_name: str, prefix: str) -> int:
     return n
 
 
+# ── Super-Admin API (Priority 1: role-gated, read-only platform views) ────────
+# Every endpoint is gated by require_admin (internal-tenant token + "Admin" app role). These are
+# PLATFORM-WIDE reads (all users/jobs), NOT the caller's own data — the gap Jayasri's report calls
+# out. Reads only for now; mutations (credit adjust, suspend, refund) come next and each writes an
+# audit event. Fails 401 (bad/missing token or admin API not configured) or 403 (valid but not admin).
+def _require_admin_or_response(req: func.HttpRequest):
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        return require_admin(token), None
+    except NotAdminError as e:
+        logging.info(f"admin gate: forbidden — {e}")
+        return None, func.HttpResponse(
+            json.dumps({"error": "forbidden", "message": "Admin role required."}),
+            mimetype="application/json", status_code=403)
+    except Exception as e:
+        logging.info(f"admin gate: unauthorized — {e}")
+        return None, func.HttpResponse("Unauthorized", status_code=401)
+
+
+def _admin_page(req: func.HttpRequest):
+    """Clamp pagination: limit 1..200 (default 50), offset >= 0."""
+    try:
+        limit = max(1, min(200, int(req.params.get("limit", "50"))))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(req.params.get("offset", "0")))
+    except (TypeError, ValueError):
+        offset = 0
+    return limit, offset
+
+
+@app.route(route="superadmin/dashboard/summary", methods=["GET"])
+def admin_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    cur = get_db().cursor()
+
+    def scalar(sql):
+        cur.execute(sql)
+        r = cur.fetchone()
+        return r[0] if r and r[0] is not None else 0
+
+    avg_secs = scalar(
+        "SELECT AVG(CAST(DATEDIFF(SECOND, dispatched_at, completed_at) AS FLOAT)) FROM jobs "
+        "WHERE status='completed' AND completed_at IS NOT NULL AND dispatched_at IS NOT NULL "
+        "AND completed_at >= DATEADD(DAY,-1,GETUTCDATE())")
+    return func.HttpResponse(json.dumps({
+        "users": {
+            "total": scalar("SELECT COUNT(*) FROM users"),
+            "new_30d": scalar("SELECT COUNT(*) FROM users WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "active_30d": scalar("SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "paying": scalar("SELECT COUNT(DISTINCT user_id) FROM credit_transactions WHERE transaction_type LIKE 'purchase%'"),
+            "suspended": scalar("SELECT COUNT(*) FROM users WHERE suspended_at IS NOT NULL"),
+            "active_subscriptions": scalar(
+                "SELECT COUNT(*) FROM users WHERE subscription_type = 'monthly' AND subscription_cancel_at IS NULL"),
+        },
+        "jobs": {
+            "total": scalar("SELECT COUNT(*) FROM jobs"),
+            "completed_all_time": scalar("SELECT COUNT(*) FROM jobs WHERE status='completed'"),
+            "today": scalar("SELECT COUNT(*) FROM jobs WHERE created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "completed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='completed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "failed_today": scalar("SELECT COUNT(*) FROM jobs WHERE status='failed' AND created_at >= CAST(GETUTCDATE() AS DATE)"),
+            "queue_depth": scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','dispatching','processing','waiting_lora')"),
+            "avg_processing_seconds": round(float(avg_secs), 1) if avg_secs else 0,
+            "total_images_generated": scalar("SELECT SUM(credits_consumed) FROM jobs WHERE status='completed'"),
+        },
+        "billing": {
+            "credits_purchased_30d": scalar(
+                "SELECT SUM(amount) FROM credit_transactions WHERE transaction_type LIKE 'purchase%' "
+                "AND created_at >= DATEADD(DAY,-30,GETUTCDATE())"),
+            "credits_used_all_time": scalar("SELECT SUM(credits_consumed) FROM jobs"),
+            "note": "currency revenue needs the Stripe/plan-price join (not wired yet). "
+                    "total_images_generated is credits_consumed on completed jobs (1 credit = 1 image).",
+        },
+        "organizations": {"total": scalar("SELECT COUNT(*) FROM organizations")},
+        "support": {"open": 0, "note": "no support-ticket table yet"},
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users", methods=["GET"])
+def admin_list_users(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    q = (req.params.get("q") or "").strip()
+    cur = get_db().cursor()
+    where, args = "", []
+    if q:
+        where = "WHERE (email LIKE ? OR full_name LIKE ? OR CAST(user_id AS varchar(36)) LIKE ?)"
+        args = [f"%{q}%"] * 3
+    cur.execute(f"SELECT COUNT(*) FROM users {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT user_id, email, full_name, plan_name, subscription_type, lora_status, "
+        f"credits_remaining, one_time_credits_remaining, monthly_credits_remaining, created_at "
+        f"FROM users {where} ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        *(args + [offset, limit]))
+    users = [{
+        "user_id": str(r[0]), "email": r[1], "full_name": r[2], "plan_name": r[3],
+        "subscription_type": r[4], "lora_status": r[5],
+        "credits": int((r[7] or 0) + (r[8] or 0)) if (r[7] is not None or r[8] is not None) else int(r[6] or 0),
+        "one_time_credits": int(r[7] or 0), "monthly_credits": int(r[8] or 0),
+        "created_at": _utc_iso(r[9]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"users": users, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}", methods=["GET"])
+def admin_user_detail(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    cur = get_db().cursor()
+    cur.execute(
+        "SELECT user_id, email, full_name, plan_name, subscription_type, subscription_plan, "
+        "lora_status, retrain_count, credits_remaining, one_time_credits_remaining, "
+        "monthly_credits_remaining, created_at, subscription_start, subscription_end, "
+        "stripe_customer_id, terms_accepted_at, suspended_at FROM users WHERE user_id = ?", user_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("User not found", status_code=404)
+    user = {
+        "user_id": str(r[0]), "email": r[1], "full_name": r[2], "plan_name": r[3],
+        "subscription_type": r[4], "subscription_plan": r[5], "lora_status": r[6],
+        "retrain_count": int(r[7] or 0), "credits_remaining": int(r[8] or 0),
+        "one_time_credits_remaining": int(r[9] or 0), "monthly_credits_remaining": int(r[10] or 0),
+        "created_at": _utc_iso(r[11]), "subscription_start": _utc_iso(r[12]),
+        "subscription_end": _utc_iso(r[13]), "stripe_customer_id": r[14],
+        "terms_accepted_at": _utc_iso(r[15]),
+        "suspended": r[16] is not None, "suspended_at": _utc_iso(r[16]),
+        "account_status": "suspended" if r[16] is not None else "active",
+    }
+    # internal support notes (most recent first)
+    cur.execute("SELECT admin_email, note, created_at FROM admin_user_notes "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["notes"] = [{"admin_email": n[0], "note": n[1], "created_at": _utc_iso(n[2])}
+                     for n in cur.fetchall()]
+    cur.execute("SELECT TOP 20 job_id, status, category, credits_consumed, created_at, completed_at "
+                "FROM jobs WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["recent_jobs"] = [{
+        "job_id": str(j[0]), "status": j[1], "category": j[2],
+        "credits_consumed": int(j[3] or 0), "created_at": _utc_iso(j[4]), "completed_at": _utc_iso(j[5]),
+    } for j in cur.fetchall()]
+    cur.execute("SELECT TOP 30 amount, transaction_type, job_id, created_at FROM credit_transactions "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    user["credit_ledger"] = [{
+        "amount": int(t[0]), "type": t[1], "job_id": str(t[2]) if t[2] else None, "created_at": _utc_iso(t[3]),
+    } for t in cur.fetchall()]
+    return func.HttpResponse(json.dumps(user), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs", methods=["GET"])
+def admin_list_jobs(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    status_f = (req.params.get("status") or "").strip()
+    user_f = (req.params.get("user_id") or "").strip()
+    cur = get_db().cursor()
+    clauses, args = [], []
+    if status_f:
+        clauses.append("j.status = ?"); args.append(status_f)
+    if user_f:
+        clauses.append("j.user_id = ?"); args.append(user_f)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur.execute(f"SELECT COUNT(*) FROM jobs j {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT j.job_id, j.user_id, u.email, j.status, j.category, j.source_type, "
+        f"j.credits_consumed, j.created_at, j.completed_at, j.external_execution_id "
+        f"FROM jobs j LEFT JOIN users u ON u.user_id = j.user_id {where} "
+        f"ORDER BY j.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        *(args + [offset, limit]))
+    jobs = [{
+        "job_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "status": r[3],
+        "category": r[4], "source_type": r[5], "credits_consumed": int(r[6] or 0),
+        "created_at": _utc_iso(r[7]), "completed_at": _utc_iso(r[8]), "execution_id": r[9],
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"jobs": jobs, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}", methods=["GET"])
+def admin_job_detail(req: func.HttpRequest) -> func.HttpResponse:
+    _admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute(
+        "SELECT j.job_id, j.user_id, u.email, j.status, j.category, j.source_type, j.job_type, "
+        "j.credits_consumed, j.created_at, j.dispatched_at, j.completed_at, j.external_execution_id, "
+        "j.output_blob_path, j.job_params FROM jobs j LEFT JOIN users u ON u.user_id = j.user_id "
+        "WHERE j.job_id = ?", job_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("Not found", status_code=404)
+    try:
+        params = json.loads(r[13]) if r[13] else {}
+    except (TypeError, ValueError):
+        params = {}
+    try:
+        images = json.loads(r[12]) if r[12] else []
+        image_count = len(images) if isinstance(images, list) else 0
+    except (TypeError, ValueError):
+        image_count = 0
+    proc_secs = None
+    if r[9] and r[10]:
+        try:
+            proc_secs = int((r[10] - r[9]).total_seconds())
+        except Exception:
+            proc_secs = None
+    return func.HttpResponse(json.dumps({
+        "job_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "status": r[3],
+        "category": r[4], "source_type": r[5], "job_type": r[6], "credits_consumed": int(r[7] or 0),
+        "created_at": _utc_iso(r[8]), "dispatched_at": _utc_iso(r[9]), "completed_at": _utc_iso(r[10]),
+        "execution_id": r[11], "image_count": image_count, "processing_seconds": proc_secs,
+        "params": params,
+    }), mimetype="application/json", status_code=200)
+
+
+# ── Admin helpers: JSON body + immutable audit write ──────────────────────────
+def _admin_json_body(req: func.HttpRequest):
+    """(body_dict, None) or (None, 400 response)."""
+    try:
+        body = req.get_json()
+        return (body if isinstance(body, dict) else {}), None
+    except Exception:
+        return None, func.HttpResponse(
+            json.dumps({"error": "invalid JSON body"}), mimetype="application/json", status_code=400)
+
+
+def _write_audit(cur, admin, action, target_type=None, target_id=None,
+                 previous=None, new=None, reason=None, result="success"):
+    """Append one admin-audit row using the CALLER'S cursor, so it commits atomically with the
+    mutation in a transaction. Best-effort: an audit failure is logged, never fatal to the action."""
+    try:
+        cur.execute(
+            "INSERT INTO admin_audit_log (actor_id, actor_email, action, target_type, target_id, "
+            "previous_value, new_value, reason, result) VALUES (?,?,?,?,?,?,?,?,?)",
+            (admin or {}).get("oid"), (admin or {}).get("email"), action, target_type,
+            str(target_id) if target_id is not None else None,
+            json.dumps(previous) if previous is not None else None,
+            json.dumps(new) if new is not None else None, reason, result)
+    except Exception as e:
+        logging.warning(f"audit write failed action={action}: {e}")
+
+
+@app.route(route="superadmin/me", methods=["GET"])
+def admin_me(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    return func.HttpResponse(json.dumps({
+        "oid": admin["oid"], "email": admin["email"], "name": admin["name"], "roles": admin["roles"],
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/audit-logs", methods=["GET"])
+def admin_audit_logs(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    clauses, args = [], []
+    for col, key in (("target_type", "target_type"), ("target_id", "target_id")):
+        v = (req.params.get(key) or "").strip()
+        if v:
+            clauses.append(f"{col} = ?"); args.append(v)
+    act = (req.params.get("action") or "").strip()
+    if act:
+        clauses.append("action LIKE ?"); args.append(f"%{act}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur = get_db().cursor()
+    cur.execute(f"SELECT COUNT(*) FROM admin_audit_log {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT event_id, actor_email, action, target_type, target_id, previous_value, new_value, "
+        f"reason, result, created_at FROM admin_audit_log {where} "
+        f"ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", *(args + [offset, limit]))
+    events = [{
+        "event_id": str(r[0]), "actor_email": r[1], "action": r[2], "target_type": r[3],
+        "target_id": r[4], "previous_value": r[5], "new_value": r[6], "reason": r[7],
+        "result": r[8], "created_at": _utc_iso(r[9]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"events": events, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/suspend", methods=["POST"])
+def admin_suspend_user(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT suspended_at FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        cur.execute("UPDATE users SET suspended_at = SYSUTCDATETIME() "
+                    "WHERE user_id = ? AND suspended_at IS NULL", user_id)
+        _write_audit(cur, admin, "user.suspended", "user", user_id,
+                     previous={"suspended": row[0] is not None}, new={"suspended": True}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"user_id": str(user_id), "suspended": True}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/reactivate", methods=["POST"])
+def admin_reactivate_user(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip() or "reactivated"
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT suspended_at FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        cur.execute("UPDATE users SET suspended_at = NULL WHERE user_id = ?", user_id)
+        _write_audit(cur, admin, "user.reactivated", "user", user_id,
+                     previous={"suspended": row[0] is not None}, new={"suspended": False}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"user_id": str(user_id), "suspended": False}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/notes", methods=["GET", "POST"])
+def admin_user_notes(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    cur = get_db().cursor()
+    if req.method == "POST":
+        body, berr = _admin_json_body(req)
+        if berr:
+            return berr
+        note = (body.get("note") or "").strip()
+        if not note:
+            return func.HttpResponse(json.dumps({"error": "note required"}),
+                                     mimetype="application/json", status_code=400)
+        cur.execute("INSERT INTO admin_user_notes (user_id, admin_id, admin_email, note) VALUES (?,?,?,?)",
+                    user_id, admin["oid"], admin["email"], note[:4000])
+        _write_audit(cur, admin, "user.note_added", "user", user_id, new={"note": note[:200]})
+        return func.HttpResponse(json.dumps({"status": "added"}),
+                                 mimetype="application/json", status_code=201)
+    cur.execute("SELECT admin_email, note, created_at FROM admin_user_notes "
+                "WHERE user_id = ? ORDER BY created_at DESC", user_id)
+    notes = [{"admin_email": r[0], "note": r[1], "created_at": _utc_iso(r[2])} for r in cur.fetchall()]
+    return func.HttpResponse(json.dumps({"notes": notes}), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/users/{user_id}/credits/adjust", methods=["POST"])
+def admin_adjust_credits(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    user_id = req.route_params.get("user_id")
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    try:
+        amount = int(body.get("amount"))
+    except (TypeError, ValueError):
+        return func.HttpResponse(json.dumps({"error": "amount must be an integer"}),
+                                 mimetype="application/json", status_code=400)
+    if amount == 0:
+        return func.HttpResponse(json.dumps({"error": "amount must be non-zero"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT credits_remaining, one_time_credits_remaining, monthly_credits_remaining "
+                    "FROM users WHERE user_id = ?", user_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("User not found", status_code=404)
+        before = {"legacy": int(row[0] or 0), "one_time": int(row[1] or 0), "monthly": int(row[2] or 0)}
+        # Adjust the one_time bucket (+ legacy mirror). A deduction never drives the bucket below 0.
+        new_one_time = before["one_time"] + amount if amount > 0 else max(0, before["one_time"] + amount)
+        applied = new_one_time - before["one_time"]
+        cur.execute("UPDATE users SET one_time_credits_remaining = ?, "
+                    "credits_remaining = credits_remaining + ? WHERE user_id = ?",
+                    new_one_time, applied, user_id)
+        cur.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type) VALUES (?,?,?)",
+                    user_id, applied, "admin_adjust")
+        after = {**before, "one_time": new_one_time, "legacy": before["legacy"] + applied}
+        _write_audit(cur, admin, "user.credits.adjusted", "user", user_id,
+                     previous=before, new=after, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({
+        "user_id": str(user_id), "requested": amount, "applied": applied,
+        "one_time_credits_remaining": new_one_time,
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/credits", methods=["GET"])
+def admin_credits_ledger(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    clauses, args = [], []
+    uf = (req.params.get("user_id") or "").strip()
+    tf = (req.params.get("type") or "").strip()
+    if uf:
+        clauses.append("t.user_id = ?"); args.append(uf)
+    if tf:
+        clauses.append("t.transaction_type = ?"); args.append(tf)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cur = get_db().cursor()
+    cur.execute(f"SELECT COUNT(*) FROM credit_transactions t {where}", *args)
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT t.transaction_id, t.user_id, u.email, t.amount, t.transaction_type, t.job_id, t.created_at "
+        f"FROM credit_transactions t LEFT JOIN users u ON u.user_id = t.user_id {where} "
+        f"ORDER BY t.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", *(args + [offset, limit]))
+    entries = [{
+        "transaction_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "amount": int(r[3] or 0),
+        "type": r[4], "job_id": str(r[5]) if r[5] else None, "created_at": _utc_iso(r[6]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"entries": entries, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/cancel", methods=["POST"])
+def admin_cancel_job(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute("SELECT status, external_execution_id FROM jobs WHERE job_id = ?", job_id)
+    row = cur.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    status, exec_id = (row[0] or "").strip(), row[1]
+    if status in ("completed", "failed"):
+        return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": status, "cancelled": False}),
+                                 mimetype="application/json", status_code=200)
+    if exec_id:
+        try:
+            from shared.queue_trigger import stop_execution
+            stop_execution(exec_id)
+        except Exception as e:
+            logging.warning(f"admin_cancel_job stop failed job={job_id}: {e}")
+    _mark_failed(job_id)  # fail + refund, guarded once
+    _write_audit(get_db().cursor(), admin, "job.cancelled", "job", str(job_id),
+                 previous={"status": status}, new={"status": "failed"})
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/retry", methods=["POST"])
+def admin_retry_job(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cur = get_db().cursor()
+    cur.execute("SELECT status, user_id, job_params FROM jobs WHERE job_id = ?", job_id)
+    r = cur.fetchone()
+    if not r:
+        return func.HttpResponse("Not found", status_code=404)
+    status = (r[0] or "").strip()
+    if status != "failed":
+        return func.HttpResponse(
+            json.dumps({"error": f"can only retry a failed job (status={status})"}),
+            mimetype="application/json", status_code=409)
+    cur.execute("UPDATE jobs SET status='queued', external_execution_id=NULL, completed_at=NULL "
+                "WHERE job_id = ?", job_id)
+    try:
+        from shared.queue_client import INFERENCE_QUEUE, enqueue_job
+        enqueue_job(INFERENCE_QUEUE, {"job_id": str(job_id), "user_id": str(r[1]), "job_params": r[2]})
+    except Exception as e:
+        logging.warning(f"admin_retry_job enqueue failed job={job_id}: {e}")
+    _write_audit(get_db().cursor(), admin, "job.retried", "job", str(job_id),
+                 previous={"status": status}, new={"status": "queued"})
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": "queued"}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/jobs/{job_id}/restore-credit", methods=["POST"])
+def admin_restore_credit(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    body, berr = _admin_json_body(req)
+    if berr:
+        return berr
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        return func.HttpResponse(json.dumps({"error": "reason required"}),
+                                 mimetype="application/json", status_code=400)
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, job_params FROM jobs WHERE job_id = ?", job_id)
+        r = cur.fetchone()
+        if not r:
+            conn.rollback()
+            return func.HttpResponse("Not found", status_code=404)
+        try:
+            cost = max(1, int(json.loads(r[1]).get("credit_cost", 1)))
+        except Exception:
+            cost = 1
+        cur.execute("UPDATE users SET one_time_credits_remaining = one_time_credits_remaining + ?, "
+                    "credits_remaining = credits_remaining + ? WHERE user_id = ?", cost, cost, r[0])
+        cur.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type, job_id) "
+                    "VALUES (?,?,?,?)", r[0], cost, "admin_restore", job_id)
+        _write_audit(cur, admin, "job.credits_restored", "job", str(job_id),
+                     new={"restored": cost}, reason=reason)
+        conn.commit()
+    finally:
+        conn.close()
+    return func.HttpResponse(json.dumps({"job_id": str(job_id), "restored": cost}),
+                             mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/payments", methods=["GET"])
+def admin_payments(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    cur = get_db().cursor()
+    cur.execute("SELECT COUNT(*) FROM credit_transactions WHERE transaction_type LIKE 'purchase%'")
+    total = cur.fetchone()[0]
+    cur.execute(
+        "SELECT t.transaction_id, t.user_id, u.email, u.stripe_customer_id, t.amount, "
+        "t.transaction_type, t.created_at FROM credit_transactions t "
+        "LEFT JOIN users u ON u.user_id = t.user_id WHERE t.transaction_type LIKE 'purchase%' "
+        "ORDER BY t.created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", offset, limit)
+    payments = [{
+        "transaction_id": str(r[0]), "user_id": str(r[1]), "email": r[2], "stripe_customer_id": r[3],
+        "credits_granted": int(r[4] or 0), "type": r[5], "created_at": _utc_iso(r[6]),
+    } for r in cur.fetchall()]
+    return func.HttpResponse(json.dumps({
+        "payments": payments, "total": total, "limit": limit, "offset": offset,
+        "note": "credit-grant records from the ledger; currency amounts + Stripe refunds need the "
+                "Stripe API join (not wired yet — use /jobs/{id}/restore-credit or credits/adjust to "
+                "return credits).",
+    }), mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/subscriptions", methods=["GET"])
+def admin_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    limit, offset = _admin_page(req)
+    cur = get_db().cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE subscription_type IS NOT NULL")
+    total = cur.fetchone()[0]
+    cur.execute(
+        "SELECT user_id, email, subscription_type, subscription_plan, monthly_credits_remaining, "
+        "subscription_start, subscription_end, subscription_cancel_at, payment_failed_at "
+        "FROM users WHERE subscription_type IS NOT NULL "
+        "ORDER BY subscription_start DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", offset, limit)
+    subs = [{
+        "user_id": str(r[0]), "email": r[1], "subscription_type": r[2], "subscription_plan": r[3],
+        "monthly_credits_remaining": int(r[4] or 0), "start": _utc_iso(r[5]), "end": _utc_iso(r[6]),
+        "cancel_at": _utc_iso(r[7]), "payment_failed": r[8] is not None,
+    } for r in cur.fetchall()]
+    return func.HttpResponse(
+        json.dumps({"subscriptions": subs, "total": total, "limit": limit, "offset": offset}),
+        mimetype="application/json", status_code=200)
+
+
+@app.route(route="superadmin/system-health", methods=["GET"])
+def admin_system_health(req: func.HttpRequest) -> func.HttpResponse:
+    admin, err = _require_admin_or_response(req)
+    if err:
+        return err
+    health = {}
+    try:
+        get_db().cursor().execute("SELECT 1")
+        health["sql"] = "ok"
+    except Exception as e:
+        health["sql"] = f"error: {str(e)[:100]}"
+    try:
+        get_blob_client().get_container_client("outputs").get_container_properties()
+        health["blob"] = "ok"
+    except Exception as e:
+        health["blob"] = f"error: {str(e)[:100]}"
+    try:
+        from shared.queue_trigger import count_active_job_executions
+        health["gpu_active_executions"] = count_active_job_executions()
+    except Exception as e:
+        health["gpu_active_executions"] = f"error: {str(e)[:100]}"
+    try:
+        cur = get_db().cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE status IN "
+                    "('queued','dispatching','processing','waiting_lora')")
+        health["queue_depth"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE status='failed' "
+                    "AND created_at >= DATEADD(DAY,-1,GETUTCDATE())")
+        health["failed_jobs_24h"] = cur.fetchone()[0]
+    except Exception as e:
+        health["queue_depth"] = f"error: {str(e)[:100]}"
+    return func.HttpResponse(json.dumps(health), mimetype="application/json", status_code=200)
+
+
 @app.timer_trigger(schedule="0 0 * * * *", arg_name="timer", run_on_startup=False)
 def retention_cleanup(timer: func.TimerRequest) -> None:
     """Hourly: for users past their retention window, delete BLOBS (photos, LoRA,
@@ -4059,6 +5137,9 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
         logging.info(
             f"retention_cleanup: user={user_id} deleted photos={n_photos} lora={n_lora} "
             f"results={n_results} jobs_expired={len(job_ids)}")
+        _write_event(user_id, "retention.delete",
+                     detail={"photos": n_photos, "lora": n_lora, "results": n_results,
+                             "jobs_expired": len(job_ids)})
 
 
 # ── Monthly credit renewal ───────────────────────────────

@@ -37,3 +37,4 @@ Bettersnap-aI_Backend/*
 !Bettersnap-aI_Backend/shared
 Bettersnap-aI_Backend/shared/*
 !Bettersnap-aI_Backend/shared/catalog.py
+!Bettersnap-aI_Backend/shared/catalog_data.py

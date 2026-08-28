@@ -126,7 +126,9 @@ def _install_stubs():
     _mod("azure.storage.blob",
          generate_blob_sas=mock.Mock(return_value="sas"), BlobSasPermissions=mock.Mock())
     _mod("shared.auth", validate_token=mock.Mock(return_value={"oid": "user-1"}),
-         get_user_id=mock.Mock(return_value="user-1"))
+         get_user_id=mock.Mock(return_value="user-1"),
+         require_admin=mock.Mock(return_value={"oid": "admin", "email": "admin@test", "name": "Admin", "roles": ["Admin"]}),
+         NotAdminError=type("NotAdminError", (Exception,), {}))
     _mod("shared.db", get_db=mock.Mock(), new_connection=mock.Mock())
     _mod("shared.queue_client",
          enqueue_job=mock.Mock(), enqueue_training_job=mock.Mock(),
@@ -248,7 +250,7 @@ class ImageCountValidationTests(unittest.TestCase):
     mocked to succeed and to capture the job_params the handler built, so the CLAMP production
     applies (max(1, min(min_session, credits), min(requested, monthly, credits))) is measured."""
 
-    PLAN_ROW = ("monthly_pro", "ready", 200, 0)  # plan_name, lora_status, credits_remaining, one_time_credits_remaining
+    PLAN_ROW = ("monthly_pro", "ready", 200, 0, None)  # plan_name, lora_status, credits_remaining, one_time_credits_remaining, suspended_at
     MONTHLY_CAP = 40                            # monthly_pro.monthly_images
     MIN_SESSION = 5                             # monthly_pro.min_session_images
 

@@ -26,17 +26,18 @@ def _valid_ref_pool():
     of arbitrary shape in the permutation test."""
     attires, backgrounds = [], []
     for cat, data in catalog.CATEGORY_CATALOG.items():
-        for aid in (data.get("attires") or {}):
+        # Attires are gender-keyed now; the 'other' set gives a stable distinct pool.
+        for aid in (data.get("attires", {}).get("other") or {}):
             attires.append(f"{cat}.{aid}")
         for bid in (data.get("backgrounds") or {}):
             backgrounds.append(f"{cat}.{bid}")
     return attires, backgrounds
 
 
-ATTIRES = ["business_suit.navy_suit_tie", "business_suit.charcoal_three_piece"]
+ATTIRES = ["business_suit.navy_suit_tie", "business_suit.charcoal_suit_tie"]
 BGS = [
-    "business_suit.studio_gray", "business_suit.studio_white",
-    "business_suit.modern_office", "business_suit.exec_office",
+    "business_suit.light_gray_studio", "business_suit.white_studio",
+    "business_suit.modern_office", "business_suit.executive_office",
     "business_suit.corporate_lobby",
 ]
 
@@ -62,10 +63,10 @@ class BuildCombosCoverage(unittest.TestCase):
     def test_monthly_pro_3x3_on_5_covers_all_attires_and_backgrounds(self):
         # The realistic in-product regression: 3x3 combos on a default 5-image session used to
         # drop the third attire.
-        attires = ["business_suit.navy_suit_tie", "business_suit.charcoal_three_piece",
-                   "dating.knit_sweater"]
-        bgs = ["business_suit.studio_gray", "business_suit.modern_office",
-               "beach_sunset.beach_sunset"]
+        attires = ["business_suit.navy_suit_tie", "business_suit.charcoal_suit_tie",
+                   "dating.crew_neck_sweater"]
+        bgs = ["business_suit.light_gray_studio", "business_suit.modern_office",
+               "beach_sunset.golden_hour_beach"]
         delivered = _delivered(attires, bgs, 5)
         self.assertEqual({a for a, _ in delivered}, set(attires))
         self.assertEqual({b for _, b in delivered}, set(bgs))
@@ -82,8 +83,8 @@ class BuildCombosCoverage(unittest.TestCase):
     def test_dedupe_and_invalid_refs_dropped(self):
         combos = catalog.build_combos_global(
             ["business_suit.navy_suit_tie", "business_suit.navy_suit_tie", "business_suit.NOPE"],
-            ["business_suit.studio_gray", "business_suit.studio_gray"])
-        self.assertEqual(combos, [("business_suit.navy_suit_tie", "business_suit.studio_gray")])
+            ["business_suit.light_gray_studio", "business_suit.light_gray_studio"])
+        self.assertEqual(combos, [("business_suit.navy_suit_tie", "business_suit.light_gray_studio")])
 
     def test_single_dimensions_and_empty(self):
         self.assertEqual(len(catalog.build_combos_global(ATTIRES[:1], BGS)), 5)   # 1 attire

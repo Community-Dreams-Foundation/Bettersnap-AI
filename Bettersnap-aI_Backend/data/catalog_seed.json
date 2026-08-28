@@ -1,0 +1,567 @@
+{
+  "_meta": {
+    "note": "Authored source of truth for the DB catalog + generated shared/catalog_data.py. Keys derive from labels: attire_key = snake(label), ref = '<category>.<attire_key>', image_key = kebab(label). Image path composed per gender: /catalog/<gender>/<attires|backgrounds>/<image_key>_<gender>.jpg. Only prompt phrases are hand-authored. Labels are copied verbatim from the source JSON so they match the /public/catalog filenames.",
+    "genders": ["male", "female", "other"]
+  },
+
+  "business_suit": {
+    "label": "Business Suit",
+    "category_type": "professional",
+    "lead_phrase": "A professional corporate headshot photograph of",
+    "lighting": null,
+    "sort_order": 1,
+    "attires": {
+      "male": [
+        { "label": "Navy Suit & Tie",       "phrase": "a sharp navy-blue business suit with a crisp white dress shirt and a silk tie" },
+        { "label": "Charcoal Suit & Tie",    "phrase": "a tailored charcoal-grey business suit with a white dress shirt and a silk tie" },
+        { "label": "Black Suit & Tie",       "phrase": "a classic black business suit with a white dress shirt and a dark tie" },
+        { "label": "Navy Suit - No Tie",     "phrase": "a navy-blue business suit with an open-collar white dress shirt, no tie" },
+        { "label": "Charcoal Suit - No Tie", "phrase": "a charcoal-grey business suit with an open-collar white shirt, no tie" },
+        { "label": "Blazer & Dress Shirt",   "phrase": "a tailored blazer over a crisp white dress shirt, sharp business style" },
+        { "label": "Double-Breasted Suit",   "phrase": "a double-breasted navy business suit with a white shirt and a silk tie" },
+        { "label": "Three-Piece Suit",       "phrase": "a charcoal three-piece business suit with a matching waistcoat, white shirt and tie" }
+      ],
+      "female": [
+        { "label": "Navy Pantsuit",                     "phrase": "a tailored navy-blue pantsuit with a crisp white blouse" },
+        { "label": "Charcoal Pantsuit",                 "phrase": "a tailored charcoal-grey pantsuit with a silk blouse" },
+        { "label": "Black Pantsuit",                    "phrase": "a classic black pantsuit with a white blouse" },
+        { "label": "Tailored Blazer & Blouse",          "phrase": "a tailored blazer over an elegant blouse, polished business style" },
+        { "label": "Professional Dress & Blazer",       "phrase": "a professional sheath dress under a tailored blazer" },
+        { "label": "Skirt Suit",                        "phrase": "a tailored skirt suit with a matching blazer and a smart blouse" },
+        { "label": "Double-Breasted Blazer & Trousers", "phrase": "a double-breasted blazer with tailored trousers and a crisp blouse" },
+        { "label": "Tailored Blazer & Dress",           "phrase": "a tailored blazer worn over a professional dress" }
+      ],
+      "other": [
+        { "label": "Navy Tailored Suit",        "phrase": "a well-fitted navy-blue tailored suit" },
+        { "label": "Charcoal Tailored Suit",    "phrase": "a well-fitted charcoal-grey tailored suit" },
+        { "label": "Black Tailored Suit",       "phrase": "a well-fitted classic black tailored suit" },
+        { "label": "Suit - No Tie",             "phrase": "a tailored suit with an open-collar shirt, no tie" },
+        { "label": "Structured Blazer & Shirt", "phrase": "a structured blazer over a crisp collared shirt" },
+        { "label": "Blazer & High-Neck Top",    "phrase": "a tailored blazer over a smart high-neck top" },
+        { "label": "Double-Breasted Suit",      "phrase": "a double-breasted tailored suit with a crisp shirt" },
+        { "label": "Blazer & Tailored Trousers","phrase": "a tailored blazer with matching tailored trousers" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Light Gray Studio",   "phrase": "against a smooth light-gray photography studio backdrop" },
+      { "label": "White Studio",        "phrase": "against a clean pure-white photography studio backdrop" },
+      { "label": "Modern Office",       "phrase": "in a modern corporate office with softly blurred glass walls behind" },
+      { "label": "Executive Office",    "phrase": "in an executive office with a softly blurred city skyline through the window" },
+      { "label": "Corporate Lobby",     "phrase": "in a polished corporate lobby with softly blurred modern architecture" },
+      { "label": "Conference Room",     "phrase": "in a modern conference room softly blurred behind" },
+      { "label": "City Skyline",        "phrase": "in front of a softly blurred city skyline" },
+      { "label": "Modern Architecture", "phrase": "against softly blurred modern architectural lines" }
+    ]
+  },
+
+  "healthcare": {
+    "label": "Healthcare",
+    "category_type": "professional",
+    "lead_phrase": "A professional medical portrait photograph of",
+    "lighting": null,
+    "sort_order": 2,
+    "attires": {
+      "male": [
+        { "label": "White Coat & Dress Shirt", "phrase": "a clean white medical coat over a collared dress shirt with a stethoscope" },
+        { "label": "White Coat & Tie",         "phrase": "a clean white medical coat over a shirt and tie with a stethoscope" },
+        { "label": "White Coat & Scrubs",      "phrase": "a clean white medical coat over light-blue scrubs with a stethoscope" },
+        { "label": "Navy Medical Scrubs",      "phrase": "navy-blue medical scrubs with a lanyard ID badge" },
+        { "label": "Blue Medical Scrubs",      "phrase": "light-blue medical scrubs with a stethoscope" },
+        { "label": "Green Medical Scrubs",     "phrase": "surgical-green medical scrubs with a lanyard ID badge" },
+        { "label": "Business Professional",    "phrase": "professional business attire, a collared shirt and blazer" },
+        { "label": "Lab Coat",                 "phrase": "a crisp white lab coat over a collared shirt" }
+      ],
+      "female": [
+        { "label": "White Coat & Blouse",  "phrase": "a clean white medical coat over a professional blouse with a stethoscope" },
+        { "label": "White Coat & Dress",   "phrase": "a clean white medical coat over a professional dress with a stethoscope" },
+        { "label": "White Coat & Scrubs",  "phrase": "a clean white medical coat over light-blue scrubs with a stethoscope" },
+        { "label": "Navy Medical Scrubs",  "phrase": "navy-blue medical scrubs with a lanyard ID badge" },
+        { "label": "Blue Medical Scrubs",  "phrase": "light-blue medical scrubs with a stethoscope" },
+        { "label": "Green Medical Scrubs", "phrase": "surgical-green medical scrubs with a lanyard ID badge" },
+        { "label": "Business Professional","phrase": "professional business attire, an elegant blouse and blazer" },
+        { "label": "Lab Coat",             "phrase": "a crisp white lab coat over a professional blouse" }
+      ],
+      "other": [
+        { "label": "White Coat & Professional Shirt", "phrase": "a clean white medical coat over a professional collared shirt with a stethoscope" },
+        { "label": "White Coat & Scrubs",             "phrase": "a clean white medical coat over light-blue scrubs with a stethoscope" },
+        { "label": "White Coat & High-Neck Top",      "phrase": "a clean white medical coat over a smart high-neck top with a stethoscope" },
+        { "label": "Navy Medical Scrubs",             "phrase": "navy-blue medical scrubs with a lanyard ID badge" },
+        { "label": "Blue Medical Scrubs",             "phrase": "light-blue medical scrubs with a stethoscope" },
+        { "label": "Green Medical Scrubs",            "phrase": "surgical-green medical scrubs with a lanyard ID badge" },
+        { "label": "Business Professional",           "phrase": "professional business attire, a structured shirt and blazer" },
+        { "label": "Lab Coat",                        "phrase": "a crisp white lab coat over a professional shirt" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Medical Clinic",     "phrase": "in a bright modern medical clinic softly blurred behind" },
+      { "label": "Hospital",           "phrase": "in a clean modern hospital setting softly blurred behind" },
+      { "label": "Doctor Office",      "phrase": "in a tidy doctor's office softly blurred behind" },
+      { "label": "Hospital Corridor",  "phrase": "in a bright hospital corridor with softly blurred medical equipment" },
+      { "label": "Exam Room",          "phrase": "in a modern medical exam room softly blurred behind" },
+      { "label": "Healthcare Office",  "phrase": "in a bright healthcare office with softly blurred shelving" },
+      { "label": "Hospital Lobby",     "phrase": "in a spacious hospital lobby softly blurred behind" },
+      { "label": "Medical Laboratory", "phrase": "in a clean medical laboratory with softly blurred equipment" }
+    ]
+  },
+
+  "realtor": {
+    "label": "Realtor",
+    "category_type": "professional",
+    "lead_phrase": "A professional real-estate agent portrait photograph of",
+    "lighting": null,
+    "sort_order": 3,
+    "attires": {
+      "male": [
+        { "label": "Navy Blazer & Dress Shirt", "phrase": "a smart navy blazer over a crisp white dress shirt, no tie" },
+        { "label": "Gray Blazer & Dress Shirt", "phrase": "a light-grey blazer over a crisp dress shirt" },
+        { "label": "Suit - No Tie",             "phrase": "a modern suit with an open-collar shirt, no tie" },
+        { "label": "Smart Casual Button-Down",  "phrase": "a smart-casual button-down shirt, polished and approachable" },
+        { "label": "Blazer & Polo Shirt",       "phrase": "a tailored blazer over a smart polo shirt" },
+        { "label": "Sweater & Collared Shirt",  "phrase": "a fine knit sweater over a collared shirt" },
+        { "label": "Dress Shirt & Chinos",      "phrase": "a crisp dress shirt with smart chinos, business-casual" },
+        { "label": "Business Casual Blazer",    "phrase": "a relaxed business-casual blazer over a smart shirt" }
+      ],
+      "female": [
+        { "label": "Blazer & Blouse",             "phrase": "an elegant blazer over a smart blouse" },
+        { "label": "Professional Pantsuit",       "phrase": "a tailored professional pantsuit with a soft blouse" },
+        { "label": "Professional Dress",          "phrase": "a polished professional dress" },
+        { "label": "Smart Casual Blouse",         "phrase": "a smart-casual blouse, approachable and professional" },
+        { "label": "Blazer & Professional Dress", "phrase": "a tailored blazer over a professional dress" },
+        { "label": "Cardigan & Blouse",           "phrase": "a soft cardigan over an elegant blouse" },
+        { "label": "Business Casual Outfit",      "phrase": "a chic business-casual outfit" },
+        { "label": "Tailored Blazer & Trousers",  "phrase": "a tailored blazer with matching trousers and a blouse" }
+      ],
+      "other": [
+        { "label": "Tailored Blazer & Shirt",       "phrase": "a tailored blazer over a crisp collared shirt" },
+        { "label": "Blazer & High-Neck Top",        "phrase": "a tailored blazer over a smart high-neck top" },
+        { "label": "Suit - No Tie",                 "phrase": "a modern suit with an open-collar shirt, no tie" },
+        { "label": "Smart Casual Button-Down",      "phrase": "a smart-casual button-down shirt, polished and approachable" },
+        { "label": "Blazer & Knit Top",             "phrase": "a tailored blazer over a fine knit top" },
+        { "label": "Sweater & Collared Shirt",      "phrase": "a fine knit sweater over a collared shirt" },
+        { "label": "Professional Shirt & Trousers", "phrase": "a professional collared shirt with tailored trousers" },
+        { "label": "Business Casual Blazer",        "phrase": "a relaxed business-casual blazer over a smart top" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Modern Home Interior",     "phrase": "in a bright modern home interior softly blurred behind" },
+      { "label": "Luxury Home Interior",     "phrase": "in an upscale luxury home interior softly blurred behind" },
+      { "label": "Real Estate Office",       "phrase": "in a bright modern real-estate office softly blurred behind" },
+      { "label": "Front Porch",              "phrase": "on a welcoming front porch softly blurred behind" },
+      { "label": "Modern Kitchen",           "phrase": "in a beautifully staged modern kitchen softly blurred behind" },
+      { "label": "Living Room",              "phrase": "in a beautifully staged living room softly blurred behind" },
+      { "label": "Luxury Property Exterior", "phrase": "in front of a luxury property exterior softly blurred" },
+      { "label": "Suburban Neighborhood",    "phrase": "on a pleasant suburban street softly blurred behind" }
+    ]
+  },
+
+  "lawyer": {
+    "label": "Lawyer",
+    "category_type": "professional",
+    "lead_phrase": "A professional corporate headshot photograph of",
+    "lighting": null,
+    "sort_order": 4,
+    "attires": {
+      "male": [
+        { "label": "Navy Suit & Tie",       "phrase": "a formal navy suit with a crisp white shirt and a conservative tie" },
+        { "label": "Charcoal Suit & Tie",   "phrase": "a formal charcoal suit with a white shirt and a conservative tie" },
+        { "label": "Black Suit & Tie",      "phrase": "a formal black suit with a white shirt and a dark tie" },
+        { "label": "Dark Suit - No Tie",    "phrase": "a formal dark suit with an open-collar white shirt, no tie" },
+        { "label": "Blazer & Dress Shirt",  "phrase": "a tailored dark blazer over a crisp dress shirt" },
+        { "label": "Three-Piece Suit",      "phrase": "a formal three-piece dark suit with a waistcoat, shirt and tie" },
+        { "label": "Double-Breasted Suit",  "phrase": "a formal double-breasted dark suit with a shirt and tie" },
+        { "label": "Formal Court Attire",   "phrase": "formal court attire, a conservative dark suit with a tie" }
+      ],
+      "female": [
+        { "label": "Tailored Blazer & Blouse",      "phrase": "a formal tailored blazer over a crisp blouse" },
+        { "label": "Professional Pantsuit",         "phrase": "a formal professional pantsuit with a smart blouse" },
+        { "label": "Structured Professional Dress", "phrase": "a structured professional dress, formal and polished" },
+        { "label": "Blazer & High-Neck Blouse",     "phrase": "a tailored blazer over a high-neck blouse" },
+        { "label": "Skirt Suit",                    "phrase": "a formal tailored skirt suit with a smart blouse" },
+        { "label": "Double-Breasted Pantsuit",      "phrase": "a formal double-breasted pantsuit with a blouse" },
+        { "label": "Professional Dress & Jacket",   "phrase": "a professional dress under a tailored jacket" },
+        { "label": "Formal Court Attire",           "phrase": "formal court attire, a conservative tailored suit" }
+      ],
+      "other": [
+        { "label": "Navy Tailored Suit",        "phrase": "a formal well-fitted navy tailored suit" },
+        { "label": "Charcoal Tailored Suit",    "phrase": "a formal well-fitted charcoal tailored suit" },
+        { "label": "Black Tailored Suit",       "phrase": "a formal well-fitted black tailored suit" },
+        { "label": "Dark Suit - No Tie",        "phrase": "a formal dark suit with an open-collar shirt, no tie" },
+        { "label": "Structured Blazer & Shirt", "phrase": "a structured blazer over a crisp collared shirt" },
+        { "label": "Blazer & High-Neck Top",    "phrase": "a tailored blazer over a smart high-neck top" },
+        { "label": "Double-Breasted Suit",      "phrase": "a formal double-breasted tailored suit" },
+        { "label": "Formal Court Attire",       "phrase": "formal court attire, a conservative tailored suit" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Law Office",           "phrase": "in a classic law office softly blurred behind" },
+      { "label": "Legal Library",        "phrase": "in front of a richly blurred wall of law books" },
+      { "label": "Light Gray Studio",    "phrase": "against a smooth light-gray photography studio backdrop" },
+      { "label": "Executive Office",     "phrase": "in a wood-panelled executive office softly blurred behind" },
+      { "label": "Courtroom",            "phrase": "in a dignified courtroom softly blurred behind" },
+      { "label": "Courthouse Interior",  "phrase": "in a classical courthouse interior softly blurred behind" },
+      { "label": "Conference Room",      "phrase": "in a formal conference room softly blurred behind" },
+      { "label": "Bookshelf Office",     "phrase": "in front of a softly blurred office bookshelf" }
+    ]
+  },
+
+  "dark_studio": {
+    "label": "Dark Studio",
+    "category_type": "professional",
+    "lead_phrase": "A dramatic professional portrait photograph of",
+    "lighting": ["dramatic low-key studio lighting", "moody Rembrandt side lighting", "soft rim lighting against a dark background"],
+    "sort_order": 5,
+    "attires": {
+      "male": [
+        { "label": "Black Turtleneck",        "phrase": "a sleek black turtleneck" },
+        { "label": "Navy Suit - No Tie",      "phrase": "a dark navy suit with an open-collar shirt, no tie" },
+        { "label": "Dark Blazer & Black Shirt","phrase": "a dark tailored blazer over a black shirt" },
+        { "label": "Dark Knit Sweater",       "phrase": "a fine dark knit sweater" },
+        { "label": "Black Suit",              "phrase": "an elegant black suit with a dark shirt" },
+        { "label": "Charcoal Blazer",         "phrase": "a refined charcoal blazer over a dark top" },
+        { "label": "Black Dress Shirt",       "phrase": "a crisp black dress shirt" },
+        { "label": "Turtleneck & Blazer",     "phrase": "a dark turtleneck under a tailored blazer" }
+      ],
+      "female": [
+        { "label": "Black Turtleneck",     "phrase": "a sleek black turtleneck" },
+        { "label": "Dark Blazer & Blouse", "phrase": "a dark tailored blazer over an elegant blouse" },
+        { "label": "Dark Professional Dress","phrase": "a dark professional dress, refined and elegant" },
+        { "label": "Dark Knit Top",        "phrase": "a fine dark knit top" },
+        { "label": "Black Pantsuit",       "phrase": "an elegant black pantsuit" },
+        { "label": "Charcoal Blazer",      "phrase": "a refined charcoal blazer over a dark top" },
+        { "label": "Black High-Neck Dress","phrase": "an elegant black high-neck dress" },
+        { "label": "Turtleneck & Blazer",  "phrase": "a dark turtleneck under a tailored blazer" }
+      ],
+      "other": [
+        { "label": "Black Turtleneck",         "phrase": "a sleek black turtleneck" },
+        { "label": "Dark Tailored Suit",       "phrase": "a dark well-fitted tailored suit" },
+        { "label": "Dark Blazer & Black Shirt","phrase": "a dark tailored blazer over a black shirt" },
+        { "label": "Dark Knit Sweater",        "phrase": "a fine dark knit sweater" },
+        { "label": "Black Structured Suit",    "phrase": "a structured black suit, refined and dark" },
+        { "label": "Charcoal Blazer",          "phrase": "a refined charcoal blazer over a dark top" },
+        { "label": "Black High-Neck Top",      "phrase": "an elegant black high-neck top" },
+        { "label": "Turtleneck & Blazer",      "phrase": "a dark turtleneck under a tailored blazer" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Charcoal Gray",   "phrase": "against a dramatic charcoal-gray studio background" },
+      { "label": "Graphite",        "phrase": "against a deep graphite studio background" },
+      { "label": "Dark Navy",       "phrase": "against a dark navy studio background" },
+      { "label": "Black Gradient",  "phrase": "against a black gradient studio backdrop" },
+      { "label": "Midnight Blue",   "phrase": "against a midnight-blue studio background" },
+      { "label": "Deep Purple",     "phrase": "against a deep purple studio background" },
+      { "label": "Dark Teal",       "phrase": "against a dark teal studio background" },
+      { "label": "Deep Burgundy",   "phrase": "against a deep burgundy studio background" }
+    ]
+  },
+
+  "non_suit_formal": {
+    "label": "Formal Non-Suit",
+    "category_type": "professional",
+    "lead_phrase": "A professional headshot photograph of",
+    "lighting": null,
+    "sort_order": 6,
+    "attires": {
+      "male": [
+        { "label": "Blazer & Open-Collar Shirt", "phrase": "a tailored blazer over an open-collar shirt, no tie" },
+        { "label": "Turtleneck & Blazer",        "phrase": "a smart turtleneck under a tailored blazer" },
+        { "label": "Dress Shirt",                "phrase": "a crisp light-blue dress shirt, smart without a jacket" },
+        { "label": "Knit Sweater & Dress Shirt", "phrase": "a fine knit sweater over a collared dress shirt" },
+        { "label": "Polo & Blazer",              "phrase": "a smart polo shirt under a tailored blazer" },
+        { "label": "Cardigan & Dress Shirt",     "phrase": "a fine cardigan over a crisp dress shirt" },
+        { "label": "Quarter-Zip Sweater",        "phrase": "a smart quarter-zip sweater over a collared shirt" },
+        { "label": "Dress Shirt & Waistcoat",    "phrase": "a crisp dress shirt with a tailored waistcoat" }
+      ],
+      "female": [
+        { "label": "Blazer & Blouse",             "phrase": "a tailored blazer over an elegant blouse" },
+        { "label": "Turtleneck & Blazer",         "phrase": "a smart turtleneck under a tailored blazer" },
+        { "label": "Professional Blouse",         "phrase": "an elegant professional blouse, polished without a blazer" },
+        { "label": "Knit Top & Cardigan",         "phrase": "a fine knit top under a soft cardigan" },
+        { "label": "Professional Knit Dress",     "phrase": "an elegant professional knit dress" },
+        { "label": "Blouse & Tailored Trousers",  "phrase": "an elegant blouse with tailored trousers" },
+        { "label": "Sweater & Blazer",            "phrase": "a fine sweater under a tailored blazer" },
+        { "label": "High-Neck Blouse & Trousers", "phrase": "a high-neck blouse with tailored trousers" }
+      ],
+      "other": [
+        { "label": "Blazer & Open-Collar Shirt",       "phrase": "a tailored blazer over an open-collar shirt, no tie" },
+        { "label": "Turtleneck & Blazer",              "phrase": "a smart turtleneck under a tailored blazer" },
+        { "label": "Professional Shirt",               "phrase": "a crisp professional shirt, smart without a jacket" },
+        { "label": "Knit Sweater & Shirt",             "phrase": "a fine knit sweater over a collared shirt" },
+        { "label": "Structured Blazer & Knit Top",     "phrase": "a structured blazer over a fine knit top" },
+        { "label": "Cardigan & Professional Shirt",    "phrase": "a fine cardigan over a professional shirt" },
+        { "label": "Quarter-Zip Sweater",              "phrase": "a smart quarter-zip sweater over a collared shirt" },
+        { "label": "High-Neck Top & Tailored Trousers","phrase": "a smart high-neck top with tailored trousers" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Light Gray Studio",   "phrase": "against a smooth light-gray photography studio backdrop" },
+      { "label": "Modern Office",       "phrase": "in a modern office softly blurred behind" },
+      { "label": "Coworking Space",     "phrase": "in a bright coworking space softly blurred behind" },
+      { "label": "Warm Neutral Studio", "phrase": "against a warm neutral studio backdrop" },
+      { "label": "Home Office",         "phrase": "in a tidy home office softly blurred behind" },
+      { "label": "Corporate Lobby",     "phrase": "in a polished corporate lobby softly blurred behind" },
+      { "label": "Library",             "phrase": "in front of softly blurred library shelves" },
+      { "label": "Modern Interior",     "phrase": "in a clean modern interior softly blurred behind" }
+    ]
+  },
+
+  "dating": {
+    "label": "Dating",
+    "category_type": "personal",
+    "lead_phrase": "A warm, approachable lifestyle portrait photograph of",
+    "lighting": ["warm golden-hour light", "soft warm ambient light", "natural window light"],
+    "sort_order": 7,
+    "attires": {
+      "male": [
+        { "label": "Oxford Button-Down",       "phrase": "a well-fitted oxford button-down shirt, relaxed and approachable" },
+        { "label": "Polo Shirt",               "phrase": "a smart casual polo shirt" },
+        { "label": "Denim Jacket & T-Shirt",   "phrase": "a casual denim jacket over a plain t-shirt" },
+        { "label": "Casual Blazer & T-Shirt",  "phrase": "a relaxed casual blazer over a fitted t-shirt" },
+        { "label": "Henley Shirt",             "phrase": "a casual henley shirt" },
+        { "label": "Crew Neck Sweater",        "phrase": "a soft crew-neck sweater" },
+        { "label": "Linen Shirt",              "phrase": "a relaxed light linen shirt" },
+        { "label": "Leather Jacket & T-Shirt", "phrase": "a stylish leather jacket over a plain t-shirt" }
+      ],
+      "female": [
+        { "label": "Casual Dress",         "phrase": "a flattering casual dress, natural and approachable" },
+        { "label": "Blouse & Jeans",       "phrase": "a stylish blouse with casual jeans" },
+        { "label": "Denim Jacket & Top",   "phrase": "a casual denim jacket over a stylish top" },
+        { "label": "Smart Casual Blazer",  "phrase": "a chic smart-casual blazer over a soft top" },
+        { "label": "Knit Sweater",         "phrase": "a soft stylish knit sweater" },
+        { "label": "Sundress",             "phrase": "a light, pretty sundress" },
+        { "label": "Casual Blouse",        "phrase": "a relaxed casual blouse, natural and approachable" },
+        { "label": "Leather Jacket & Top", "phrase": "a stylish leather jacket over a soft top" }
+      ],
+      "other": [
+        { "label": "Relaxed Button-Down",     "phrase": "a relaxed button-down shirt, casual and approachable" },
+        { "label": "Polo Shirt",              "phrase": "a smart casual polo shirt" },
+        { "label": "Denim Jacket & T-Shirt",  "phrase": "a casual denim jacket over a plain t-shirt" },
+        { "label": "Casual Blazer & T-Shirt", "phrase": "a relaxed casual blazer over a fitted t-shirt" },
+        { "label": "Knit Top",                "phrase": "a soft casual knit top" },
+        { "label": "Crew Neck Sweater",       "phrase": "a soft crew-neck sweater" },
+        { "label": "Linen Shirt",             "phrase": "a relaxed light linen shirt" },
+        { "label": "Leather Jacket & Top",    "phrase": "a stylish leather jacket over a soft top" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Cafe",             "phrase": "in a warm softly-lit cafe with cozy blurred bokeh" },
+      { "label": "Restaurant Patio", "phrase": "on a charming restaurant patio softly blurred behind" },
+      { "label": "Public Park",      "phrase": "in a green public park with soft blurred greenery" },
+      { "label": "City Street",      "phrase": "on a lively city street with warm blurred lights" },
+      { "label": "Coffee Shop",      "phrase": "in a cozy coffee shop softly blurred behind" },
+      { "label": "Rooftop",          "phrase": "on a rooftop at golden hour with a softly blurred skyline" },
+      { "label": "Cozy Interior",    "phrase": "in a cozy warmly-lit interior softly blurred behind" },
+      { "label": "Waterfront",       "phrase": "along a scenic waterfront softly blurred behind" }
+    ]
+  },
+
+  "travel": {
+    "label": "Travel",
+    "category_type": "personal",
+    "lead_phrase": "A natural candid travel portrait photograph of",
+    "lighting": null,
+    "sort_order": 8,
+    "attires": {
+      "male": [
+        { "label": "Linen Shirt",               "phrase": "a light linen shirt, relaxed travel style" },
+        { "label": "Polo Shirt",                "phrase": "a comfortable casual polo shirt" },
+        { "label": "Denim Jacket & T-Shirt",    "phrase": "a casual denim jacket over a plain t-shirt" },
+        { "label": "Lightweight Outdoor Jacket","phrase": "a lightweight outdoor jacket over a casual top" },
+        { "label": "Casual Button-Down",        "phrase": "a relaxed casual button-down shirt" },
+        { "label": "Crew Neck T-Shirt",         "phrase": "a comfortable crew-neck t-shirt" },
+        { "label": "Sweater & Jacket",          "phrase": "a casual sweater under a light jacket" },
+        { "label": "Resort Shirt",              "phrase": "a relaxed resort shirt, easy travel style" }
+      ],
+      "female": [
+        { "label": "Linen Blouse",              "phrase": "a light linen blouse, relaxed travel style" },
+        { "label": "Sundress",                  "phrase": "a light, breezy sundress" },
+        { "label": "Denim Jacket & Top",        "phrase": "a casual denim jacket over a comfortable top" },
+        { "label": "Lightweight Outdoor Jacket","phrase": "a lightweight outdoor jacket over a casual top" },
+        { "label": "Casual Dress",              "phrase": "a comfortable casual dress" },
+        { "label": "Casual Top & Jacket",       "phrase": "a casual top under a light jacket" },
+        { "label": "Sweater & Jacket",          "phrase": "a casual sweater under a light jacket" },
+        { "label": "Resort Wear",               "phrase": "relaxed resort wear, easy travel style" }
+      ],
+      "other": [
+        { "label": "Linen Shirt",               "phrase": "a light linen shirt, relaxed travel style" },
+        { "label": "Relaxed Polo",              "phrase": "a comfortable relaxed polo shirt" },
+        { "label": "Denim Jacket & T-Shirt",    "phrase": "a casual denim jacket over a plain t-shirt" },
+        { "label": "Lightweight Outdoor Jacket","phrase": "a lightweight outdoor jacket over a casual top" },
+        { "label": "Casual Button-Down",        "phrase": "a relaxed casual button-down shirt" },
+        { "label": "Crew Neck T-Shirt",         "phrase": "a comfortable crew-neck t-shirt" },
+        { "label": "Sweater & Jacket",          "phrase": "a casual sweater under a light jacket" },
+        { "label": "Relaxed Resort Wear",       "phrase": "relaxed resort wear, easy travel style" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "European Street",  "phrase": "on a scenic European street softly blurred behind" },
+      { "label": "Beach",            "phrase": "on a sunny beach with the sea softly blurred behind" },
+      { "label": "Mountain View",    "phrase": "at a scenic mountain overlook softly blurred behind" },
+      { "label": "Waterfront",       "phrase": "along a scenic waterfront softly blurred behind" },
+      { "label": "Historic Town",    "phrase": "in a charming historic town softly blurred behind" },
+      { "label": "Tropical Resort",  "phrase": "at a tropical resort softly blurred behind" },
+      { "label": "Lake View",        "phrase": "by a tranquil lake softly blurred behind" },
+      { "label": "Scenic Overlook",  "phrase": "at a scenic overlook softly blurred behind" }
+    ]
+  },
+
+  "graduation": {
+    "label": "Graduation",
+    "category_type": "personal",
+    "lead_phrase": "A proud graduation portrait photograph of",
+    "lighting": null,
+    "sort_order": 9,
+    "attires": {
+      "male": [
+        { "label": "Cap & Gown with Dress Shirt",     "phrase": "a graduation cap and gown over a collared dress shirt" },
+        { "label": "Cap & Gown with Stole",           "phrase": "a graduation cap and gown with a colored stole" },
+        { "label": "Cap & Gown with Honors Cords",    "phrase": "a graduation cap and gown with honor cords" },
+        { "label": "Suit & Graduation Stole",         "phrase": "a smart suit with a graduation stole" },
+        { "label": "Cap & Gown with Tie",             "phrase": "a graduation cap and gown over a shirt and tie" },
+        { "label": "Cap & Gown with Bow Tie",         "phrase": "a graduation cap and gown over a shirt and bow tie" },
+        { "label": "Formal Suit",                     "phrase": "a formal suit for the graduation ceremony" },
+        { "label": "Dress Shirt & Graduation Stole",  "phrase": "a crisp dress shirt with a graduation stole" }
+      ],
+      "female": [
+        { "label": "Cap & Gown with Blouse",                "phrase": "a graduation cap and gown over an elegant blouse" },
+        { "label": "Cap & Gown with Stole",                 "phrase": "a graduation cap and gown with a colored stole" },
+        { "label": "Cap & Gown with Honors Cords",          "phrase": "a graduation cap and gown with honor cords" },
+        { "label": "Professional Dress & Graduation Stole", "phrase": "a professional dress with a graduation stole" },
+        { "label": "Cap & Gown with Dress",                 "phrase": "a graduation cap and gown over a smart dress" },
+        { "label": "Cap & Gown with Formal Blouse",         "phrase": "a graduation cap and gown over a formal blouse" },
+        { "label": "Professional Dress",                    "phrase": "a polished professional dress for the ceremony" },
+        { "label": "Blazer & Graduation Stole",             "phrase": "a tailored blazer with a graduation stole" }
+      ],
+      "other": [
+        { "label": "Cap & Gown with Professional Shirt", "phrase": "a graduation cap and gown over a professional shirt" },
+        { "label": "Cap & Gown with Stole",              "phrase": "a graduation cap and gown with a colored stole" },
+        { "label": "Cap & Gown with Honors Cords",       "phrase": "a graduation cap and gown with honor cords" },
+        { "label": "Tailored Suit & Graduation Stole",   "phrase": "a tailored suit with a graduation stole" },
+        { "label": "Cap & Gown with High-Neck Top",      "phrase": "a graduation cap and gown over a smart high-neck top" },
+        { "label": "Cap & Gown with Formal Shirt",       "phrase": "a graduation cap and gown over a formal shirt" },
+        { "label": "Professional Tailored Outfit",       "phrase": "a polished professional tailored outfit" },
+        { "label": "Blazer & Graduation Stole",          "phrase": "a tailored blazer with a graduation stole" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "University Campus",   "phrase": "on a university campus with softly blurred historic buildings" },
+      { "label": "University Building", "phrase": "in front of a stately university building softly blurred" },
+      { "label": "Campus Quad",         "phrase": "on a green campus quad softly blurred behind" },
+      { "label": "University Steps",    "phrase": "on the university steps softly blurred behind" },
+      { "label": "Library",            "phrase": "in front of softly blurred library shelves" },
+      { "label": "Graduation Stage",    "phrase": "on a graduation stage softly blurred behind" },
+      { "label": "Academic Hall",       "phrase": "in a grand academic hall softly blurred behind" },
+      { "label": "Campus Walkway",      "phrase": "on a tree-lined campus walkway softly blurred behind" }
+    ]
+  },
+
+  "beach_sunset": {
+    "label": "Beach Sunset",
+    "category_type": "personal",
+    "lead_phrase": "A natural candid lifestyle portrait photograph of",
+    "lighting": ["warm golden-hour sunlight", "soft sunset backlight", "warm natural light"],
+    "sort_order": 10,
+    "attires": {
+      "male": [
+        { "label": "White Linen Shirt",       "phrase": "a white linen shirt, relaxed summer style" },
+        { "label": "Light Blue Linen Shirt",  "phrase": "a light-blue linen shirt, relaxed summer style" },
+        { "label": "Casual Button-Down",      "phrase": "a relaxed casual button-down shirt" },
+        { "label": "Polo Shirt",              "phrase": "a smart casual polo shirt" },
+        { "label": "White T-Shirt",           "phrase": "a clean white t-shirt, easy summer style" },
+        { "label": "Resort Shirt",            "phrase": "a relaxed resort shirt" },
+        { "label": "Light Knit Shirt",        "phrase": "a light knit shirt, easy summer style" },
+        { "label": "Open-Collar Linen Shirt", "phrase": "an open-collar linen shirt, relaxed summer style" }
+      ],
+      "female": [
+        { "label": "White Sundress",       "phrase": "a flowing white sundress" },
+        { "label": "Maxi Dress",           "phrase": "a light flowing maxi dress" },
+        { "label": "Linen Blouse",         "phrase": "a light linen blouse, relaxed summer style" },
+        { "label": "Resort Dress",         "phrase": "a breezy resort dress" },
+        { "label": "Summer Dress",         "phrase": "a light summer dress" },
+        { "label": "Flowy Beach Dress",    "phrase": "a flowy beach dress" },
+        { "label": "Casual Linen Outfit",  "phrase": "a casual light linen outfit" },
+        { "label": "Light Knit Top",       "phrase": "a light knit top, easy summer style" }
+      ],
+      "other": [
+        { "label": "White Linen Shirt",       "phrase": "a white linen shirt, relaxed summer style" },
+        { "label": "Light Blue Linen Shirt",  "phrase": "a light-blue linen shirt, relaxed summer style" },
+        { "label": "Relaxed Button-Down",     "phrase": "a relaxed casual button-down shirt" },
+        { "label": "Light Knit Top",          "phrase": "a light knit top, easy summer style" },
+        { "label": "White T-Shirt",           "phrase": "a clean white t-shirt, easy summer style" },
+        { "label": "Relaxed Resort Wear",     "phrase": "relaxed resort wear, easy summer style" },
+        { "label": "Casual Linen Outfit",     "phrase": "a casual light linen outfit" },
+        { "label": "Open-Collar Linen Shirt", "phrase": "an open-collar linen shirt, relaxed summer style" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Golden Hour Beach", "phrase": "on a beach bathed in golden-hour light, the ocean softly blurred behind" },
+      { "label": "Ocean Sunset",      "phrase": "by the ocean at sunset with warm blurred light" },
+      { "label": "Tropical Beach",    "phrase": "on a tropical beach softly blurred at sunset" },
+      { "label": "Coastal View",      "phrase": "at a scenic coastal viewpoint with the sea blurred behind" },
+      { "label": "Beach Dunes",       "phrase": "among soft beach dunes at golden hour, softly blurred" },
+      { "label": "Rocky Coast",       "phrase": "along a rugged rocky coast softly blurred at sunset" },
+      { "label": "Palm Beach",        "phrase": "on a palm-lined beach softly blurred at sunset" },
+      { "label": "Beach Boardwalk",   "phrase": "on a seaside boardwalk softly blurred at sunset" }
+    ]
+  },
+
+  "luxury_lifestyle": {
+    "label": "Luxury Lifestyle",
+    "category_type": "personal",
+    "lead_phrase": "An elegant lifestyle portrait photograph of",
+    "lighting": null,
+    "sort_order": 11,
+    "attires": {
+      "male": [
+        { "label": "Tailored Suit - No Tie",          "phrase": "an upscale tailored suit with an open collar, no tie" },
+        { "label": "Turtleneck & Blazer",             "phrase": "a fine turtleneck under a tailored blazer" },
+        { "label": "Cashmere Sweater",                "phrase": "a fine cashmere sweater, understated luxury" },
+        { "label": "Dress Shirt & Tailored Trousers", "phrase": "a crisp dress shirt with tailored trousers" },
+        { "label": "Double-Breasted Suit",            "phrase": "an elegant double-breasted suit" },
+        { "label": "Velvet Blazer",                   "phrase": "a luxurious velvet blazer over a fine shirt" },
+        { "label": "Monochrome Suit",                 "phrase": "a sleek monochrome tailored suit" },
+        { "label": "Luxury Casual Blazer",            "phrase": "an upscale casual blazer over a fine top" }
+      ],
+      "female": [
+        { "label": "Tailored Blazer & Silk Blouse",       "phrase": "a tailored blazer over a fine silk blouse" },
+        { "label": "Cocktail Dress",                      "phrase": "an elegant cocktail dress" },
+        { "label": "Tailored Pantsuit",                   "phrase": "a sleek tailored pantsuit" },
+        { "label": "Elegant Monochrome Dress",            "phrase": "an elegant monochrome dress" },
+        { "label": "Silk Dress",                          "phrase": "a luxurious silk dress" },
+        { "label": "Luxury Evening Dress",                "phrase": "a luxurious evening dress" },
+        { "label": "Designer-Style Blazer",               "phrase": "a bold designer-style blazer" },
+        { "label": "Cashmere Top & Tailored Trousers",    "phrase": "a fine cashmere top with tailored trousers" }
+      ],
+      "other": [
+        { "label": "Tailored Suit - No Tie",            "phrase": "an upscale tailored suit with an open collar, no tie" },
+        { "label": "Turtleneck & Blazer",               "phrase": "a fine turtleneck under a tailored blazer" },
+        { "label": "Cashmere Knit",                     "phrase": "a fine cashmere knit, understated luxury" },
+        { "label": "Structured Shirt & Tailored Trousers","phrase": "a structured shirt with tailored trousers" },
+        { "label": "Double-Breasted Suit",              "phrase": "an elegant double-breasted suit" },
+        { "label": "Velvet Blazer",                     "phrase": "a luxurious velvet blazer over a fine top" },
+        { "label": "Monochrome Tailored Outfit",        "phrase": "a sleek monochrome tailored outfit" },
+        { "label": "Luxury Casual Blazer",              "phrase": "an upscale casual blazer over a fine top" }
+      ]
+    },
+    "backgrounds": [
+      { "label": "Luxury Hotel Lobby", "phrase": "in a luxurious hotel lobby softly blurred behind" },
+      { "label": "Penthouse",          "phrase": "in a modern penthouse interior softly blurred behind" },
+      { "label": "Rooftop Lounge",     "phrase": "in an upscale rooftop lounge softly blurred behind" },
+      { "label": "Upscale Restaurant", "phrase": "in an upscale restaurant softly blurred behind" },
+      { "label": "Luxury Residence",   "phrase": "in a luxury residence interior softly blurred behind" },
+      { "label": "Boutique Hotel",     "phrase": "in a stylish boutique hotel softly blurred behind" },
+      { "label": "Marina",             "phrase": "at an upscale marina softly blurred behind" },
+      { "label": "Private Club",       "phrase": "in an elegant private club softly blurred behind" }
+    ]
+  },
+
+  "custom_scene": {
+    "label": "Custom Scene",
+    "category_type": "personal",
+    "lead_phrase": "A portrait photograph of",
+    "lighting": null,
+    "custom": true,
+    "sort_order": 12,
+    "attires": { "male": [], "female": [], "other": [] },
+    "backgrounds": []
+  }
+}
