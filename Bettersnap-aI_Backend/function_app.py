@@ -483,7 +483,7 @@ def create_org_payment_intent(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("Organization not found", status_code=404)
     admin_user_id, seats_purchased, status = row
-    if admin_user_id != user_id:
+    if str(admin_user_id).lower() != str(user_id).lower():
         return func.HttpResponse("Forbidden", status_code=403)
     # Payable exactly once, while locked. Already-active means it was paid
     # already (or, before this fix, was active from the moment of creation and
@@ -531,7 +531,7 @@ def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     if not row:
         return func.HttpResponse("Organization not found", status_code=404)
     admin_user_id, name, seats_purchased, status = row
-    if admin_user_id != user_id:
+    if str(admin_user_id).lower() != str(user_id).lower():
         return func.HttpResponse("Forbidden", status_code=403)
 
     cur.execute(
