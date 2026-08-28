@@ -39,7 +39,15 @@ def get_active_membership(cursor, user_id):
     row = cursor.fetchone()
     if not row:
         return None
-    return row[0], int(row[1] or 0), row[2]
+    # Treat an incomplete/legacy row as no usable Teams membership. The schema stores
+    # credits_remaining as INT, but this guard keeps an old or partially migrated
+    # environment from turning every individual submit into a 500; the caller then
+    # falls back to the personal pool and the reservation path re-checks atomically.
+    try:
+        credits_remaining = int(row[1] or 0)
+    except (TypeError, ValueError):
+        return None
+    return row[0], credits_remaining, row[2]
 
 
 def effective_credits(cursor, user_id, personal_credits):

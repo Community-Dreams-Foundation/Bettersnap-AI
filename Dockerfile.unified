@@ -85,10 +85,28 @@ RUN mkdir -p /models/realesrgan && \
     curl -fL -o /models/realesrgan/RealESRGAN_x4plus.pth \
       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 
+# ── IP-Adapter Plus-Face (SDXL, CLIP ViT-H) ──────────────────────────────────────
+# COMMERCIAL-SAFE face conditioning: uses a CLIP image encoder (Apache lineage), NOT
+# InsightFace/ArcFace — so unlike InstantID/FaceID it carries no non-commercial license.
+# Strengthens per-user likeness by conditioning on the user's OWN face crop at gen time.
+RUN huggingface-cli download h94/IP-Adapter \
+        sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors \
+        --local-dir /models/ip-adapter && \
+    huggingface-cli download h94/IP-Adapter \
+        --include "models/image_encoder/*" \
+        --local-dir /models/ip-adapter && \
+    rm -rf /root/.cache/huggingface
+
 # ── Inference app (/app) ─────────────────────────────────────────────────────────
 COPY rrdbnet.py .
+COPY stage_runtime.py .
+COPY prompt_control.py .
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
+COPY Bettersnap-aI_Backend/shared/catalog_data.py catalog_data.py
 COPY main.py .
+# Phase 2: torch-free domain contracts + runtime engines (the orchestrated pipeline).
+COPY domain/ /app/domain/
+COPY runtime/ /app/runtime/
 
 # ── Trainer (/workspace) — reads the baked /models above; NO runtime HF download ──
 COPY training/trainer/train_dreambooth_lora_sdxl.py /workspace/train_dreambooth_lora_sdxl.py
@@ -96,5 +114,28 @@ COPY training/trainer/train_text_to_image_lora_sdxl.py /workspace/train_text_to_
 COPY training/trainer/run_training.py /workspace/run_training.py
 
 # MODE=train -> trainer, anything else -> inference.
+# gpu_preflight.py MUST sit in the same directory as entrypoint.py so `import gpu_preflight`
+# resolves from the script directory (sys.path[0]) with no PYTHONPATH juggling.
+COPY gpu_preflight.py /gpu_preflight.py
 COPY entrypoint.py /entrypoint.py
+
+# Build provenance is carried via build-args -> env vars, read at runtime by gpu_preflight.py:
+#   BUILD_GIT_SHA      the commit built from
+#   BUILD_IMAGE_REF    the image tag/ref
+#   BUILD_DIRTY        "true" if built from an uncommitted working tree, else "false"
+#   BUILD_SOURCE_HASH  deterministic sha256 over every baked source file (identifies exact source)
+# There is intentionally NO build_provenance.json COPY: it had NO runtime consumer and its file +
+# generator were untracked, so it only broke clean/CI/fresh-clone builds. Provenance lives in the
+# args below. Build with:
+#   az acr build --build-arg BUILD_GIT_SHA=$(git rev-parse HEAD) --build-arg BUILD_IMAGE_REF=<tag> \
+#     --build-arg BUILD_DIRTY=false --build-arg BUILD_SOURCE_HASH=<sha256-of-baked-sources> ...
+ARG BUILD_GIT_SHA=unknown
+ARG BUILD_IMAGE_REF=unknown
+ARG BUILD_DIRTY=false
+ARG BUILD_SOURCE_HASH=unknown
+ENV BUILD_GIT_SHA=${BUILD_GIT_SHA} \
+    BUILD_IMAGE_REF=${BUILD_IMAGE_REF} \
+    BUILD_DIRTY=${BUILD_DIRTY} \
+    BUILD_SOURCE_HASH=${BUILD_SOURCE_HASH}
+
 CMD ["python3.11", "/entrypoint.py"]

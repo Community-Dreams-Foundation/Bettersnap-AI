@@ -1,4 +1,5 @@
 import os
+import hmac
 import jwt
 import logging
 from jwt import PyJWKClient
@@ -42,6 +43,29 @@ def _get_jwks_client() -> PyJWKClient:
 
 
 def validate_token(token: str) -> dict:
+    # ── QA-ONLY TEST-AUTH PATH — env-gated, NON-PRODUCTION ONLY ───────────────────
+    # Lets a single designated test account authenticate for end-to-end testing WITHOUT
+    # the Entra email-OTP flow (no real inbox needed). It is COMPLETELY INERT unless BOTH
+    # gates below are set on the Function App — which must ONLY ever be done on a sandbox /
+    # test app, NEVER in production:
+    #     TEST_AUTH_ENABLED = "1"
+    #     TEST_AUTH_SECRET  = <a long random secret>     (token must equal "test:<secret>")
+    # Optional identity overrides: TEST_AUTH_OID, TEST_AUTH_EMAIL.
+    # Testers send   Authorization: Bearer test:<secret>   and get a session as the test user.
+    # In production TEST_AUTH_ENABLED is unset, so this block is skipped entirely and the real
+    # Entra validation below is the only path. If this warning ever appears in prod logs,
+    # UNSET TEST_AUTH_ENABLED immediately.
+    if os.environ.get("TEST_AUTH_ENABLED") == "1":
+        secret = os.environ.get("TEST_AUTH_SECRET") or ""
+        if secret and hmac.compare_digest(token, f"test:{secret}"):
+            oid = os.environ.get("TEST_AUTH_OID", "11111111-1111-4111-8111-111111111111")
+            email = os.environ.get("TEST_AUTH_EMAIL", "kumar-test@bettersnap.ai")
+            logging.warning(
+                "TEST-AUTH bypass used (non-prod only): oid=%s email=%s — if this is "
+                "production, UNSET TEST_AUTH_ENABLED now.", oid, email)
+            return {"oid": oid, "email": email, "preferred_username": email,
+                    "name": "Kumar Test", "iss": "test-auth", "aud": "test-auth"}
+
     try:
         aud = os.environ.get("ENTRA_AUD")
         iss = os.environ.get("ENTRA_ISSUER")
@@ -73,7 +97,6 @@ def validate_token(token: str) -> dict:
                 "verify_iss": True,
             },
         )
-        logging.info(f"Token validated: oid={payload.get('oid')}")
         return payload
     except Exception as e:
         logging.warning(f"Token validation failed: {e}")
@@ -87,3 +110,83 @@ def get_user_id(token: str) -> str:
     # per-app pairwise subject and is NOT stable across apps, so it must not be
     # used as the identity key.)
     return payload["oid"]
+
+
+# ── Super-Admin token validation — SEPARATE issuer + a required app role ──────
+# The customer API above trusts the customer CIAM tenant. Admin-dashboard staff sign in against
+# the INTERNAL work tenant instead (admin@bettersnap.ai etc.), so the admin API validates a
+# DIFFERENT issuer/JWKS/audience AND requires an app role — a valid work token is not enough,
+# the account must be assigned the admin role. All fail closed (missing config => raise => 401).
+#   ADMIN_JWKS_URI — internal tenant JWKS, e.g. https://login.microsoftonline.com/<tid>/discovery/v2.0/keys
+#   ADMIN_ISSUER   — internal tenant issuer, e.g. https://login.microsoftonline.com/<tid>/v2.0
+#   ADMIN_AUD      — the admin API's audience (api://<admin-client-id> or the bare client-id GUID)
+#   ADMIN_ROLE     — required role value in the token's `roles` claim (default "Admin")
+_admin_jwks_client = None
+
+
+class NotAdminError(Exception):
+    """Token is otherwise valid but the account is NOT assigned the admin role -> 403 (not 401)."""
+
+
+def _get_admin_jwks_client() -> PyJWKClient:
+    global _admin_jwks_client
+    if _admin_jwks_client is None:
+        jwks_uri = os.environ.get("ADMIN_JWKS_URI")
+        if not jwks_uri:
+            raise RuntimeError("ADMIN_JWKS_URI not set — admin API refuses to validate (fail closed)")
+        _admin_jwks_client = PyJWKClient(jwks_uri, cache_keys=True)
+    return _admin_jwks_client
+
+
+def require_admin(token: str) -> dict:
+    """Validate an admin-dashboard token and require the admin role. Returns
+    {oid, email, name, roles}. Raises NotAdminError (valid but not an admin -> 403) or any other
+    Exception (invalid/expired/misconfigured -> 401). Callers distinguish the two."""
+    # ── QA-ONLY admin test path — env-gated, NON-PRODUCTION ONLY ─────────────────
+    # Lets Jayasri develop the dashboard BEFORE the internal-tenant app registration is wired.
+    # Inert unless BOTH gates are set (sandbox app only, NEVER prod):
+    #     ADMIN_TEST_ENABLED = "1"; ADMIN_TEST_SECRET = <long random>
+    # She sends  Authorization: Bearer admin-test:<secret>  and gets an admin session.
+    if os.environ.get("ADMIN_TEST_ENABLED") == "1":
+        secret = os.environ.get("ADMIN_TEST_SECRET") or ""
+        if secret and hmac.compare_digest(token, f"admin-test:{secret}"):
+            email = os.environ.get("ADMIN_TEST_EMAIL", "admin@bettersnap.ai")
+            logging.warning("ADMIN-TEST bypass used (non-prod only) email=%s — UNSET "
+                            "ADMIN_TEST_ENABLED in production.", email)
+            return {"oid": os.environ.get("ADMIN_TEST_OID", "00000000-0000-4000-8000-000000000001"),
+                    "email": email, "name": "Admin Test", "roles": ["Admin"]}
+
+    aud_raw = os.environ.get("ADMIN_AUD")
+    iss = os.environ.get("ADMIN_ISSUER")
+    if not aud_raw:
+        raise RuntimeError("ADMIN_AUD not set — admin API refuses to validate (fail closed).")
+    if not iss:
+        raise RuntimeError("ADMIN_ISSUER not set — admin API refuses to validate (fail closed).")
+    # ADMIN_AUD and ADMIN_ISSUER may each be a comma-separated list. A work-tenant access token's
+    # `aud` for a custom API can be the App ID URI (api://<client-id>) OR the bare client-id GUID,
+    # and `iss` can be the v2 form (login.microsoftonline.com/<tid>/v2.0) OR the v1 form
+    # (sts.windows.net/<tid>/) depending on the app's requestedAccessTokenVersion. Accept any of
+    # each so a version mismatch doesn't silently 401. jwt.decode matches a list of audiences; we
+    # verify the issuer ourselves against the allowed set (its `issuer=` param is single-valued).
+    aud = [a.strip() for a in aud_raw.split(",") if a.strip()]
+    issuers = [i.strip() for i in iss.split(",") if i.strip()]
+
+    signing_key = _get_admin_jwks_client().get_signing_key_from_jwt(token)
+    payload = jwt.decode(
+        token, signing_key.key, algorithms=["RS256"], audience=aud,
+        options={"require": ["exp", "iss", "aud", "oid"], "verify_signature": True,
+                 "verify_exp": True, "verify_aud": True, "verify_iss": False},
+    )
+    if payload.get("iss") not in issuers:
+        raise jwt.InvalidIssuerError(f"iss {payload.get('iss')} not in allowed {issuers}")
+    role_name = os.environ.get("ADMIN_ROLE", "Admin")
+    roles = payload.get("roles") or []
+    if role_name not in roles:
+        raise NotAdminError(
+            f"oid={payload.get('oid')} authenticated but lacks role '{role_name}' (roles={roles})")
+    return {
+        "oid": payload["oid"],
+        "email": payload.get("preferred_username") or payload.get("email") or "",
+        "name": payload.get("name") or "",
+        "roles": roles,
+    }

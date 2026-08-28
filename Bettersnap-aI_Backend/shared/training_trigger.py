@@ -26,13 +26,11 @@ import logging
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.appcontainers import ContainerAppsAPIClient
-from azure.mgmt.appcontainers.models import (
-    JobExecutionTemplate, Container, EnvironmentVar, ContainerResources,
-)
+from azure.mgmt.appcontainers.models import EnvironmentVar
 
 from . import catalog
 from .queue_trigger import (
-    SUBSCRIPTION_ID, RESOURCE_GROUP, JOB_NAME, _newest_execution_name,
+    SUBSCRIPTION_ID, RESOURCE_GROUP, JOB_NAME, _start_execution,
 )
 
 # Env keys this dispatcher OWNS. Always removed from the job template, then re-set
@@ -45,11 +43,33 @@ _OWNED_ENV = {
     "CLASS_WORD",
     "INPUT_BLOB_PATH",   # stripped, never re-set — FILES_JSON is the input contract
     "MODE",              # shared job with inference — MUST re-set to "train" every run
+    # Owned for the SAME reason as USER_ID. The deployed template carries a JOB_ID baked in
+    # from manual runs; without stripping it we would (a) append a second JOB_ID in fused
+    # mode, leaving which one wins undefined, and (b) leak a previous user's job id into a
+    # plain MODE=train run. Stripped always, re-set ONLY when fusing.
+    "JOB_ID",
 }
 
 
-def trigger_training_job(user_id: str, files: list, class_word: str):
+def trigger_training_job(user_id: str, files: list, class_word: str, job_id: str = None):
     """Start a training execution for ONE user.
+
+    FUSED MODE (job_id given) — one container, one cold start
+    --------------------------------------------------------
+    When `job_id` is supplied we start MODE=train_infer instead of MODE=train: the SAME
+    container trains the adapter and then generates that job's images, so a one-time buyer
+    (and a monthly user's first session) pays ONE cold start and ONE queue hop instead of
+    two. Measured saving ~4 min of a ~45 min journey: ~3.3 min ACA scheduling + image pull,
+    plus ~30 s model load on the second container.
+
+    entrypoint.py refuses MODE=train_infer without JOB_ID/USER_ID (exit 2) rather than
+    training for 30 minutes and failing at the handoff, so both are always set here.
+
+    THE CALLER MUST HAVE CLAIMED THE JOB OUT OF 'waiting_lora' FIRST. _finish_training
+    releases every job still in 'waiting_lora' for the user when training completes — if the
+    fused job were left there it would be enqueued a SECOND time and the user would get two
+    generations for one payment. Claiming it (to 'processing') before this call is what makes
+    the fused path safe; see _dispatch_training.
 
     user_id     — the authenticated user. Used for BOTH the input photo paths (by the
                   caller, when it built `files`) and the adapter output path
@@ -77,71 +97,33 @@ def trigger_training_job(user_id: str, files: list, class_word: str):
             f"training file(s) outside user {user_id}'s prefix: {stray[:3]} — refusing to start"
         )
 
-    credential = DefaultAzureCredential()
-    client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
-
-    job = client.jobs.get(RESOURCE_GROUP, JOB_NAME)
-    base = job.template.containers[0]
-
-    # Strip every user-identifying key from the template, then set ours. Non-owned keys
+    # Strip every user-identifying key (_OWNED_ENV) and re-set ours. Non-owned keys
     # (STORAGE_CONNECTION_STRING secretRef, RANK, MAX_TRAIN_STEPS, LEARNING_RATE,
-    # TEXT_ENCODER_LR, NUM_CLASS_IMAGES, PRIOR_LOSS_WEIGHT, LORA_CONTAINER, ...) are the
-    # tuned recipe and are carried through untouched.
-    env = [e for e in (base.env or []) if e.name not in _OWNED_ENV]
-    env.append(EnvironmentVar(name="MODE", value="train"))   # boot the trainer, not inference
-    env.append(EnvironmentVar(name="USER_ID", value=str(user_id)))
-    env.append(EnvironmentVar(name="FILES_JSON", value=json.dumps(files)))
-    env.append(EnvironmentVar(name="CLASS_WORD", value=class_word))
-    env.append(EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)))
-    env.append(EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)))
+    # TEXT_ENCODER_LR, NUM_CLASS_IMAGES, PRIOR_LOSS_WEIGHT, AZURE_LORA_CONTAINER, ...) are
+    # the tuned recipe, carried through untouched. Built as EnvironmentVar objects via the
+    # ARM SDK (no shell), so the Windows --env-vars quote-stripping that mangled FILES_JSON
+    # into invalid JSON cannot happen. MODE=train boots the trainer, not inference.
+    fused = bool(job_id)
+    overrides = [
+        EnvironmentVar(name="MODE", value="train_infer" if fused else "train"),
+        EnvironmentVar(name="USER_ID", value=str(user_id)),
+        EnvironmentVar(name="FILES_JSON", value=json.dumps(files)),
+        EnvironmentVar(name="CLASS_WORD", value=class_word),
+        EnvironmentVar(name="INSTANCE_PROMPT", value=catalog.instance_prompt(class_word)),
+        EnvironmentVar(name="CLASS_PROMPT", value=catalog.class_prompt(class_word)),
+    ]
+    if fused:
+        overrides.append(EnvironmentVar(name="JOB_ID", value=str(job_id)))
 
-    # Built via EnvironmentVar objects through the ARM SDK — there is no shell, so the
-    # Windows `az ... --env-vars` quote-stripping that mangled FILES_JSON into invalid
-    # JSON cannot happen on this path.
-
-    # CRITICAL (same trap as the inference dispatcher): rebuild resources EXPLICITLY.
-    # Passing base.resources back through begin_start does NOT round-trip — ACA silently
-    # drops it and the execution falls back to the platform default 0.5 CPU / 1Gi, which
-    # SIGKILLs the trainer. A freshly-constructed ContainerResources IS honored.
-    resources = ContainerResources(
-        cpu=float(base.resources.cpu),
-        memory=str(base.resources.memory),
+    execution_id = _start_execution(
+        owned_env_keys=_OWNED_ENV,
+        env_overrides=overrides,
     )
-
-    template = JobExecutionTemplate(
-        containers=[
-            Container(
-                name=base.name,
-                image=base.image,
-                env=env,
-                resources=resources,
-                volume_mounts=base.volume_mounts,
-            )
-        ]
-    )
-
     logging.info(
-        f"dispatching training: user={user_id} files={len(files)} class_word={class_word} "
-        f"image={base.image} cpu={resources.cpu} memory={resources.memory}"
+        f"Started {'FUSED train_infer' if fused else 'training'} job for user={user_id}"
+        + (f", job_id={job_id}" if fused else "")
+        + f", execution_id={execution_id}"
     )
-
-    poller = client.jobs.begin_start(
-        resource_group_name=RESOURCE_GROUP,
-        job_name=JOB_NAME,
-        template=template,
-    )
-    try:
-        execution_id = getattr(poller.result(), "name", None)
-    except Exception as e:
-        logging.warning(
-            f"begin_start LRO did not resolve cleanly for training user={user_id} ({e}); "
-            f"recovering execution id from the executions list"
-        )
-        execution_id = None
-    if not execution_id:
-        execution_id = _newest_execution_name(client, JOB_NAME)
-
-    logging.info(f"Started training job for user={user_id}, execution_id={execution_id}")
     return execution_id
 
 

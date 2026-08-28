@@ -83,10 +83,14 @@ RUN mkdir -p /models/realesrgan && \
       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 
 COPY rrdbnet.py .
-# Canonical category/attire/background catalog — SAME file the Functions app
-# imports as shared.catalog. COPYd to /app/catalog.py so main.py's `import catalog`
-# resolves and prompt phrases never drift between the two deploy units.
+COPY stage_runtime.py .
+COPY prompt_control.py .
+# Canonical category/attire/background catalog — SAME files the Functions app
+# imports as shared.catalog / shared.catalog_data. COPYd so main.py's `import catalog`
+# resolves and prompt phrases never drift between the two deploy units. catalog.py imports
+# catalog_data.py (the generated gender-aware data), so BOTH must be present.
 COPY Bettersnap-aI_Backend/shared/catalog.py catalog.py
+COPY Bettersnap-aI_Backend/shared/catalog_data.py catalog_data.py
 COPY main.py .
 
 CMD ["python3.11", "main.py"]

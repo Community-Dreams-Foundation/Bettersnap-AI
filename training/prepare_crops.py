@@ -31,7 +31,7 @@ sys.path.insert(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Bettersnap-aI_Backend"),
 )
 from shared.crops import (  # noqa: E402
-    crop_head_and_shoulders, center_square_crop, NoFaceError,
+    crop_head_and_shoulders, center_square_crop, NoFaceError, FaceTooSmallError,
     DEFAULT_SIZE, DEFAULT_FACE_FRAC, DEFAULT_HEADROOM,
 )
 
@@ -54,7 +54,7 @@ def main():
     )
     print(f"Found {len(paths)} photos in {args.in_dir}")
 
-    no_face = []
+    no_face, too_small = [], []
     for i, p in enumerate(paths):
         with open(p, "rb") as f:
             data = f.read()
@@ -65,6 +65,14 @@ def main():
             out = center_square_crop(data, args.size)
             status = "NO_FACE_center_crop"
             no_face.append(os.path.basename(p))
+        except FaceTooSmallError as e:
+            # Production REJECTS these (/train returns 400). The CLI still writes the
+            # crop so you can eyeball how soft it is, but flags it loudly — a crop this
+            # upscaled is what teaches the adapter blurry, waxy skin.
+            out = crop_head_and_shoulders(data, args.size, args.face_frac,
+                                          args.headroom, enforce_min_face=False)
+            status = f"TOO_SMALL_{e.face_px}px"
+            too_small.append(f"{os.path.basename(p)} ({e.face_px}px)")
 
         # img{i}.jpg matches the naming /train generates, so a hand-made set and a
         # production set are interchangeable.
@@ -76,6 +84,11 @@ def main():
     print(f"Done -> {args.out_dir}")
     if no_face:
         print(f"\n!! {len(no_face)} photo(s) had NO DETECTABLE FACE: {', '.join(no_face)}")
+    if too_small:
+        print(f"\n!! {len(too_small)} photo(s) have a face too SMALL to crop cleanly "
+              f"(production /train REJECTS these): {', '.join(too_small)}")
+        print("   The subject is too far from the camera; the crop is heavily upscaled "
+              "and will teach the adapter blurry skin. Use closer shots.")
         print("!! Production would REJECT these. Replace them before training.")
 
 

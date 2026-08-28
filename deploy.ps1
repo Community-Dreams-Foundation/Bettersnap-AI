@@ -36,8 +36,19 @@ param(
   # `ohwx {subject}` trigger so each user's identity LoRA fires by default.
   # MUST match the image tag in job.yaml — bump both together or ACA can serve a
   # stale image. (History: v23 = SDXL img2img good; v30 = + identity LoRA;
-  # v31 = + depth-ControlNet; v32 = txt2img rework; v33 = + baked ohwx trigger.)
-  [string]$ImageTag      = "v35",
+  # v31 = + depth-ControlNet; v32 = txt2img rework; v33 = + baked ohwx trigger;
+  # v43 = last image actually deployed, built from `main`; v45 = built from
+  # `development` = first image to carry IP-Adapter/realism/face-refine.)
+  #
+  # DRIFT WARNING (2026-07-20): this default sat at v35 while job.yaml pinned v43, so
+  # running deploy.ps1 -Gpu WITHOUT -ImageTag would have rebuilt v35 and repointed the
+  # job at it — a silent DOWNGRADE of production with no error. Keep this in lock-step
+  # with job.yaml, and prefer passing -ImageTag explicitly.
+  #
+  # ALSO: `az acr build` uploads the WORKING TREE, not git. Building while checked out
+  # on `main` produces an image with NO IP-Adapter / realism / face-refine passes and
+  # silently regresses generation quality. Confirm `git branch` before -Gpu.
+  [string]$ImageTag      = "v45",
   # A100 resource alloc, set on every redeploy (see Step 3). These MUST match the
   # Consumption-GPU-NC24-A100 workload profile's fixed alloc AND job.yaml, or a
   # bare `--image`-only update silently drops the job toward the 1Gi OOM default.
@@ -100,7 +111,17 @@ if (-not $SkipMigrations) {
 # ── 2. Build + push v23 ─────────────────────────────────────────────────────
 Step 2 "Build + push $Image (ACR build)"
 Confirm-Continue "Build and push $ImageTag from $RepoRoot ?"
-az acr build --registry $Registry --image "inference:$ImageTag" $RepoRoot
+# --file Dockerfile.unified is LOAD-BEARING. There are TWO Dockerfiles and they publish
+# under the SAME `inference:vNN` tag namespace, so the tag alone never tells you which
+# one you got:
+#   Dockerfile          -> CMD ["python3.11","main.py"]      inference ONLY, IGNORES MODE
+#   Dockerfile.unified   -> CMD ["python3.11","/entrypoint.py"] + run_training.py = train+infer
+# The bettersnapai-if job runs BOTH modes off one image (MODE=train|infer), so it needs
+# the unified one. Omitting --file silently builds the inference-only image; MODE=train is
+# then ignored, the container runs main.py against whatever stale JOB_ID is in the template
+# env, and training "fails" with a confusing "Job <id> not found in DB". Cost of finding
+# this out: one 17-min build + a wasted A100 start (2026-07-20).
+az acr build --registry $Registry --image "inference:$ImageTag" --file Dockerfile.unified $RepoRoot
 
 # ── 3. Point the job at v23 + set A100 resources ────────────────────────────
 # --cpu/--memory are set here too, NOT just --image. An image-only update leaves

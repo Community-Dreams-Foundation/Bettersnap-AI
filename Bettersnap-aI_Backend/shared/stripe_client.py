@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import os
 import time
 import json
 import requests
@@ -7,9 +8,6 @@ from shared.keyvault import get_secret
 from shared.plans import PLANS
 
 STRIPE_API_BASE = "https://api.stripe.com/v1"
-
-# 1 job = 20 credits = 4 image variations
-CREDITS_PER_JOB = 20
 
 # Plan economics are DERIVED from the single source of truth (shared/plans.py) so the billing
 # numbers can never drift from what submit_job enforces. One-time = image packs (1 credit == 1
@@ -49,11 +47,13 @@ def _price_id(plan_type: str, plan: str) -> str:
     return get_secret(f"stripe-price-{plan_type}-{plan}")
 
 
-def _post(path: str, data: dict) -> dict:
+def _post(path: str, data: dict, idempotency_key: str | None = None) -> dict:
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
     resp = requests.post(
         f"{STRIPE_API_BASE}/{path}",
         auth=(_secret_key(), ""),
         data=data,
+        headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
@@ -99,6 +99,30 @@ def _maybe_email(params: dict, email: str) -> dict:
     return params
 
 
+def monthly_plan_for_price_id(price_id: str) -> str | None:
+    """Resolve a Stripe monthly Price ID to the BetterSnap plan tier."""
+    if not price_id:
+        return None
+    for plan in MONTHLY_PLANS:
+        if hmac.compare_digest(price_id, _price_id("monthly", plan)):
+            return plan
+    return None
+
+
+def subscription_period_end(subscription: dict) -> int | None:
+    """Return the effective period end across legacy and current Stripe response shapes."""
+    if subscription.get("cancel_at"):
+        return int(subscription["cancel_at"])
+    if subscription.get("current_period_end"):
+        return int(subscription["current_period_end"])
+    item_period_ends = [
+        int(item["current_period_end"])
+        for item in subscription.get("items", {}).get("data", [])
+        if item.get("current_period_end")
+    ]
+    return min(item_period_ends) if item_period_ends else None
+
+
 def create_onetime_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
     price_id = _price_id("onetime", plan)
     return _post("checkout/sessions", _maybe_email({
@@ -128,7 +152,33 @@ def create_org_checkout(organization_id: str, admin_email: str, seats: int,
     }, admin_email))
 
 
-def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: str, cancel_url: str) -> dict:
+def create_topup_checkout(user_id: str, email: str, pack: str, success_url: str, cancel_url: str) -> dict:
+    """Credit top-up for an ACTIVE monthly subscriber — buy more images generated from the
+    EXISTING model (no new training, no plan change). Reuses the one-time pack sizes + Stripe
+    prices, so no new Stripe setup is needed; the webhook grants those images at the account's
+    monthly credit rate. (A dedicated, cheaper top-up price can be swapped in later.)"""
+    price_id = _price_id("onetime", pack)
+    return _post("checkout/sessions", _maybe_email({
+        "mode": "payment",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata[user_id]": user_id,
+        "metadata[plan]": pack,
+        "metadata[payment_type]": "topup",
+    }, email))
+
+
+def create_monthly_checkout(
+    user_id: str,
+    email: str,
+    plan: str,
+    success_url: str,
+    cancel_url: str,
+    checkout_token: str,
+    expires_at: int,
+) -> dict:
     price_id = _price_id("monthly", plan)
     return _post("checkout/sessions", _maybe_email({
         "mode": "subscription",
@@ -139,9 +189,11 @@ def create_monthly_checkout(user_id: str, email: str, plan: str, success_url: st
         "metadata[user_id]": user_id,
         "metadata[plan]": plan,
         "metadata[payment_type]": "monthly",
+        "metadata[checkout_token]": checkout_token,
         "subscription_data[metadata][user_id]": user_id,
         "subscription_data[metadata][plan]": plan,
-    }, email))
+        "expires_at": str(expires_at),
+    }, email), idempotency_key=f"monthly-checkout-{checkout_token}")
 
 
 def cancel_subscription(stripe_subscription_id: str) -> dict:
@@ -152,6 +204,23 @@ def cancel_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
+def get_subscription(stripe_subscription_id: str) -> dict:
+    """Retrieve the complete subscription after an update response omits period fields."""
+    return _get(f"subscriptions/{stripe_subscription_id}")
+
+
+def find_checkout_session_by_token(checkout_token: str) -> dict | None:
+    """Find a recent Checkout Session by the reservation token stored in its metadata."""
+    sessions = _get("checkout/sessions?limit=100").get("data", [])
+    return next(
+        (
+            session for session in sessions
+            if session.get("metadata", {}).get("checkout_token") == checkout_token
+        ),
+        None,
+    )
+
+
 def reactivate_subscription(stripe_subscription_id: str) -> dict:
     """Undo a pending period-end cancellation — the subscription keeps renewing."""
     return _post(f"subscriptions/{stripe_subscription_id}", {
@@ -159,12 +228,32 @@ def reactivate_subscription(stripe_subscription_id: str) -> dict:
     })
 
 
-def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
-    webhook_secret = get_secret("stripe-webhook-secret")
+def create_billing_portal(stripe_customer_id: str, return_url: str) -> dict:
+    """Create a Stripe-hosted session where the customer can update payment details."""
+    return _post("billing_portal/sessions", {
+        "customer": stripe_customer_id,
+        "return_url": return_url,
+    })
 
-    parts = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(","))}
-    timestamp = parts.get("t", "")
-    signatures = [v for k, v in parts.items() if k == "v1"]
+def verify_webhook(payload_bytes: bytes, sig_header: str) -> dict:
+    # env override first (features-stripe), then Key Vault (dev) — either source works.
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET") or get_secret("stripe-webhook-secret")
+
+    # Preserve repeated v1 fields. During webhook-secret rotation Stripe can send more than
+    # one v1 signature; a dict would silently keep only the last and could drop the valid one.
+    timestamp = ""
+    signatures = []
+    for part in (sig_header or "").split(","):
+        key, separator, value = part.strip().partition("=")
+        if not separator:
+            continue
+        if key == "t" and not timestamp:
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+
+    if not timestamp or not signatures:
+        raise ValueError("Invalid Stripe-Signature header")
 
     if abs(time.time() - int(timestamp)) > 300:
         raise ValueError("Webhook timestamp too old")

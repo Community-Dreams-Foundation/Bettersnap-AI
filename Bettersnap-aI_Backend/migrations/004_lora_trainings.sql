@@ -53,11 +53,8 @@ GO
 --   az storage blob list --account-name bettersnapaistorage -c lora-weights \
 --     --prefix identity/ --account-key <key> --query "[].name" -o tsv
 --
--- Then mark each user whose identity/<user_id>/adapter_model.safetensors is present.
--- As of 2026-07-12 that is exactly one user (the Phase-2 test LoRA):
-UPDATE dbo.users SET lora_status = 'ready'
-WHERE user_id = '85AC304C-39C7-4269-BFAC-0BE9DAA7641B';
-GO
+-- Then mark each verified user through an operator-controlled repair, not this
+-- production migration. Migration files must never embed test-account identities.
 
 -- ── Rollback ──────────────────────────────────────────────────────────────
 -- DROP TABLE IF EXISTS dbo.lora_trainings;

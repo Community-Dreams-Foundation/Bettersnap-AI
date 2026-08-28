@@ -33,7 +33,7 @@ is in the code. Identity comes entirely from env vars, so a new user needs no co
 | `CLASS_PROMPT` | `a photo of a woman` — must match the instance class word |
 | `RANK` / `MAX_TRAIN_STEPS` / `LEARNING_RATE` / `TEXT_ENCODER_LR` | `32` / `1400` / `1e-4` / `5e-5` |
 | `NUM_CLASS_IMAGES` / `PRIOR_LOSS_WEIGHT` | `200` / `1.0` |
-| `INPUT_CONTAINER` / `LORA_CONTAINER` | `inputs` / `lora-weights` |
+| `INPUT_CONTAINER` / `AZURE_LORA_CONTAINER` | `inputs` / `lora-weights` — `LORA_CONTAINER` is a deprecated alias, still accepted for backward compatibility |
 
 Two things that are easy to get wrong:
 

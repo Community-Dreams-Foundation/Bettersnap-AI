@@ -28,8 +28,7 @@ GO
 -- 'basic' here is unambiguously "never paid". Move them to the trial plan so their
 -- existing credits actually buy a session.
 --
--- Deliberately does NOT touch 'pro'/'expert'/'monthly' rows (e.g. the 85AC304C test
--- account, which was set by hand and has 1000 credits) — only the stranded default.
+-- Deliberately does NOT touch 'pro'/'expert'/'monthly' rows; only the stranded default.
 UPDATE dbo.users
 SET plan_name = 'trial'
 WHERE plan_name = 'basic';

@@ -3,13 +3,10 @@ import io
 import json
 import time
 import logging
-import traceback
 import faulthandler
-import requests
 
 faulthandler.enable()   # dumps C++ stack to stderr on SIGSEGV / SIGABRT / SIGFPE / SIGBUS
-from datetime import datetime, timedelta, timezone
-from PIL import Image, ImageDraw, ImageFont
+from datetime import datetime, timezone
 
 import torch
 import pyodbc
@@ -31,14 +28,14 @@ import catalog
 # pose and reduces the scene variety the product needs. commercial-safe only —
 # do NOT swap to Depth-Anything-V2-Large or CMU OpenPose (both non-commercial).
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL
-import numpy as np
 # Real-ESRGAN generator (vendored, BSD-3-Clause — COMMERCIAL-SAFE). 2K upscale
 # post-process. do NOT swap to a non-commercial upscaler.
 from rrdbnet import RRDBNet
+from stage_runtime import run_stage
+from prompt_control import apply_composition_control
 from azure.keyvault.secrets import SecretClient
 
-from azure.storage.queue import QueueClient, TextBase64DecodePolicy
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.communication.email import EmailClient
 
@@ -48,10 +45,16 @@ log = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────
 AZURE_STORAGE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "bettersnapaistorage")
-AZURE_QUEUE_NAME        = os.environ.get("AZURE_QUEUE_NAME", "inference-jobs")
 AZURE_BLOB_CONTAINER    = os.environ.get("AZURE_BLOB_CONTAINER", "outputs")
-AZURE_LORA_CONTAINER    = os.environ.get("AZURE_LORA_CONTAINER", "lora-weights")
-AZURE_STORAGE_KEY       = os.environ.get("AZURE_STORAGE_KEY")
+# LoRA-weights container. AZURE_LORA_CONTAINER is CANONICAL (matches AZURE_BLOB_CONTAINER /
+# AZURE_STORAGE_ACCOUNT and the ACA job manifest job.yaml). LORA_CONTAINER is a DEPRECATED
+# alias kept for the trainer's older convention: read both (canonical first) so an operator can
+# set EITHER and the trainer + inference always agree on one container. Remove the alias once
+# deploy manifests + docs use AZURE_LORA_CONTAINER everywhere (see run_training.py for the twin).
+AZURE_LORA_CONTAINER    = (os.environ.get("AZURE_LORA_CONTAINER")
+                           or os.environ.get("LORA_CONTAINER") or "lora-weights")
+if not os.environ.get("AZURE_LORA_CONTAINER") and os.environ.get("LORA_CONTAINER"):
+    log.warning("LORA_CONTAINER is DEPRECATED; use AZURE_LORA_CONTAINER instead.")
 SQL_SERVER              = os.environ.get("SQL_SERVER", "bettersnap-srv.database.windows.net")
 SQL_DATABASE            = os.environ.get("SQL_DATABASE", "bettersnap-db")
 KEY_VAULT_URL           = "https://bettersnapkeyvault.vault.azure.net/"
@@ -63,37 +66,75 @@ blob_service = BlobServiceClient(
     account_url=f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net",
     credential=credential
 )
-queue_client = QueueClient(
-    account_url=f"https://{AZURE_STORAGE_ACCOUNT}.queue.core.windows.net",
-    queue_name=AZURE_QUEUE_NAME,
-    credential=credential,
-    # Messages are enqueued base64-encoded (to match the Functions queue
-    # extension default); decode them symmetrically on receive.
-    message_decode_policy=TextBase64DecodePolicy(),
-)
+
+
+# ── Blob helper ───────────────────────────────────────────
+def _read_blob(container: str, blob_name: str, *, retries: int = 3, base_delay: float = 0.5) -> bytes:
+    """Download a blob's bytes, retrying TRANSIENT failures with exponential backoff.
+    A definitive ResourceNotFoundError (BlobNotFound) is NOT retried — it is re-raised
+    immediately so callers can tell 'missing' (e.g. retention deleted the crops) from
+    'flaky' (a transient blip that would otherwise fail a 30-min job). Centralizes the
+    retry policy (count / backoff / logging) that was previously hand-rolled per read.
+    Raises the last transient error after `retries` attempts."""
+    from azure.core.exceptions import ResourceNotFoundError
+    last = None
+    for attempt in range(retries):
+        try:
+            return blob_service.get_blob_client(
+                container=container, blob=blob_name).download_blob().readall()
+        except ResourceNotFoundError:
+            raise  # definitive 'not there' — do not retry; let the caller decide
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(f"blob read {container}/{blob_name} failed "
+                            f"(attempt {attempt + 1}/{retries}: {e}); retrying in {delay:.1f}s")
+                time.sleep(delay)
+    raise last
+
 
 # ── Key Vault helper ──────────────────────────────────────
-def get_secret(name: str) -> str:
-    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
-    return kv_client.get_secret(name).value
+# Cache the SecretClient + fetched values in-process (mirrors shared/keyvault.py): rebuilding
+# the client and re-reading Key Vault on every call is a wasteful round-trip, and secrets change
+# rarely, so a short TTL is safe. The inference container runs ONE job single-threaded, so no
+# locking is needed (unlike the multi-threaded Functions host the backend guards).
+_kv_client = None
+_secret_cache: "dict[str, tuple[float, str]]" = {}
+_SECRET_TTL = int(os.environ.get("KEYVAULT_CACHE_TTL_SECONDS", "600"))
 
-# ── Debug logger to blob ──────────────────────────────────
+
+def get_secret(name: str) -> str:
+    global _kv_client
+    now = time.time()
+    cached = _secret_cache.get(name)
+    if cached and (now - cached[0]) < _SECRET_TTL:
+        return cached[1]
+    if _kv_client is None:
+        _kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+    value = _kv_client.get_secret(name).value
+    _secret_cache[name] = (now, value)
+    return value
+
+# ── Debug logger to blob (append-blob; see runtime/debug_log.py, M9) ──────────
+# Per-job log blob namespaced by JOB_ID (isolates concurrent A100 runs). The logger APPENDS each
+# line to an Azure Append Blob — O(1) per call, no read-modify-write of the whole growing log
+# (was O(n^2) per job and reset the log to one line on a transient download failure), and each
+# line persists immediately so the log survives an OOM SIGKILL. Built lazily on first use.
+_debug_log = None
+
+
 def write_debug(msg: str):
+    global _debug_log
     try:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         line = f"[{timestamp}] {msg}\n"
-        # Per-job log blob. The old code appended EVERY run to one shared
-        # outputs/debug/log.txt with overwrite=True, so two concurrent A100 runs
-        # clobbered each other's logs (read-modify-write race) and the blob grew
-        # unbounded. Namespacing by JOB_ID isolates each run's log.
         job_id = os.environ.get("JOB_ID", "unknown")
         blob_name = f"debug/{job_id}.txt"
-        blob_client = blob_service.get_blob_client(container="outputs", blob=blob_name)
-        try:
-            existing = blob_client.download_blob().readall().decode()
-        except:
-            existing = ""
-        blob_client.upload_blob(existing + line, overwrite=True)
+        if _debug_log is None:
+            from runtime.debug_log import BlobDebugLog
+            _debug_log = BlobDebugLog(blob_service, AZURE_BLOB_CONTAINER)
+        _debug_log.append(blob_name, line)
     except Exception as e:
         log.error(f"write_debug failed: {e}")
 
@@ -122,6 +163,27 @@ def get_db_connection(max_attempts: int = 5, base_delay: float = 3.0):
 # ── Global pipeline (SDXL txt2img) + Real-ESRGAN upscaler ─
 pipe     = None
 upscaler = None   # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause) — 2K post-process
+ip_adapter_ok = False   # IP-Adapter Plus-Face loaded successfully?
+img2img_pipe = None     # SDXL img2img (shares pipe's UNet/LoRA/IP-Adapter) for face refine
+_face_cascade = None    # cv2 Haar cascade for locating the face to refine
+cn_pipe = None          # SDXL depth-ControlNet pipe (shares pipe.components) — pose reference, default off
+depth_estimator = None  # {"model":DPT, "proc":DPTImageProcessor} for depth maps — pose reference, default off
+
+# Per-stage init outcome for the run manifest: name -> {enabled, initialized, reason[, error]}.
+# Populated by load_base_model via stage_runtime.run_stage. SINGLE-JOB INVARIANT: the GPU
+# worker serves ONE job per container execution (one JOB_ID, no threads), so a module-global
+# is safe. If the worker is ever changed to serve concurrent jobs in one process, this must
+# become per-job state (pass a fresh dict into run_stage per job) — see stage_runtime.py.
+STAGE_STATUS = {}
+
+
+class IpAdapterReferenceUnavailable(RuntimeError):
+    """IP-Adapter is enabled but the user's reference face crops are unavailable at
+    generation time (retention deletes the input crops after N days). We FAIL the job
+    clearly rather than silently dropping to LoRA-only — that would change output quality
+    with no error and no signal to anyone. The __main__ handler catches this like any
+    other generation error and marks the job 'failed' (which refunds)."""
+    code = "IP_ADAPTER_REFERENCE_UNAVAILABLE"
 
 # ─────────────────────────────────────────────────────────
 # PRODUCT-LEVEL MENU + PROMPT CONFIG (general — identical for every user)
@@ -129,31 +191,6 @@ upscaler = None   # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause) — 2K post-process
 # is used; the user's identity (face, skin tone, features, build) comes ENTIRELY
 # from their trained LoRA, never from anything hardcoded below.
 # ─────────────────────────────────────────────────────────
-
-# Phase-1 STARTER background menu (3). The full canonical 13-category menu
-# (6 professional + 7 personal) lands after Phase 1 proves txt2img works.
-BACKGROUND_MENU = [
-    ("studio_white", "against a clean, pure white photography studio backdrop"),
-    ("studio_gray",  "against a smooth neutral gray photography studio backdrop"),
-    ("modern_office","in a modern corporate office with softly blurred glass walls behind"),
-]
-
-# Phase-1 STARTER attire menu, keyed by gender (2 each). 'neutral' is the
-# fallback when gender is absent/unknown — we NEVER assume male or female.
-ATTIRE_MENU = {
-    "female":  [
-        "a tailored navy blazer over a white blouse",
-        "a charcoal grey business suit",
-    ],
-    "male":    [
-        "a navy blue business suit with a white shirt and tie",
-        "a charcoal grey business suit",
-    ],
-    "neutral": [
-        "professional business attire",
-        "a charcoal grey business suit",
-    ],
-}
 
 # Subject noun driven by gender — fixes the "gender is a dead read" bug (it was
 # read then never used, and defaulted to male). No default is assumed here.
@@ -171,9 +208,6 @@ LIGHTING = [
     "bright high-key studio lighting",
 ]
 
-# General SDXL seeds — enough distinct values to span a full menu without repeats.
-SEEDS = [42, 1337, 9999, 77777, 271828, 161803, 314159, 112358]
-
 # GENERAL anti-idealization defaults (NOT tuned to any person). Env-overridable
 # for GLOBAL tuning only — never set per-user.
 #  • CFG ~6: enough for the scene/attire prompt to land WITHOUT over-idealizing
@@ -181,11 +215,70 @@ SEEDS = [42, 1337, 9999, 77777, 271828, 161803, 314159, 112358]
 #  • LoRA identity weight ~1.0: let the user's own trained identity dominate.
 DEFAULT_CFG           = float(os.environ.get("GUIDANCE_SCALE", "6.0"))
 DEFAULT_LORA_WEIGHT   = float(os.environ.get("LORA_IDENTITY_WEIGHT", "1.0"))
+# IP-Adapter Plus-Face conditioning strength (0 disables). FROZEN at 0.2 (DECISIONS.md A1):
+# an A/B on female+male subjects showed 0.6 OVER-conditions — visible reference bleed that
+# fights the attire/scene prompt — while 0.2 follows the prompt and preserves likeness.
+# Env-tunable for A/B testing, but the DEFAULT must stay 0.2 so a missing/dropped env var
+# can't silently revert to the rejected 0.6. Deployment also sets it explicitly (job.yaml).
+IP_ADAPTER_SCALE      = float(os.environ.get("IP_ADAPTER_SCALE", "0.2"))
+# Which fetched reference crop feeds IP-Adapter (Phase-3 ablation). DEFAULT 0 = the first
+# crop = current behavior (strategy A), so the baseline / Phase-2 control is unchanged. The
+# harness (evaluation.reference_selection) picks a best-quality index for strategy B and it
+# is passed in via this env — the GPU worker does no detection of its own. Clamped to the
+# available crops at use time.
+IP_ADAPTER_REF_INDEX  = int(os.environ.get("IP_ADAPTER_REF_INDEX", "0"))
+# How many crops _get_ref_faces tries to download (img0..img{N-1}). Was a hardcoded 3,
+# which made img3+ unreachable for IP_ADAPTER_REF_INDEX above. Measured cost of the larger
+# window is ~0.1 s and ~16 MB (see _get_ref_faces), so the default now covers a full
+# training set. Index 0 is still img0.jpg -> DEFAULT OUTPUT IS UNCHANGED.
+IP_ADAPTER_REF_FETCH_N = int(os.environ.get("IP_ADAPTER_REF_FETCH_N", "12"))
+# Phase-5 composition control: append explicit head-and-shoulders framing + composition
+# negatives to steer away from full-body/averted output. DEFAULT 0 so the Phase-2 baseline
+# (current prompts) is unchanged; the Phase-5 experiment sets it to 1.
+COMPOSITION_CONTROL   = os.environ.get("COMPOSITION_CONTROL", "0").strip() != "0"
+# Face-inpaint ("ADetailer") pass: after the base image, re-render JUST the face crop at
+# 1024 (with LoRA + IP-Adapter) so eyes/skin get real detail instead of upscaler-guessed
+# mush. STRENGTH controls how much is rewritten (0.35-0.5); too high drifts the face.
+FACE_REFINE_ENABLE    = os.environ.get("FACE_REFINE", "1").strip() != "0"
+FACE_REFINE_STRENGTH  = float(os.environ.get("FACE_REFINE_STRENGTH", "0.45"))
+# WHOLE-IMAGE realism pass: a light img2img over the FULL upscaled (2048) image. The plastic
+# hair + painterly look the user flagged comes mostly from Real-ESRGAN over-smoothing the
+# ENTIRE frame (not just the face) — a face-only refine can't reach the hair top or fabric.
+# Running img2img AFTER the upscale is the only ordering where re-injected texture survives
+# (ESRGAN already ran and can't re-smooth it). Low strength keeps identity/composition; it
+# just rebuilds fine detail (hair strands, skin pores, fabric weave). Shares pipe's UNet so
+# the identity LoRA + IP-Adapter stay active. Env-tunable so strength is A/B'd without a rebuild.
+REALISM_PASS_ENABLE   = os.environ.get("REALISM_PASS", "1").strip() != "0"
+REALISM_PASS_STRENGTH = float(os.environ.get("REALISM_STRENGTH", "0.18"))
+# Film grain: real camera sensors add luminance noise; a perfectly clean frame reads as "AI".
+# A subtle grain at the very end (post-refine, pre-watermark) is the cheapest realism win.
+# GRAIN_AMOUNT is the noise sigma in 0-255 space (~4-8 is subtle). 0 disables.
+FILM_GRAIN_AMOUNT     = float(os.environ.get("GRAIN_AMOUNT", "5.0"))
 DEFAULT_STEPS         = int(os.environ.get("NUM_INFERENCE_STEPS", "30"))
 DEFAULT_WIDTH         = int(os.environ.get("GEN_WIDTH", "1024"))
 DEFAULT_HEIGHT        = int(os.environ.get("GEN_HEIGHT", "1024"))
 # How many (background, attire) tuples one job spans (product wants ~4-6 for range).
 DEFAULT_NUM_OUTPUTS   = int(os.environ.get("NUM_OUTPUTS", "6"))
+
+# ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────────
+# Opt-in pose guidance: condition generation on the DEPTH of a set of reference photos
+# so outputs adopt those poses (head/shoulder position, framing, posture) while identity
+# still comes from the LoRA + IP-Adapter. The depth ControlNet (xinsir, Apache-2.0) + DPT
+# depth estimator are already BAKED into the image; this wires them, off by default.
+#   * A SINGLE reference would force ALL images into one pose (why ControlNet was left off).
+#     So we take a SET of refs (POSE_REF_PREFIX) and CYCLE them: image i uses ref[i % N].
+#     N good poses -> N varied professional poses, not N clones.
+#   * POSE_REF_SCALE is controlnet_conditioning_scale: how hard the depth forces the pose.
+#     ~0.5 guides pose without overpowering the attire/scene; 1.0 locks the pose harder.
+# DEFAULT OFF => the plain txt2img path runs UNCHANGED (byte-identical) until validated on GPU,
+# same discipline as EXPRESSION_CLAUSE / BODY_BUILD_CLAUSE / COMPOSITION_CONTROL.
+POSE_REF_ENABLE       = os.environ.get("POSE_REF_ENABLE", "0").strip() != "0"
+# Blob folder (in POSE_REF_CONTAINER) holding the pose-reference images (img0.jpg, img1.jpg, ...).
+POSE_REF_CONTAINER    = os.environ.get("POSE_REF_CONTAINER", "inputs")
+POSE_REF_PREFIX       = os.environ.get("POSE_REF_PREFIX", "").strip()
+POSE_REF_SCALE        = float(os.environ.get("POSE_REF_SCALE", "0.5"))
+# How many refs to try to fetch (img0..img{N-1}); the set is cycled across the output images.
+POSE_REF_FETCH_N      = int(os.environ.get("POSE_REF_FETCH_N", "12"))
 
 # DreamBooth trigger token baked into EVERY prompt as "ohwx <class>" so the
 # per-user identity LoRA actually FIRES. Every per-user LoRA is trained with this
@@ -262,11 +355,18 @@ def age_to_phrase(age_range: str) -> str:
 # ─────────────────────────────────────────────────────────
 
 def load_base_model():
-    global pipe, upscaler
+    # upscaler / img2img_pipe / _face_cascade are assigned inside the nested _init_*
+    # functions below, which declare their own `global`; only pipe and ip_adapter_ok are
+    # assigned directly in this scope.
+    global pipe, ip_adapter_ok
     if pipe is not None:
         return
 
     write_debug("START: load_base_model called")
+    # Fresh status each real load (the pipe!=None guard above means this runs once per
+    # process, but clearing keeps STAGE_STATUS honest if that guard ever changes).
+    STAGE_STATUS.clear()
+    ip_adapter_ok = False
 
     try:
         files = os.listdir("/models")
@@ -276,42 +376,133 @@ def load_base_model():
 
     try:
         write_debug("Loading SDXL txt2img + fp16-fix VAE from baked /models ...")
+        # VAE is env-configurable (default = baked fp16-fix VAE), mirroring BASE_MODEL
+        # below — so the actual load matches what the run manifest records (which already
+        # reads VAE_MODEL). Without this, setting VAE_MODEL changed ONLY the manifest.
+        _vae_path = os.environ.get("VAE_MODEL", "/models/sdxl-vae")
         vae = AutoencoderKL.from_pretrained(
-            "/models/sdxl-vae",
+            _vae_path,
             torch_dtype=torch.float16,
         )
+        write_debug(f"vae model: {_vae_path}")
         # Pure txt2img: identity comes from the per-user LoRA loaded per job, the
         # scene from the prompt. No source photo, no ControlNet at inference.
+        # Base checkpoint is env-configurable (default = baked SDXL 1.0). Lets an
+        # experimental image point at an alternate baked base (e.g. /models/realvis)
+        # WITHOUT changing default/production behavior. Also makes the actual load match
+        # what the run manifest records (which already read BASE_MODEL).
+        _base = os.environ.get("BASE_MODEL", "/models/sdxl-base")
         pipe = StableDiffusionXLPipeline.from_pretrained(
-            "/models/sdxl-base",
+            _base,
             vae=vae,
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
         )
+        write_debug(f"base model: {_base}")
         pipe = pipe.to("cuda")
 
-        # Real-ESRGAN x4 upscaler (RRDBNet, BSD-3-Clause — COMMERCIAL-SAFE) for the
-        # 2K post-process. Weight baked at /models/realesrgan (params_ema key). Kept
-        # resident on the A100 (its ~67MB weights + a single 1024→4096 pass fit
-        # easily in 80GB alongside the fp16 pipe). do NOT swap to a non-commercial
-        # upscaler. UPSCALE_TARGET=0 skips loading it.
-        if UPSCALE_TARGET > 0:
-            try:
-                upscaler = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4,
-                                   num_feat=64, num_block=23, num_grow_ch=32)
-                _sd = torch.load("/models/realesrgan/RealESRGAN_x4plus.pth",
-                                 map_location="cpu")
-                _sd = _sd.get("params_ema", _sd.get("params", _sd))
-                upscaler.load_state_dict(_sd, strict=True)
-                upscaler = upscaler.to("cuda").eval()
-                if UPSCALE_HALF:
-                    upscaler = upscaler.half()
-                write_debug(f"Real-ESRGAN upscaler loaded (target={UPSCALE_TARGET}, half={UPSCALE_HALF})")
-            except Exception as e:
-                # Non-fatal: fall back to raw 1024 rather than failing the whole job.
-                upscaler = None
-                write_debug(f"Upscaler load FAILED (shipping 1024): {e}")
+        # ── Optional pipeline stages (Phase-0 stage runner) ──────────────────────
+        # Each stage initializes independently and records {enabled, initialized,
+        # reason[, error]} in STAGE_STATUS for the run manifest. Policy: a DISABLED stage
+        # is skipped and recorded; an ENABLED stage that fails to initialize is FATAL —
+        # no more silently continuing with a required quality stage missing (the bug that
+        # made face-refine + realism never run in prod when cv2 was absent). EXCEPTION:
+        # 'upscale' degrades to 1024 and records reason=degraded_to_1024 rather than
+        # failing a ~30-min job over a resolution downgrade. See stage_runtime.py.
+        def _init_ip_adapter():
+            # IP-Adapter Plus-Face (CLIP ViT-H, commercial-safe): conditions on the user's
+            # own face crop (applied per job), alongside the identity LoRA.
+            global ip_adapter_ok
+            pipe.load_ip_adapter(
+                "/models/ip-adapter",
+                subfolder="sdxl_models",
+                weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+                image_encoder_folder="models/image_encoder",
+            )
+            ip_adapter_ok = True
+            write_debug("IP-Adapter Plus-Face loaded (CLIP ViT-H)")
+
+        def _init_upscaler():
+            # Real-ESRGAN x4 (RRDBNet, BSD-3-Clause — COMMERCIAL-SAFE). Weight baked at
+            # /models/realesrgan (params_ema key). do NOT swap to a non-commercial upscaler.
+            global upscaler
+            up = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4,
+                         num_feat=64, num_block=23, num_grow_ch=32)
+            _sd = torch.load("/models/realesrgan/RealESRGAN_x4plus.pth", map_location="cpu")
+            _sd = _sd.get("params_ema", _sd.get("params", _sd))
+            up.load_state_dict(_sd, strict=True)
+            up = up.to("cuda").eval()
+            if UPSCALE_HALF:
+                up = up.half()
+            upscaler = up
+            write_debug(f"Real-ESRGAN upscaler loaded (target={UPSCALE_TARGET}, half={UPSCALE_HALF})")
+
+        def _init_shared_img2img():
+            # The ONE img2img pipe shared by realism + face-refine. Shares pipe.components
+            # (same UNet/LoRA/IP-Adapter — no second SDXL load). Lazy + idempotent, so
+            # realism no longer depends on face-refine being enabled.
+            global img2img_pipe
+            if img2img_pipe is None:
+                from diffusers import StableDiffusionXLImg2ImgPipeline
+                img2img_pipe = StableDiffusionXLImg2ImgPipeline(**pipe.components)
+
+        def _init_face_refine():
+            # Requires BOTH the shared img2img pipe AND the Haar detector; either failing
+            # must leave the stage un-initialized (so run_stage records init_failed).
+            global _face_cascade
+            import cv2
+            _init_shared_img2img()
+            casc = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            if casc.empty():
+                raise RuntimeError("Haar face cascade failed to load (empty classifier)")
+            _face_cascade = casc
+            write_debug("Face-inpaint img2img pipe + detector ready")
+
+        def _init_realism():
+            # Realism's only init-time prerequisite is the shared img2img pipe (ref_face is
+            # per-image/optional; prompts + steps/CFG are module constants). Named so any
+            # future realism-only prereq lives here and is required BEFORE 'initialized'.
+            _init_shared_img2img()
+            write_debug("Realism img2img pipe ready")
+
+        def _init_pose_ref():
+            # Pose reference (depth-ControlNet) — DEFAULT OFF. Loads the baked depth ControlNet
+            # (xinsir, Apache-2.0) + DPT depth estimator and builds an SDXL ControlNet pipe from
+            # the SAME components as the base pipe (shares UNet/LoRA/IP-Adapter — no second SDXL
+            # load), exactly like _init_shared_img2img. Only reached when POSE_REF_ENABLE.
+            global cn_pipe, depth_estimator
+            from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+            from transformers import DPTForDepthEstimation, DPTImageProcessor
+            cn = ControlNetModel.from_pretrained(
+                "/models/controlnet-depth-sdxl",
+                torch_dtype=torch.float16, use_safetensors=True).to("cuda")
+            # ControlNet pipe shares every base component; controlnet is the only addition.
+            cn_pipe = StableDiffusionXLControlNetPipeline(**pipe.components, controlnet=cn)
+            if IP_ADAPTER_SCALE > 0 and ip_adapter_ok:
+                # The IP-Adapter scale lives on the shared UNet attn processors, but set it on
+                # this pipe handle too so cn_pipe(ip_adapter_image=...) conditions identically.
+                try:
+                    cn_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+                except Exception as e:
+                    write_debug(f"pose_ref: set_ip_adapter_scale on cn_pipe failed (non-fatal): {e}")
+            depth_estimator = {
+                "model": DPTForDepthEstimation.from_pretrained(
+                    "/models/dpt-hybrid-midas", torch_dtype=torch.float16).to("cuda").eval(),
+                "proc": DPTImageProcessor.from_pretrained("/models/dpt-hybrid-midas"),
+            }
+            write_debug(f"pose_ref: depth ControlNet + DPT loaded (scale={POSE_REF_SCALE})")
+
+        def _stage(name, enabled, init_fn, **kw):
+            return run_stage(name, enabled, init_fn, STAGE_STATUS, log=write_debug, **kw)
+
+        _stage("ip_adapter",  IP_ADAPTER_SCALE > 0, _init_ip_adapter)
+        _stage("upscale",     UPSCALE_TARGET > 0,   _init_upscaler,
+               fatal=False, degraded_reason="degraded_to_1024")
+        _stage("face_refine", FACE_REFINE_ENABLE,   _init_face_refine)
+        _stage("realism",     REALISM_PASS_ENABLE,  _init_realism)
+        _stage("pose_ref",    POSE_REF_ENABLE,      _init_pose_ref)
 
         try:
             props = torch.cuda.get_device_properties(0)
@@ -329,23 +520,6 @@ def load_base_model():
         raise
 
 
-def load_category_lora(category: str) -> bool:
-    """Download + register the category LoRA. Returns True if the adapter was
-    loaded, False otherwise. Caller decides set_adapters from what loaded."""
-    lora_path = f"/tmp/lora_category_{category}.safetensors"
-    blob_name  = f"category/{category}/adapter_model.safetensors"
-    try:
-        blob_client = blob_service.get_blob_client(container=AZURE_LORA_CONTAINER, blob=blob_name)
-        with open(lora_path, "wb") as f:
-            f.write(blob_client.download_blob().readall())
-        pipe.load_lora_weights(lora_path, adapter_name="category_lora")
-        log.info(f"✅ Category LoRA loaded: {category}")
-        return True
-    except Exception as e:
-        log.warning(f"⚠️ Category LoRA not found for '{category}': {e}")
-        return False
-
-
 def load_identity_lora(user_id: str) -> bool:
     """Download + register the identity LoRA from
     lora-weights/identity/<user_id>/adapter_model.safetensors. Returns True if the
@@ -359,9 +533,8 @@ def load_identity_lora(user_id: str) -> bool:
     lora_path = f"/tmp/lora_identity_{user_id}.safetensors"
     blob_name  = f"identity/{user_id}/adapter_model.safetensors"
     try:
-        blob_client = blob_service.get_blob_client(container=AZURE_LORA_CONTAINER, blob=blob_name)
         with open(lora_path, "wb") as f:
-            f.write(blob_client.download_blob().readall())
+            f.write(_read_blob(AZURE_LORA_CONTAINER, blob_name))
 
         import logging as _logging
         caught = []
@@ -389,113 +562,6 @@ def load_identity_lora(user_id: str) -> bool:
         log.warning(f"⚠️ Identity LoRA not found/failed for '{user_id}': {e}")
         return False
 
-
-def unload_loras():
-    try:
-        pipe.unload_lora_weights()
-        log.info("✅ LoRAs unloaded")
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────────────────
-# Image utilities
-# ─────────────────────────────────────────────────────────
-
-def generate_sas_url(container: str, blob_name: str, expiry_hours: int = 24) -> str:
-    sas_token = generate_blob_sas(
-        account_name=AZURE_STORAGE_ACCOUNT,
-        container_name=container,
-        blob_name=blob_name,
-        account_key=AZURE_STORAGE_KEY,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
-    )
-    return f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/{container}/{blob_name}?{sas_token}"
-
-
-def load_image_from_blob(container: str, blob_name: str) -> Image.Image:
-    blob_client = blob_service.get_blob_client(container=container, blob=blob_name)
-    data = blob_client.download_blob().readall()
-    return Image.open(io.BytesIO(data)).convert("RGB")
-
-
-def resize_for_sdxl(img: Image.Image) -> Image.Image:
-    # SDXL is trained at ~1024². Cap the long edge at 1024 and snap to a multiple
-    # of 8 (SDXL's latent stride). Today's render is text-to-image so this is only
-    # used to validate the input-blob read path; it becomes load-bearing when the
-    # img2img / identity path lands.
-    target = 1024
-    w, h   = img.size
-    ratio  = min(target / w, target / h)
-    new_w  = (int(w * ratio) // 8) * 8
-    new_h  = (int(h * ratio) // 8) * 8
-    return img.resize((new_w, new_h), Image.LANCZOS)
-
-
-def upscale_image(img: Image.Image) -> Image.Image:
-    """Real-ESRGAN x4 (BSD-3-Clause, commercial-safe) upscale, then fit the long
-    edge to UPSCALE_TARGET (2K). POST-PROCESS ONLY — no regeneration, identity is
-    untouched. Runs on the A100 right after generation. Falls back to the input
-    image if the upscaler failed to load.
-
-    commercial-safe license — do NOT swap to a non-commercial upscaler."""
-    if upscaler is None or UPSCALE_TARGET <= 0:
-        return img
-    dtype = torch.float16 if UPSCALE_HALF else torch.float32
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    ten = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=dtype)
-    with torch.no_grad():
-        out = upscaler(ten).clamp(0, 1)
-    out = (out.squeeze(0).permute(1, 2, 0).float().cpu().numpy() * 255.0)
-    up = Image.fromarray(out.round().astype(np.uint8))   # 4096² for a 1024² input
-    # Fit the long edge to the 2K target (high-quality Lanczos downscale from x4).
-    w, h = up.size
-    if max(w, h) != UPSCALE_TARGET:
-        ratio = UPSCALE_TARGET / max(w, h)
-        up = up.resize((round(w * ratio), round(h * ratio)), Image.LANCZOS)
-    return up
-
-
-def add_watermark(img: Image.Image) -> Image.Image:
-    img        = img.convert("RGBA")
-    w, h       = img.size
-    bar_height = int(h * 0.07)
-    overlay    = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw       = ImageDraw.Draw(overlay)
-    draw.rectangle([(0, h - bar_height), (w, h)], fill=(0, 0, 0, 160))
-    text      = "BetterSnap AI"
-    font_size = int(bar_height * 0.55)
-    font_paths = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    font = None
-    for path in font_paths:
-        if os.path.exists(path):
-            font = ImageFont.truetype(path, font_size)
-            break
-    if font is None:
-        font = ImageFont.load_default()
-    bbox   = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    x      = (w - text_w) // 2
-    y      = h - bar_height + (bar_height - text_h) // 2
-    draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 180))
-    draw.text((x, y),         text, font=font, fill=(255, 255, 255, 230))
-    return Image.alpha_composite(img, overlay).convert("RGB")
-
-
-def upload_image_to_blob(img: Image.Image, job_id: str, index: int) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    blob_name   = f"results/{job_id}/headshot_{index + 1}.png"
-    blob_client = blob_service.get_blob_client(container=AZURE_BLOB_CONTAINER, blob=blob_name)
-    blob_client.upload_blob(buf, overwrite=True)
-    log.info(f"✅ Uploaded: {blob_name}")
-    return blob_name
 
 
 # ─────────────────────────────────────────────────────────
@@ -555,19 +621,36 @@ def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
                     f"(transitioned={transitioned}, credits_refunded={refund if transitioned else 0})"
                 )
             elif status == "completed":
+                # GUARDED like the 'failed' path above: only complete a job that is still
+                # in-flight. Without this, a job the reaper already marked 'failed' (and
+                # REFUNDED) could be overwritten to 'completed' when the GPU finishes late —
+                # the user would keep BOTH the refund AND the delivered images. If the row is
+                # already terminal, this is a no-op (rowcount 0) and we leave it 'failed'.
                 cursor.execute("""
                     UPDATE jobs
                     SET status = ?, output_blob_path = ?, completed_at = GETUTCDATE()
-                    WHERE job_id = ?
+                    WHERE job_id = ? AND status NOT IN ('failed', 'completed')
                 """, status, output_json, job_id)
+                transitioned = cursor.rowcount == 1
                 conn.commit()
-                log.info(f"✅ Job {job_id} status updated to 'completed'")
+                if transitioned:
+                    log.info(f"✅ Job {job_id} status updated to 'completed'")
+                else:
+                    log.warning(
+                        f"Job {job_id} completion IGNORED — row already terminal (likely reaped "
+                        f"to 'failed' and refunded). Not overwriting, to avoid a double credit "
+                        f"(refund + delivered images)."
+                    )
             else:
-                # non-terminal (e.g. 'processing') — do NOT stamp completed_at
+                # non-terminal (e.g. 'processing') — do NOT stamp completed_at, and GUARD it
+                # like the terminal paths: a job the reaper already drove to 'failed' (and
+                # refunded) must NOT be flipped back to 'processing' — that reopens the
+                # double-credit race (user keeps the refund AND the delivered images). If the
+                # row is already terminal this is a no-op (rowcount 0). (Audit FF2)
                 cursor.execute("""
                     UPDATE jobs
                     SET status = ?, output_blob_path = ?
-                    WHERE job_id = ?
+                    WHERE job_id = ? AND status NOT IN ('failed', 'completed')
                 """, status, output_json, job_id)
                 conn.commit()
                 log.info(f"✅ Job {job_id} status updated to '{status}'")
@@ -636,228 +719,319 @@ def notify_user_email(job_id: str, user_id: str, result_blob_paths: list):
         log.warning(f"⚠️ Completion email FAILED for job_id={job_id} (non-fatal): {e}")
 
 
+def _get_ref_faces(user_id: str, n: int = None):
+    """Download up to `n` of the user's face crops (from the `inputs` container) to use as
+    IP-Adapter Plus-Face reference images. These are the SAME crops the LoRA trained on, so
+    the two identity signals agree.
+
+    WHY THIS FETCHES ALL CROPS, NOT THE FIRST 3 (2026-07-23)
+    -------------------------------------------------------
+    The old default (n=3) was a prototype value, not a constraint: it made crops img3+
+    UNREACHABLE for IP_ADAPTER_REF_INDEX, so reference selection could only ever choose
+    among the first three. Measured on a real user's set, the centroid-closest crop was
+    img7 (0.934) while the fetched-3 window contained only 0.829-0.909 and the pipeline
+    used img0 (0.835) — i.e. the best reference was structurally unreachable.
+    Measured cost of fetching all ~9 instead of 3: +1.1 MB download, +5 blob reads
+    (~50-150 ms in-region), +16 MB RAM for the decoded PIL images — against a 14-minute
+    job that peaks at 11.1 GB VRAM. Negligible, so there is no performance argument for
+    the smaller window. DEFAULT BEHAVIOR IS UNCHANGED: index 0 is still img0.jpg, so the
+    baseline pipeline picks the same reference it always did; only the *reachable* set
+    grows. Missing indices are skipped (ResourceNotFoundError is not retried), so
+    over-asking is cheap and a short crop set costs a few fast 404s.
+
+    IMPORTANT: these crops live under the user's `inputs` prefix, which retention deletes —
+    so at generation time they may be gone. The caller decides what to do with an empty
+    result (see the IP_ADAPTER_REFERENCE_UNAVAILABLE path); this function only reports.
+
+    Returns (refs, ids): a list of PIL RGB images and the parallel list of blob basenames
+    that were actually fetched, so callers can log/record EXACTLY which references exist and
+    which one is used (the pipeline currently uses index 0 only)."""
+    import io
+    from PIL import Image
+    if n is None:
+        n = IP_ADAPTER_REF_FETCH_N
+    refs, ids = [], []
+    for i in range(n):
+        blob_name = f"{user_id}/{catalog.CROP_SUBDIR}/img{i}.jpg"
+        try:
+            data = _read_blob("inputs", blob_name)
+            refs.append(Image.open(io.BytesIO(data)).convert("RGB"))
+            ids.append(f"img{i}.jpg")
+        except Exception as e:
+            write_debug(f"IP-Adapter ref img{i} unavailable: {e}")
+    return refs, ids
+
+
+def _depth_map(pil_img, size: int = 1024):
+    """DPT depth map of `pil_img` as a size×size RGB PIL image (the ControlNet control input).
+    Normalized to full 0-255 range so near/far contrast is consistent regardless of the source
+    scene. Only called on the pose-reference path (POSE_REF_ENABLE); depth_estimator is loaded."""
+    import numpy as np
+    from PIL import Image
+    proc = depth_estimator["proc"]
+    model = depth_estimator["model"]
+    inputs = proc(images=pil_img, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to("cuda", dtype=torch.float16)
+    with torch.no_grad():
+        depth = model(pixel_values=pixel_values).predicted_depth  # (1, H, W)
+    depth = torch.nn.functional.interpolate(
+        depth.unsqueeze(1).float(), size=(size, size), mode="bicubic", align_corners=False)
+    lo, hi = depth.min(), depth.max()
+    depth = (depth - lo) / (hi - lo + 1e-8)
+    arr = (depth.squeeze().cpu().numpy() * 255.0).astype("uint8")
+    return Image.fromarray(np.stack([arr, arr, arr], axis=-1))  # 3-channel depth
+
+
+def _get_pose_ref_depths(n: int = None):
+    """Fetch the pose-reference images from POSE_REF_CONTAINER/POSE_REF_PREFIX (img0.jpg,
+    img1.jpg, ...) and return their DEPTH maps as a list of PIL images, in order. The caller
+    CYCLES this list across the output images so N refs give N varied poses. Empty POSE_REF_PREFIX
+    or no images -> [] (caller then falls back to the plain txt2img path). Only the pose-ref path
+    calls this."""
+    import io
+    from PIL import Image
+    if n is None:
+        n = POSE_REF_FETCH_N
+    if not POSE_REF_PREFIX:
+        write_debug("pose_ref: POSE_REF_PREFIX unset -> no pose references")
+        return []
+    prefix = POSE_REF_PREFIX.rstrip("/")
+    depths = []
+    for i in range(n):
+        blob_name = f"{prefix}/img{i}.jpg"
+        try:
+            data = _read_blob(POSE_REF_CONTAINER, blob_name)
+            src = Image.open(io.BytesIO(data)).convert("RGB")
+            depths.append(_depth_map(src, size=DEFAULT_WIDTH))
+        except Exception as e:
+            write_debug(f"pose_ref img{i} unavailable: {e}")
+    write_debug(f"pose_ref: computed {len(depths)} depth map(s) from {POSE_REF_CONTAINER}/{prefix}/")
+    return depths
+
+
 # ─────────────────────────────────────────────────────────
 # Core inference
 # ─────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────
+# Phase 2 orchestrator (engine-based) — ARCHITECTURE.md §4/§7
+# ─────────────────────────────────────────────────────────
+
 def run_inference(job: dict) -> list:
+    """Phase 2 orchestrator — owns the workflow; engines are leaves (none calls another).
+
+    Behavior matches the pre-refactor implementation on the DETERMINISTIC subset (verified
+    pixel-identical, txt2img + upscale): the
+    per-image prompt/generation/enhancement/delivery code was MOVED into the engines, not
+    changed. Model setup (identity LoRA, adapters, IP-Adapter, reference faces) runs in the SAME
+    order as legacy, BEFORE any engine. Enhancement stays non-deterministic exactly as before."""
+    import sys
+    from domain import (GenerationPlan, Plan, PlanType, CategoryRule, GenerationJob,
+                        ScoredCandidate, Winner, Scores, Ref, RefKind)
+    from runtime import PipelineContext
+    from runtime.engines.prompt_sdxl import SdxlPromptEngine
+    from runtime.engines.generation_sdxl import SdxlGenerationEngine
+    from runtime.engines.enhancement_sdxl import SdxlEnhancementEngine
+    from runtime.engines.delivery_blob import BlobDeliveryEngine
+
+    cfg = sys.modules[__name__]
     job_id     = job["job_id"]
     user_id    = job["user_id"]
     job_params = json.loads(job.get("job_params", "{}"))
 
-    # ── Per-user attributes (from THIS user's job_params; NO assumed defaults) ──
-    # These come from the user's own onboarding data; the pipeline is identical for
-    # every user — only the values (and their LoRA) differ.
-    gkey       = normalize_gender(job_params.get("gender"))         # dead-read bug FIXED
-    age_phrase = age_to_phrase(job_params.get("age_range", ""))     # silent-drop bug FIXED
-    hair_color = (job_params.get("hair_color") or "").strip().lower()
-
-    # ── User's GLOBAL cross-category selections + plan-driven count ────────────
-    # attire_ids / background_ids are category-qualified refs ("business_suit.navy_
-    # suit_tie") the user picked in the UI — they may span professional AND personal
-    # categories (Pro/Expert). The catalog turns each ref into a gender-aware phrase.
-    # image_count comes from the user's PLAN (resolved in function_app.submit_job) —
-    # NOT a fixed constant. custom_prompt is set only for the custom_scene mode
-    # (user-typed scene), which we WRAP with identity + quality below. IMAGE_COUNT_
-    # OVERRIDE (env, off by default) caps the count for cheap wiring tests.
-    attire_refs      = job_params.get("attire_ids") or []
-    background_refs  = job_params.get("background_ids") or []
-    custom_prompt    = (job_params.get("custom_prompt") or "").strip()
-    image_count      = int(job_params.get("image_count") or DEFAULT_NUM_OUTPUTS)
+    attire_refs     = job_params.get("attire_ids") or []
+    background_refs = job_params.get("background_ids") or []
+    custom_prompt   = (job_params.get("custom_prompt") or "").strip()
+    image_count     = int(job_params.get("image_count") or DEFAULT_NUM_OUTPUTS)
     _test_cap = int(os.environ.get("IMAGE_COUNT_OVERRIDE", "0") or "0")
     if _test_cap > 0:
         image_count = min(image_count, _test_cap)
-    image_count      = max(1, min(image_count, 100))                # hard safety clamp
+    image_count = max(1, min(image_count, 100))
+    write_debug(f"[orchestrator] job={job_id} image_count={image_count} "
+                f"custom={'yes' if custom_prompt else 'no'}")
 
-    subject = SUBJECT_NOUN[gkey]
-    write_debug(
-        f"User attrs: gender={job_params.get('gender')!r}->{gkey} subject='{subject}' "
-        f"age_range={job_params.get('age_range')!r}->age_phrase={age_phrase!r} "
-        f"hair={hair_color!r} attire_refs={attire_refs} background_refs={background_refs} "
-        f"image_count={image_count} custom={'yes' if custom_prompt else 'no'} "
-        f"test_cap={_test_cap or 'off'}"
-    )
-
-    # ── Per-user identity LoRA — the ONLY thing carrying identity in txt2img ──
-    # Base SDXL is baked; the LoRA is the per-job fetch from
-    # lora-weights/identity/<user_id>/adapter_model.safetensors. Activated via
-    # set_adapters (compatible with cpu offload). active/weights built from what
-    # actually loaded, so a missing category adapter can't name an unloaded one.
+    # ── model setup — SAME ORDER as legacy (identity LoRA -> adapters -> IP) ──
     active, weights = [], []
-    # NOTE: category-style LoRAs are NOT deployed (no category/<x>/adapter_model.safetensors
-    # blobs exist), and selections now span MULTIPLE categories (attire_refs/background_refs),
-    # so there is no single `category` to load — the old `load_category_lora(category)` call
-    # referenced an undefined name and crashed every generation. Identity LoRA below is the
-    # only adapter carrying identity; attire/background are driven by the prompt.
     identity_ok = load_identity_lora(user_id)
     if identity_ok:
         active.append("identity_lora"); weights.append(DEFAULT_LORA_WEIGHT)
-
-    # HARD FAIL on a missing identity adapter. In txt2img the LoRA is the ONLY thing
-    # carrying the user's face — with no adapter, base SDXL renders a photogenic
-    # STRANGER and, before this check, happily uploaded it as the user's headshots.
-    # A loud failure (which refunds their credits via _mark_failed) is the only
-    # acceptable outcome; delivering someone else's face is not. /jobs/submit already
-    # gates on lora_status, so reaching here means the adapter blob is missing or
-    # unreadable — a real fault, not a user error.
     if not identity_ok:
         raise RuntimeError(
             f"identity LoRA missing for user_id={user_id} "
             f"(lora-weights/identity/{user_id}/adapter_model.safetensors) — refusing to "
             f"render base SDXL and pass off a generic face as this user's headshots"
         )
-
     pipe.set_adapters(active, adapter_weights=weights)
     write_debug(f"LoRA adapters ACTIVE: {active} weights={weights}")
 
-    try:
-        free_vram, total_vram = torch.cuda.mem_get_info(0)
+    use_ip_adapter = False
+    ref_faces = []
+    ref_idx = 0
+    ref_meta = {"fetched": [], "used": None, "scale": IP_ADAPTER_SCALE}
+    if ip_adapter_ok and IP_ADAPTER_SCALE > 0:
+        ref_faces, ref_ids = _get_ref_faces(user_id)
+        if not ref_faces:
+            raise IpAdapterReferenceUnavailable(
+                f"IP-Adapter enabled (scale={IP_ADAPTER_SCALE}) but NO reference face crops "
+                f"exist for user_id={user_id} at inputs/{user_id}/{catalog.CROP_SUBDIR}/ "
+                f"(retention may have deleted them). Refusing to silently fall back to "
+                f"LoRA-only. code={IpAdapterReferenceUnavailable.code}"
+            )
+        pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+        use_ip_adapter = True
+        ref_idx = IP_ADAPTER_REF_INDEX
+        if ref_idx < 0 or ref_idx >= len(ref_faces):
+            write_debug(f"IP_ADAPTER_REF_INDEX={ref_idx} out of range for "
+                        f"{len(ref_faces)} crops -> using 0")
+            ref_idx = 0
+        # M5: the configured crop can be a training-gate false positive (a wall/room crop with no
+        # face). Re-validate and fall back to a face-bearing crop before it conditions IP-Adapter.
+        from runtime.ref_face_gate import pick_face_ref_index
+        ref_idx, _ref_validation = pick_face_ref_index(
+            ref_faces, ref_ids, ref_idx, _face_cascade, write_debug)
+        ref_meta["face_validation"] = _ref_validation
+        ref_meta["fetched"] = ref_ids
+        ref_meta["used"] = ref_ids[ref_idx]
+        ref_meta["used_index"] = ref_idx
+        ref_meta["strategy"] = "A_first" if ref_idx == 0 else "B_selected"
         write_debug(
-            f"Pre-inference free VRAM: {free_vram/1024**3:.1f} GB "
-            f"of {total_vram/1024**3:.1f} GB total"
+            f"IP-Adapter ACTIVE: fetched {len(ref_faces)} crop(s) {ref_ids}; "
+            f"USING 1 (index {ref_idx} = {ref_ids[ref_idx]}); scale={IP_ADAPTER_SCALE}"
         )
-    except Exception as e:
-        write_debug(f"mem_get_info failed: {e}")
 
-    # ── Build this job's per-image plan ───────────────────────────────────────
-    # combos = cartesian product of the user's SELECTED attire refs × background
-    # refs, spanning ANY categories (Pro/Expert may mix professional + personal;
-    # the catalog drops unknown refs). The plan's image_count is distributed across
-    # combos by cycling (i % len), each image with a distinct seed so a repeated
-    # combo still varies. The custom_scene mode has NO menu — every image wraps the
-    # user's typed scene. The lead phrase + lighting are DERIVED PER-IMAGE from the
-    # BACKGROUND's category (a beach bg reads 'lifestyle portrait', golden lighting),
-    # even when the attire came from a different category.
-    is_custom = bool(custom_prompt)
-    combos = [] if is_custom else catalog.build_combos_global(attire_refs, background_refs)
-    if not is_custom and not combos:
-        raise ValueError(
-            f"No attire/background combos "
-            f"(attire_refs={attire_refs}, background_refs={background_refs})"
-        )
-    write_debug(
-        f"Plan: image_count={image_count} combos={len(combos)} custom={is_custom} "
-        f"trigger={IDENTITY_TRIGGER!r} CFG={DEFAULT_CFG} lora_w={DEFAULT_LORA_WEIGHT} "
-        f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT} steps={DEFAULT_STEPS}"
+    # ── B3: resolve effective gender from trained class_word (Policy B) ──────────────
+    # The LoRA is trained to bind the trigger token to "<IDENTITY_TRIGGER> <class_word>".
+    # Generation-time gender may differ (returning sessions re-default to "male", user changes
+    # preferences, legacy records). Use the TRAINED class_word as source of truth when available;
+    # fall back to generation-time gender for legacy records (no class_word).
+    gen_gender = job_params.get("gender") or ""
+    class_word_trained = job_params.get("class_word")
+    if class_word_trained and class_word_trained in SUBJECT_NOUN.values():
+        effective_gender = catalog.gender_from_class_word(class_word_trained)
+        if effective_gender:
+            gen_gender = effective_gender  # override: use the trained gender
+    # ─────────────────────────────────────────────────────────────────────────────────
+
+    # ── resolved plan + runtime context ──────────────────────────────────────
+    _plan = Plan(   # worker-side reconstruction; billing fields UNUSED here (control plane owns billing)
+        key=(job_params.get("plan_name") or "unknown"),
+        plan_type=PlanType.ONE_TIME, image_count=image_count, credits_per_image=1,
+        max_attires=99, max_backgrounds=99, category_rule=CategoryRule.MIXABLE,
+    )
+    plan = GenerationPlan(
+        user_id=user_id, job_id=job_id, plan=_plan,
+        billable_count=image_count, credit_cost=0, candidate_budget=image_count,
+        acceptance_threshold=0.0, retry_limit=0,
+        gender=gen_gender,
+        age_range=(job_params.get("age_range") or ""),
+        hair_color=(job_params.get("hair_color") or ""),
+        body_type=(job_params.get("body_type") or ""),
+        attire_refs=tuple(attire_refs), background_refs=tuple(background_refs),
+        custom_prompt=custom_prompt,
     )
 
-    _negative = os.environ.get("NEGATIVE_PROMPT", NEGATIVE_PROMPT)
+    ctx = PipelineContext(job_id, user_id)
+    ctx.models["pipe"] = pipe
+    ctx.models["upscaler"] = upscaler
+    ctx.models["img2img"] = img2img_pipe
+    ctx.models["face_cascade"] = _face_cascade
+    _ref = ref_faces[ref_idx] if (use_ip_adapter and ref_faces) else None
+    ctx.work["ip_adapter_ok"] = ip_adapter_ok
+    ctx.work["use_ip_adapter"] = use_ip_adapter
+    ctx.work["ip_adapter_image"] = _ref
+    ctx.work["ref_face"] = _ref
 
-    # Subject clause built ONCE from the user's REAL attributes — no beauty/
-    # idealization language anywhere (that lightened + slimmed the face). Bake the
-    # DreamBooth trigger so the per-user LoRA FIRES: "ohwx <woman|man|person>";
-    # without it the adapter loads but is never invoked → generic strangers.
-    subj = f"{IDENTITY_TRIGGER} {subject}" if IDENTITY_TRIGGER else f"a {subject}"
-    if age_phrase:
-        subj += f" {age_phrase}"
-    subj += hair_phrase(hair_color)
-    _tail = ("looking at the camera, sharp focus, high detail, realistic natural "
-             "skin texture, shot on a DSLR with an 85mm portrait lens.")
-
-    result_blob_paths = []
-    for i in range(image_count):
-        seed = 1000 + i                                   # distinct per image
-        if is_custom:
-            combo_label = "custom_scene"
-            lead = catalog.lead_phrase("custom_scene")
-            lighting = LIGHTING[i % len(LIGHTING)]
-            # Scene-only wrap: keep identity subj + quality tail + negatives around
-            # whatever the user typed (they supply only the scene/outfit).
-            prompt = f"{lead} {subj} {custom_prompt}. {lighting}, {_tail}"
+    # ── Pose reference (depth-ControlNet) — DEFAULT OFF ──────────────────────────
+    # When enabled AND the ControlNet pipe initialized AND we actually fetched depth maps,
+    # hand the generation engine the ControlNet pipe + the (cycled) depth maps. If ANY of
+    # those is missing, we leave these unset and the engine runs the plain txt2img path —
+    # so a misconfigured pose-ref run degrades to normal generation, never crashes.
+    if POSE_REF_ENABLE and cn_pipe is not None:
+        _pose_depths = _get_pose_ref_depths()
+        if _pose_depths:
+            ctx.models["cn_pipe"] = cn_pipe
+            ctx.work["pose_ref_depths"] = _pose_depths
+            ctx.work["pose_ref_scale"] = POSE_REF_SCALE
+            write_debug(f"pose_ref ACTIVE: {len(_pose_depths)} depth map(s), scale={POSE_REF_SCALE}")
         else:
-            attire_ref, bg_ref = combos[i % len(combos)]
-            attire    = catalog.attire_phrase_ref(attire_ref, gkey)
-            bg_phrase = catalog.background_phrase_ref(bg_ref)
-            lead      = catalog.lead_for_background_ref(bg_ref)        # style follows bg
-            _lighting = catalog.lighting_for_background_ref(bg_ref, LIGHTING)
-            # Advance lighting once per FULL CYCLE of combos, not per image.
-            # Indexing both by `i` aliases them whenever len(combos) and len(_lighting)
-            # share a factor — and the common case (2 attires x 2 backgrounds = 4 combos,
-            # 4 default lighting options) is the worst one: combo k would get lighting k
-            # every single time, so all 8 images of a combo shared a byte-identical prompt
-            # and differed only by seed. Dividing decorrelates the two cycles, so each
-            # combo walks through every lighting setup.
-            lighting  = _lighting[(i // len(combos)) % len(_lighting)]
-            combo_label = f"{bg_ref} | {attire_ref}"
-            prompt = f"{lead} {subj} wearing {attire}, {bg_phrase}. {lighting}, {_tail}"
-        log.info(f"📣 Output {i+1}/{image_count} [{combo_label}]: {prompt}")
-        try:
-            write_debug(
-                f"Output {i+1}: txt2img pipe() [{combo_label}] cfg={DEFAULT_CFG} seed={seed}"
-            )
-            output = pipe(
-                prompt=prompt,
-                negative_prompt=_negative,
-                guidance_scale=DEFAULT_CFG,
-                num_inference_steps=DEFAULT_STEPS,
-                width=DEFAULT_WIDTH,
-                height=DEFAULT_HEIGHT,
-                generator=torch.Generator("cuda").manual_seed(seed),
-            ).images[0]
+            write_debug("pose_ref enabled but no depth maps fetched -> plain txt2img path")
 
-            # Real inference VRAM peak on the first output — surfaces any OOM headroom.
-            if i == 0:
-                try:
-                    total = torch.cuda.get_device_properties(0).total_memory
-                    peak  = torch.cuda.max_memory_allocated(0)
-                    msg = (f"INFERENCE VRAM PEAK: max_memory_allocated={peak} "
-                           f"({peak / 1024**3:.1f} GB) of total_memory={total} "
-                           f"({total / 1024**3:.1f} GB)")
-                    log.info(f"🔎 {msg}")
-                    write_debug(msg)
-                except Exception as e:
-                    write_debug(f"inference VRAM probe failed: {e}")
+    # ── run: prompt -> generate -> [Phase-6 wrap] -> enhance -> deliver ───────
+    _gen_t0 = time.time()
+    prompt_engine = SdxlPromptEngine(ctx, cfg, write_debug)
+    gen_engine    = SdxlGenerationEngine(ctx, cfg, write_debug)
+    enh_engine    = SdxlEnhancementEngine(ctx, cfg, write_debug)
+    del_engine    = BlobDeliveryEngine(ctx, cfg, blob_service, STAGE_STATUS, write_debug)
 
-            # 2K post-process (Real-ESRGAN x4 → fit to UPSCALE_TARGET), then
-            # watermark at the final resolution (the bar scales with image height).
-            _pre = output.size
-            output    = upscale_image(output)
-            if i == 0:
-                write_debug(f"Upscaled {_pre} -> {output.size} (target={UPSCALE_TARGET})")
-            output    = add_watermark(output)
-            blob_path = upload_image_to_blob(output, job_id, i)
-            result_blob_paths.append(blob_path)
-            log.info(f"✅ Output {i+1} complete ({output.size[0]}x{output.size[1]})")
-        except Exception:
-            # Do NOT swallow: log the FULL traceback and re-raise so __main__ marks
-            # the job FAILED (and refunds), instead of a silent short/empty result.
-            log.error(
-                f"❌ Output {i+1} FAILED — full traceback:\n{traceback.format_exc()}"
-            )
-            raise
+    prompts    = prompt_engine.build(plan)
+    adapter    = Ref(RefKind.ADAPTER, f"/tmp/lora_identity_{user_id}.safetensors")
+    candidates = gen_engine.generate(prompts, adapter)
 
-    return result_blob_paths
+    # ── Diagnostic STAGE CAPTURE (instrumentation only; DEFAULT OFF) ──────────────
+    # When STAGE_CAPTURE=1, upload the RAW base-generation image (post SDXL+LoRA+IP-Adapter,
+    # BEFORE upscale/realism/face-refine) for each seed to a diagnostics prefix, IN ADDITION to
+    # the normal final delivery. This reads the already-produced ctx.images[gen://…] and writes
+    # EXTRA blobs only — it changes NO image computation, RNG, or delivered output, so it cannot
+    # affect results. Lets ONE run compare raw-vs-final expression (E1/E2 causal isolation).
+    if os.environ.get("STAGE_CAPTURE", "0").strip() == "1":
+        for i, c in enumerate(candidates):
+            try:
+                _raw = ctx.images[c.image_ref.location]
+                _buf = io.BytesIO(); _raw.save(_buf, format="PNG"); _buf.seek(0)
+                blob_service.get_blob_client(
+                    container=AZURE_BLOB_CONTAINER,
+                    blob=f"diagnostics/stages/{job_id}/headshot_{i + 1}_raw.png",
+                ).upload_blob(_buf, overwrite=True)
+                write_debug(f"STAGE_CAPTURE: raw headshot_{i + 1} -> diagnostics/stages/{job_id}/")
+            except Exception as e:
+                write_debug(f"STAGE_CAPTURE raw upload failed for candidate {i}: {e}")
 
+    # ── Phase-6 Quality Gate (DEFAULT OFF) ────────────────────────────────────────────
+    # QUALITY_GATE=1 scores candidates with a commercial-safe embedder, keeps the best per slot
+    # above threshold, and retries failed slots within candidate_budget BEFORE enhancement.
+    # DEFAULT OFF -> the historical pass-through below, so prod behavior is UNCHANGED until this
+    # is validated on an A100. (The commercial embedder is not integrated yet, so with the flag
+    # ON it raises NotImplementedError by design — the gate can never silently ship an
+    # unlicensed scorer.)
+    if os.environ.get("QUALITY_GATE", "0").strip() == "1":
+        from runtime.quality_gate import run_quality_gate_for_job
+        winners = run_quality_gate_for_job(
+            candidates, plan, ctx, ref_faces, prompt_engine, gen_engine, write_debug)
+    else:
+        winners = [
+            Winner(ScoredCandidate(c, Scores(identity=0.0), accepted=True),
+                   slot_id=(c.slot_id if c.slot_id is not None else i))
+            for i, c in enumerate(candidates)
+        ]
+    finals = enh_engine.enhance(winners)
 
-# ─────────────────────────────────────────────────────────
-# Queue polling (legacy)
-# ─────────────────────────────────────────────────────────
+    # Minimum inline quality gate (M4): every delivered image must contain a detectable face.
+    # Flags faceless images in the manifest; raises (-> fail + refund) only if the whole batch
+    # is faceless. Independent of the (validation-pending) full identity gate above.
+    _face_gate = enh_engine.face_present_gate(finals)
+    ctx.work["face_gate"] = _face_gate
 
-def process_queue():
-    log.info(f"📭 Polling queue: {AZURE_QUEUE_NAME}")
-    while True:
-        messages = queue_client.receive_messages(max_messages=1, visibility_timeout=600)
-        message  = next(messages, None)
+    # delivered_size read from the actual last final image (parity with legacy).
+    _delivered_size = None
+    if finals:
+        _last = ctx.images[finals[-1].output_ref.location]
+        _delivered_size = list(_last.size)
 
-        if message is None:
-            log.info("Queue empty. Waiting 10s...")
-            time.sleep(10)
-            continue
-
-        job_id = None
-        try:
-            job    = json.loads(message.content)
-            job_id = job.get("job_id")
-            log.info(f"📦 Job received: {job_id}")
-            update_job_status(job_id, "processing")
-            result_blob_paths = run_inference(job)
-            update_job_status(job_id, "completed", result_blob_paths)
-            queue_client.delete_message(message)
-            log.info(f"✅ Job {job_id} complete")
-        except Exception as e:
-            log.error(f"❌ Job failed: {e}")
-            if job_id:
-                update_job_status(job_id, "failed")
+    # manifest extra — SAME fields the legacy write_run_manifest call passed.
+    ctx.work["manifest_extra"] = {
+        "ref_meta": ref_meta,
+        "scheduler": type(pipe.scheduler).__name__,
+        "negative_prompt": ctx.work.get("negative_prompt"),
+        "seeds": [1000 + i for i in range(image_count)],
+        "image_count": image_count,
+        "delivered_size": _delivered_size,
+        "generation_seconds": round(time.time() - _gen_t0, 1),
+        "enhancement": ctx.work.get("enhancement_stats"),   # H7: per-stage applied/failed/skipped
+        "face_gate": ctx.work.get("face_gate"),             # M4: face-present check on delivered images
+    }
+    gjob = GenerationJob(job_id=job_id, user_id=user_id)
+    return del_engine.deliver(finals, gjob)
 
 
 # ─────────────────────────────────────────────────────────
@@ -869,7 +1043,14 @@ if __name__ == "__main__":
     log.info("🚀 BetterSnap AI Inference Container Starting...")
 
     job_id  = os.environ.get("JOB_ID")
-    user_id = os.environ.get("USER_ID")
+    # Normalize USER_ID to lowercase ONCE, here at the single point it enters the process.
+    # Training writes every per-user blob (the LoRA adapter AND the IP-Adapter face crops)
+    # under the lowercase Entra oid, but SQL returns the GUID UPPERCASE and the dispatcher
+    # forwards it as-is. Blob paths are CASE-SENSITIVE, so without this the adapter read
+    # (load_identity_lora) and the reference read (_get_ref_faces) both look up a
+    # non-existent uppercase path and generation fails. This is the ONLY read of USER_ID,
+    # so normalizing here covers every downstream blob path + the run manifest.
+    user_id = (os.environ.get("USER_ID") or "").lower()
 
     write_debug(f"JOB_ID={job_id}, USER_ID={user_id}")
 

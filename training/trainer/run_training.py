@@ -44,7 +44,14 @@ try:
 except (KeyError, ValueError) as e:
     fail(f"bad/missing env: {e}")
 IN_CONTAINER   = os.environ.get("INPUT_CONTAINER", "inputs")
-LORA_CONTAINER = os.environ.get("LORA_CONTAINER", "lora-weights")
+# AZURE_LORA_CONTAINER is the CANONICAL name (see inference/main.py + job.yaml); LORA_CONTAINER
+# is a DEPRECATED alias. Read canonical-first so the trainer and inference always resolve to the
+# SAME container even if only one name is set on the job. (job.yaml sets AZURE_LORA_CONTAINER, so
+# prod already resolves to canonical and no warning fires.)
+LORA_CONTAINER = (os.environ.get("AZURE_LORA_CONTAINER")
+                  or os.environ.get("LORA_CONTAINER") or "lora-weights")
+if not os.environ.get("AZURE_LORA_CONTAINER") and os.environ.get("LORA_CONTAINER"):
+    log.warning("LORA_CONTAINER is DEPRECATED; use AZURE_LORA_CONTAINER instead.")
 RANK   = os.environ.get("RANK", "32")
 STEPS  = os.environ.get("MAX_TRAIN_STEPS", "1400")
 LR     = os.environ.get("LEARNING_RATE", "1e-4")
@@ -55,6 +62,29 @@ NUM_CLASS_IMAGES = os.environ.get("NUM_CLASS_IMAGES", "200")
 PRIOR_W          = os.environ.get("PRIOR_LOSS_WEIGHT", "1.0")
 # woman | man | person — the cache key for the class images (see below).
 CLASS_WORD       = os.environ.get("CLASS_WORD", "woman").strip().lower()
+# CLASS_WORD chooses the shared Blob prefix, while CLASS_PROMPT generates the images
+# stored beneath it. A mismatch poisons every later cache hit (for example, male images
+# uploaded under class/woman/). Validate before any filesystem, Blob, cache, or GPU work.
+_VALID_CLASS_WORDS = {"woman", "man", "person"}
+_norm_prompt = lambda value: " ".join((value or "").strip().lower().split())
+_expected_class_prompt = f"a photo of a {CLASS_WORD}"
+_expected_instance_prompt = f"a photo of ohwx {CLASS_WORD}"
+if CLASS_WORD not in _VALID_CLASS_WORDS:
+    fail(
+        f"invalid CLASS_WORD={CLASS_WORD!r}; expected one of "
+        f"{sorted(_VALID_CLASS_WORDS)}"
+    )
+if _norm_prompt(CLASS_PROMPT) != _expected_class_prompt:
+    fail(
+        f"CLASS_PROMPT/CLASS_WORD mismatch: CLASS_WORD={CLASS_WORD!r} requires "
+        f"CLASS_PROMPT={_expected_class_prompt!r}, got {CLASS_PROMPT!r}; "
+        "refusing to read or publish the shared class-image cache"
+    )
+if _norm_prompt(INSTANCE_PROMPT) != _expected_instance_prompt:
+    fail(
+        f"INSTANCE_PROMPT/CLASS_WORD mismatch: CLASS_WORD={CLASS_WORD!r} requires "
+        f"INSTANCE_PROMPT={_expected_instance_prompt!r}, got {INSTANCE_PROMPT!r}"
+    )
 # Gradient checkpointing recomputes activations in the backward pass instead of
 # storing them: ~30-40% SLOWER, much less VRAM. It is on by default because that is
 # the safe assumption for SDXL@1024 — but we run on an 80GB A100 where inference peaks
@@ -71,10 +101,15 @@ BASE_MODEL    = os.environ.get("BASE_MODEL", "/models/sdxl-base")
 VAE_MODEL     = os.environ.get("VAE_MODEL", "/models/sdxl-vae")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", "fp16")
 
-WORK  = "/workspace"
-DATA  = "/workspace/instance_data"
-CLASS = "/workspace/class_data"
-OUT   = "/workspace/lora_out"
+# WORK holds the training scripts baked into the image (read-only is fine). The instance
+# data, class images and LoRA output must go to a WRITABLE dir — in the unified train+infer
+# image /workspace is NOT writable at runtime (it's a COPY target, not a WORKDIR), so the
+# data/output dirs live under /tmp. Overridable via TRAIN_RUNDIR.
+WORK   = "/workspace"
+RUNDIR = os.environ.get("TRAIN_RUNDIR", "/tmp/bettersnap_train")
+DATA   = f"{RUNDIR}/instance_data"
+CLASS  = f"{RUNDIR}/class_data"
+OUT    = f"{RUNDIR}/lora_out"
 for d in (DATA, CLASS, OUT):
     os.makedirs(d, exist_ok=True)
 log.info(f"CONFIG user={USER_ID} n_files={len(FILES)} rank={RANK} steps={STEPS} "

@@ -1,10 +1,24 @@
 *
 !Dockerfile
 !Dockerfile.unified
+!Dockerfile.app
 !entrypoint.py
+!gpu_preflight.py
 !main.py
 !requirements.txt
 !rrdbnet.py
+!stage_runtime.py
+!prompt_control.py
+# Phase 2 packages (domain contracts + runtime engines). Nested-whitelist walk like below.
+!domain
+domain/*
+!domain/*.py
+!runtime
+runtime/*
+!runtime/*.py
+!runtime/engines
+runtime/engines/*
+!runtime/engines/*.py
 # Trainer scripts, for the unified image's COPY training/trainer/... (same nested-whitelist
 # walk as catalog.py below).
 !training
@@ -23,3 +37,4 @@ Bettersnap-aI_Backend/*
 !Bettersnap-aI_Backend/shared
 Bettersnap-aI_Backend/shared/*
 !Bettersnap-aI_Backend/shared/catalog.py
+!Bettersnap-aI_Backend/shared/catalog_data.py
