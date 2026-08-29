@@ -15,3 +15,8 @@ test_input.*
 *.jpg
 *.jpeg
 *.png
+
+/Bettersnap-admin-dashboard/.env
+/Bettersnap-admin-dashboard/.env.local
+/Bettersnap-admin-dashboard/*.log
+/Bettersnap-admin-dashboard/.DS_Store

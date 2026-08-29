@@ -1,0 +1,3 @@
+import { describe,expect,it } from 'vitest'
+import { resolveRouteAccess } from './routeAccess'
+describe('protected route access',()=>{it('waits during initialization',()=>expect(resolveRouteAccess({loading:true,authenticated:false,hasPermission:false})).toBe('loading'));it('requires login for anonymous users',()=>expect(resolveRouteAccess({loading:false,authenticated:false,hasPermission:true})).toBe('login'));it('forbids authenticated users without permission',()=>expect(resolveRouteAccess({loading:false,authenticated:true,hasPermission:false})).toBe('forbidden'));it('allows authenticated users with permission',()=>expect(resolveRouteAccess({loading:false,authenticated:true,hasPermission:true})).toBe('allowed'))})

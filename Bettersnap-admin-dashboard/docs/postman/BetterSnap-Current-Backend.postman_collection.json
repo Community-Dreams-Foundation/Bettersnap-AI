@@ -1,0 +1,51 @@
+{
+  "info": { "name": "BetterSnap Current Backend", "description": "Current Azure Functions API. Operations require X-Admin-Key and MUST NOT be called by a browser dashboard; place secure /api/superadmin wrappers or a server-side proxy in front of them.", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{entraAccessToken}}", "type": "string" }] },
+  "variable": [{ "key": "baseUrl", "value": "http://localhost:7071/api" }, { "key": "entraAccessToken", "value": "" }, { "key": "adminApiKey", "value": "" }, { "key": "jobId", "value": "" }, { "key": "userId", "value": "" }, { "key": "trainingId", "value": "" }, { "key": "stripeWebhookSecret", "value": "" }],
+  "item": [
+    { "name": "Health and Public Configuration", "item": [
+      { "name": "Health", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/health", "description": "Public API and face-gate health." } },
+      { "name": "Catalog", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/catalog" } },
+      { "name": "Plans", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/plans" } },
+      { "name": "Attires (legacy)", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/attires" } },
+      { "name": "Backgrounds (legacy)", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/backgrounds" } }
+    ]},
+    { "name": "Registration and Profile", "item": [
+      { "name": "Register user", "request": { "method": "POST", "url": "{{baseUrl}}/users/register" } },
+      { "name": "User profile alias", "request": { "method": "GET", "url": "{{baseUrl}}/users/profile" } },
+      { "name": "Get my profile", "request": { "method": "GET", "url": "{{baseUrl}}/profiles/me" } },
+      { "name": "Update my profile", "request": { "method": "PATCH", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"display_name\": \"New Name\",\n  \"email\": \"new@example.com\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/profiles/me" } },
+      { "name": "Credits balance", "request": { "method": "GET", "url": "{{baseUrl}}/users/credits" } }
+    ]},
+    { "name": "Terms", "item": [
+      { "name": "Terms status", "request": { "method": "GET", "url": "{{baseUrl}}/users/terms-status" } },
+      { "name": "Accept terms", "request": { "method": "POST", "url": "{{baseUrl}}/users/accept-terms" } }
+    ]},
+    { "name": "Photo Upload and Training", "item": [
+      { "name": "Upload photo", "request": { "method": "POST", "header": [], "body": { "mode": "formdata", "formdata": [{ "key": "photo", "type": "file", "src": [] }] }, "url": "{{baseUrl}}/upload", "description": "Multipart photo upload; 15 MB maximum and server-side image validation." } },
+      { "name": "Start training", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"gender\": \"female\",\n  \"photos\": [\"{{userId}}/input/photo1.jpg\", \"{{userId}}/input/photo2.jpg\", \"{{userId}}/input/photo3.jpg\", \"{{userId}}/input/photo4.jpg\", \"{{userId}}/input/photo5.jpg\", \"{{userId}}/input/photo6.jpg\", \"{{userId}}/input/photo7.jpg\", \"{{userId}}/input/photo8.jpg\"]\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/train", "description": "Initial training requires 8–12 authenticated-user photo paths. Add force=true for retraining." } },
+      { "name": "Training status", "request": { "method": "GET", "url": "{{baseUrl}}/train/status" } }
+    ]},
+    { "name": "Generation Jobs", "item": [
+      { "name": "Submit job", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"gender\": \"female\",\n  \"age_range\": \"25-29\",\n  \"hair_color\": \"brown\",\n  \"attire_ids\": [\"business_suit.navy_suit_tie\"],\n  \"background_ids\": [\"business_suit.studio_gray\"],\n  \"image_count\": 4\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/jobs/submit" } },
+      { "name": "Job status", "request": { "method": "GET", "url": "{{baseUrl}}/jobs/{{jobId}}/status" } },
+      { "name": "Job result URLs", "request": { "method": "GET", "url": "{{baseUrl}}/jobs/{{jobId}}/result-url" } },
+      { "name": "Delete job", "request": { "method": "DELETE", "url": "{{baseUrl}}/jobs/{{jobId}}" } },
+      { "name": "My jobs", "request": { "method": "GET", "url": "{{baseUrl}}/users/jobs" } }
+    ]},
+    { "name": "Billing and Subscriptions", "item": [
+      { "name": "Subscription plans", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/subscriptions/plans" } },
+      { "name": "Subscription status", "request": { "method": "GET", "url": "{{baseUrl}}/subscriptions/status" } },
+      { "name": "Create checkout", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"type\":\"monthly\",\"plan\":\"pro\",\"success_url\":\"https://bettersnap.ai/subscription/success\",\"cancel_url\":\"https://bettersnap.ai/subscription/cancel\"}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/subscriptions/create" } },
+      { "name": "Credit top-up", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"pack\":\"basic\",\"success_url\":\"https://bettersnap.ai/subscription/success\",\"cancel_url\":\"https://bettersnap.ai/subscription/cancel\"}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/subscriptions/credits/topup" } },
+      { "name": "Cancel subscription", "request": { "method": "POST", "url": "{{baseUrl}}/subscriptions/cancel" } },
+      { "name": "Reactivate subscription", "request": { "method": "POST", "url": "{{baseUrl}}/subscriptions/reactivate" } }
+    ]},
+    { "name": "Stripe Webhook", "item": [{ "name": "Stripe webhook", "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Stripe-Signature", "value": "t=<timestamp>,v1=<signature>" }, { "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"id\":\"evt_123\",\"type\":\"checkout.session.completed\",\"data\":{\"object\":{\"id\":\"cs_123\"}}}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/webhooks/stripe", "description": "Server-to-server only. Use a correctly computed signature; stripeWebhookSecret is documentation tooling only." } }]},
+    { "name": "Operations", "description": "Requires X-Admin-Key. MUST NOT be called directly from a browser dashboard. Requires secure /api/superadmin wrapper endpoints or a server-side proxy.", "auth": { "type": "apikey", "apikey": [{ "key": "key", "value": "X-Admin-Key", "type": "string" }, { "key": "value", "value": "{{adminApiKey}}", "type": "string" }, { "key": "in", "value": "header", "type": "string" }] }, "item": [
+      { "name": "Stuck dispatch jobs", "request": { "method": "GET", "url": "{{baseUrl}}/ops/stuck-dispatch?older_than_min=15" } },
+      { "name": "Requeue stuck job", "request": { "method": "POST", "url": "{{baseUrl}}/ops/jobs/{{jobId}}/requeue" } },
+      { "name": "Fail and refund stuck job", "request": { "method": "POST", "url": "{{baseUrl}}/ops/jobs/{{jobId}}/fail" } }
+    ]}
+  ]
+}
