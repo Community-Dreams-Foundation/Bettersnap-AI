@@ -1,0 +1,4 @@
+import{api,queryString}from'../lib/api/client'
+import type{SuperAdminJob,SuperAdminJobsResponse}from'./contracts'
+export interface JobsQuery{status?:string;user_id?:string;limit?:number;offset?:number}
+export const jobsService={list:(query:JobsQuery={})=>api.getDetailed<SuperAdminJobsResponse>(`/superadmin/jobs${queryString(query)}`),get:(id:string)=>api.getDetailed<SuperAdminJob>(`/superadmin/jobs/${encodeURIComponent(id)}`),retry:(id:string,reason:string)=>api.postDetailed<{job_id:string;status:string}>(`/superadmin/jobs/${encodeURIComponent(id)}/retry`,{reason}),cancel:(id:string,reason:string)=>api.postDetailed<{job_id:string;status:string;cancelled:boolean}>(`/superadmin/jobs/${encodeURIComponent(id)}/cancel`,{reason}),restoreCredit:(id:string,reason:string)=>api.postDetailed<{job_id:string;restored:number}>(`/superadmin/jobs/${encodeURIComponent(id)}/restore-credit`,{reason})}

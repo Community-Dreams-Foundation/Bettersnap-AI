@@ -1,0 +1,6 @@
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+const defaultPath = typeof window !== 'undefined' ? window.location.pathname : '/'
+const RouterContext = createContext<{ path: string; navigate: (path: string) => void }>({ path: defaultPath, navigate: () => undefined })
+export function Router({ children }: { children: ReactNode }) { const [path, setPath] = useState(typeof window !== 'undefined' ? window.location.pathname : '/'); useEffect(() => { if (typeof window === 'undefined') return; const onPop = () => setPath(window.location.pathname); window.addEventListener('popstate', onPop); return () => window.removeEventListener('popstate', onPop) }, []); const navigate = (next: string) => { if (typeof window !== 'undefined') { window.history.pushState({}, '', next); window.scrollTo(0, 0) } setPath(next) }; return <RouterContext.Provider value={{ path, navigate }}>{children}</RouterContext.Provider> }
+export const useRouter = () => useContext(RouterContext)
+export function Link({ to, children, className, onClick }: { to: string; children: ReactNode; className?: string; onClick?: () => void }) { const { navigate } = useRouter(); return <a href={to} className={className} onClick={e => { e.preventDefault(); navigate(to); onClick?.() }}>{children}</a> }

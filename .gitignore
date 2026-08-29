@@ -31,3 +31,10 @@ BetterSnap_Supabase_to_Azure_Migration_Report.docx
 
 local.settings.json
 deploy.zip
+
+/Bettersnap-admin-dashboard/.env
+/Bettersnap-admin-dashboard/.env.local
+/Bettersnap-admin-dashboard/*.log
+/Bettersnap-admin-dashboard/.DS_Store
+/Bettersnap-admin-dashboard/node_modules/
+/Bettersnap-admin-dashboard/dist/

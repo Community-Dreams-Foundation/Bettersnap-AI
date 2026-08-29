@@ -1,0 +1,1 @@
+import { api } from '../lib/api/client';import type{PlansResponse,SubscriptionPlansResponse}from'./contracts';export const plansService={getPlans:()=>api.getDetailed<PlansResponse>('/plans',false),getSubscriptionPlans:()=>api.getDetailed<SubscriptionPlansResponse>('/subscriptions/plans',false)}
