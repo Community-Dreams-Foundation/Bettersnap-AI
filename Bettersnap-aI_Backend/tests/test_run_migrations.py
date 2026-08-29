@@ -36,6 +36,17 @@ class MigrationOrderTests(unittest.TestCase):
                 offenders.append(path.name)
         self.assertEqual(offenders, [], f"account GUIDs embedded in migrations: {offenders}")
 
+    def test_org_status_repair_replaces_legacy_constraint(self):
+        migration = ROOT / "migrations" / "032_fix_org_status_constraint.sql"
+        sql = migration.read_text(encoding="utf-8").lower()
+
+        self.assertIn("drop constraint ck_org_status", sql)
+        self.assertIn("add constraint ck_org_status", sql)
+        self.assertIn("'pending_payment'", sql)
+        self.assertIn("'active'", sql)
+        self.assertIn("'suspended'", sql)
+        self.assertIn("'closed'", sql)
+
     def test_late_backfill_is_rejected(self):
         names = ["011_dunning.sql", "012_late.sql", "013_cancel.sql"]
         applied = {"011_dunning.sql", "013_cancel.sql"}
