@@ -5864,32 +5864,27 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
  
-    # Same helper the generation path uses to decide which credit pool to charge, so
-    # the number shown here is by construction the number that will actually be spent.
-    membership = get_active_membership(cur, user_id)
-    if not membership:
-        return func.HttpResponse(
-            json.dumps({"organization": None}),
-            mimetype="application/json", status_code=200)
- 
-    org_id, credits_remaining, membership_id = membership
- 
+    # Dashboard discovery includes a newly-created pending-payment workspace so its
+    # admin can reach checkout. Generation still uses get_active_membership(), which
+    # remains restricted to active organizations and therefore cannot spend org credits
+    # before payment succeeds.
     cur.execute("""
-        SELECT o.name, o.admin_user_id, o.credits_per_seat,
-               m.credits_granted, m.joined_at
-        FROM organizations o
-        JOIN organization_members m ON m.organization_id = o.organization_id
-        WHERE o.organization_id = ? AND m.membership_id = ?
-    """, org_id, membership_id)
+        SELECT m.organization_id, m.credits_remaining, m.membership_id,
+               o.name, o.admin_user_id, o.credits_per_seat,
+               m.credits_granted, m.joined_at, o.status, o.seats_purchased
+        FROM organization_members m
+        JOIN organizations o ON o.organization_id = m.organization_id
+        WHERE m.user_id = ? AND m.status = 'active'
+          AND o.status IN ('pending_payment', 'active')
+    """, user_id)
     row = cur.fetchone()
     if not row:
-        # get_active_membership just returned this row, so a miss here means the org
-        # was deleted mid-request. Treat as no org rather than 500.
         return func.HttpResponse(
             json.dumps({"organization": None}),
             mimetype="application/json", status_code=200)
- 
-    org_name, admin_user_id, credits_per_seat, credits_granted, joined_at = row
+
+    (org_id, credits_remaining, membership_id, org_name, admin_user_id,
+     credits_per_seat, credits_granted, joined_at, org_status, seats_purchased) = row
  
     # lora_status drives the dashboard's next action: an employee who hasn't uploaded
     # photos yet needs "upload photos", not "generate". Same field the individual
@@ -5904,6 +5899,8 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
                 "organization_id": str(org_id),
                 "name": org_name,
                 "is_admin": str(admin_user_id).lower() == str(user_id).lower(),
+                "status": org_status,
+                "seats_purchased": seats_purchased,
             },
             "membership": {
                 "membership_id": str(membership_id),

@@ -186,9 +186,16 @@ class FakeCursor:
         elif "insert into processed_stripe_events" in s:
             self.rowcount = self.cfg.get("claim_event_rowcount", 1)
 
+        # ── /me/organization includes pending-payment admin memberships ──
+        elif "o.status in ('pending_payment', 'active')" in s:
+            self._fetch = self.cfg.get("my_organization_row")
+
         # ── org membership lookup (shared/org_credits.get_active_membership) ──
         elif "from organization_members m" in s and "join organizations o" in s:
             self._fetch = self.cfg.get("membership_row")  # None or (org_id, credits, membership_id)
+
+        elif "select lora_status from users" in s:
+            self._fetch = (self.cfg.get("lora_status", "none"),)
 
         # ── personal credits (individual pool, no org membership) ──
         elif "select credits_remaining from users" in s:
@@ -337,6 +344,45 @@ class OrgCreditsTests(unittest.TestCase):
         cur = FakeCursor({"membership_row": None})
         credits, org_id = effective_credits(cur, "user-1", personal_credits=50)
         self.assertEqual((credits, org_id), (50, None))
+
+
+class MyOrganizationTests(unittest.TestCase):
+    def test_pending_payment_workspace_is_visible_to_admin(self):
+        cfg = {
+            "my_organization_row": (
+                "org-1", 0, "member-1", "Acme", "admin-1", 10,
+                0, None, "pending_payment", 10,
+            ),
+            "lora_status": "none",
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            resp = function_app.get_my_organization(FakeRequest())
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.body)
+        self.assertEqual(data["organization"]["organization_id"], "org-1")
+        self.assertEqual(data["organization"]["status"], "pending_payment")
+        self.assertEqual(data["organization"]["seats_purchased"], 10)
+        self.assertTrue(data["organization"]["is_admin"])
+        self.assertEqual(data["membership"]["credits_remaining"], 0)
+
+    def test_user_without_pending_or_active_membership_has_no_organization(self):
+        cfg = {"my_organization_row": None}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("user-1")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            resp = function_app.get_my_organization(FakeRequest())
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(json.loads(resp.body)["organization"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
