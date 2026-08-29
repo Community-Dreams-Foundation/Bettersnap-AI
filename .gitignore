@@ -20,3 +20,4 @@ test_input.*
 /Bettersnap-admin-dashboard/.env.local
 /Bettersnap-admin-dashboard/*.log
 /Bettersnap-admin-dashboard/.DS_Store
+/Bettersnap-admin-dashboard/node_modules/
