@@ -47,6 +47,28 @@ def _utc_iso(dt):
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# ARM/ACA execution statuses that mean this execution attempt is over. Used ONLY to decide
+# whether to stamp first_terminal_observed_at; the failure CLASS is exec_reconcile's job.
+_ARM_TERMINAL_STATES = {"failed", "degraded", "cancelled", "canceled", "stopped", "succeeded"}
+
+
+def _epoch_or_none(value):
+    """DATETIME2 (naive UTC from SQL Server) -> epoch seconds, or None.
+
+    Returns None rather than guessing on an unreadable value: None means "not yet observed
+    terminal", which the classifier already treats as pending, never as retryable."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+    except (AttributeError, ValueError, OverflowError):
+        return None
+
+
 def _route_job_id(req):
     """Return a canonical GUID string, or None for a malformed/missing route id."""
     try:
@@ -171,6 +193,8 @@ from shared.job_reservation import reserve_job_slot
 from shared.training_reservation import reserve_training_slot
 from shared import credit_ledger
 from shared import exec_reconcile
+from shared import provisioning_retry
+from shared import training_orphan
 from shared.queue_client import enqueue_job, INFERENCE_QUEUE, TRAINING_QUEUE
 from shared.outbox import outbox_add, outbox_try_send_now
 from shared.blob import upload_blob, download_blob, get_blob_client
@@ -1855,11 +1879,20 @@ def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning(f"cancel_job: stop_execution failed for job_id={job_id}: {e}")
 
     # 2) Mark failed + refund SYNCHRONOUSLY (guarded transition, one-time refund).
-    _mark_failed(job_id)
-
-    logging.info(f"cancel_job: user={user_id} cancelled job_id={job_id} (was '{status}')")
+    #    The outcome is explicit: the job is terminal in every case, but the refund may be
+    #    OWED rather than paid, and we must not tell the customer otherwise.
+    outcome = _mark_failed(job_id)
+    if outcome == MARK_REFUND_PENDING:
+        logging.error(f"cancel_job: job_id={job_id} cancelled but the refund is PENDING "
+                      f"(target row missing); the compensator will settle it")
+    logging.info(f"cancel_job: user={user_id} cancelled job_id={job_id} (was '{status}') "
+                 f"outcome={outcome}")
     return func.HttpResponse(
-        json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
+        json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True,
+                    # Honest about the money: the cancellation always succeeds, but the
+                    # refund is only claimed when it actually moved.
+                    "refunded": outcome == MARK_TERMINALIZED,
+                    "refund_pending": outcome == MARK_REFUND_PENDING}),
         mimetype="application/json", status_code=200)
 
 
@@ -2199,9 +2232,15 @@ def admin_fail_job(req: func.HttpRequest) -> func.HttpResponse:
             )
     finally:
         conn.close()
-    _mark_failed(job_id)   # guarded transition + one-time credit refund
-    return func.HttpResponse(json.dumps({"failed": job_id, "refunded": True}),
-                             mimetype="application/json")
+    outcome = _mark_failed(job_id)   # guarded transition + one-time credit refund
+    # Report what ACTUALLY happened. This used to answer refunded:true unconditionally, which
+    # is a false statement whenever the refund target row is missing.
+    return func.HttpResponse(
+        json.dumps({"failed": job_id,
+                    "refunded": outcome == MARK_TERMINALIZED,
+                    "outcome": outcome,
+                    "refund_pending": outcome == MARK_REFUND_PENDING}),
+        mimetype="application/json")
 
 
 # ── Queue Trigger ─────────────────────────────────────────
@@ -2250,7 +2289,9 @@ def process_inference_job(msg: func.QueueMessage):
             f"DISPATCH_CONFIG_ERROR: {e}; failing job_id={job_id} without GPU start. "
             f"ALERT: apply migration 001 / check the lease table."
         )
-        _mark_failed(job_id)
+        if _mark_failed(job_id) == MARK_REFUND_PENDING:
+            logging.error(f"DISPATCH_CONFIG_ERROR: job_id={job_id} failed with a PENDING "
+                          f"refund; the compensator will settle it")
         return
     if owner is None:
         _defer_job(payload, job_id)
@@ -2345,6 +2386,14 @@ def process_inference_job(msg: func.QueueMessage):
         release_dispatch_lease(owner)
 
 
+# _mark_failed outcomes. Callers MUST branch on these: a False/None return used to be read as
+# "the job is terminal", which it is not in every case.
+MARK_TERMINALIZED = "terminalized"          # this call failed the job AND returned the credits
+MARK_ALREADY_TERMINAL = "already_terminal"  # someone else terminalized it; nothing refunded
+MARK_REFUND_PENDING = "refund_pending"      # job IS terminal; the refund is owed and recorded
+MARK_REFUND_BLOCKED = "refund_blocked"      # NOT terminal: the debt could not even be recorded
+
+
 def _mark_failed(job_id: str):
     """Fail a job and refund its credit — exactly once.
 
@@ -2354,98 +2403,130 @@ def _mark_failed(job_id: str):
     (WHERE status NOT IN ('failed','completed') + rowcount check), so retries,
     poison + timeout both firing, or the container ALSO failing the same job can
     never refund twice. completed jobs are never touched (no refund on success).
+
+    The transition + balance restore + ledger row live in
+    provisioning_retry.terminalize_and_refund so that the retry-EXHAUSTION path can run the
+    exact same guarded logic inside its OWN transaction (alongside recording the final
+    execution id) instead of committing a state change and then calling a separate refund
+    helper. One implementation, one guard, two callers.
     """
     conn = new_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE jobs SET status = 'failed', completed_at = GETUTCDATE() "
-            "WHERE job_id = ? AND status NOT IN ('failed', 'completed')",
-            job_id,
-        )
-        transitioned = cur.rowcount == 1
-        refund = 0
-        if transitioned:
-            # Refund the FULL amount spent at submit (image_count * credits_per_image),
-            # stored as credit_cost in job_params. Falls back to 1 for any legacy job
-            # written before per-image charging. Tied to the same state-transition
-            # rowcount guard above, so it can never double-refund.
-            cur.execute(
-                "SELECT job_params, user_id, source_type FROM jobs WHERE job_id = ?",
-                job_id,
-            )
-            r = cur.fetchone()
-            source_type = r[2] if r and len(r) > 2 else None
-            refund = 1
-            if r and r[0]:
-                try:
-                    refund = max(1, int(json.loads(r[0]).get("credit_cost", 1)))
-                except (TypeError, ValueError):
-                    refund = 1
-            # Refund to whichever pool was charged. jobs.organization_id was written at
-            # reserve time, so this stays correct even if the person has since left the
-            # org — the credits go back to the org that paid for them.
-            cur.execute("SELECT organization_id FROM jobs WHERE job_id = ?", job_id)
-            orow = cur.fetchone()
-            job_org_id = orow[0] if orow else None
-            if job_org_id:
-                cur.execute(
-                    "UPDATE organization_members SET credits_remaining = credits_remaining + ? "
-                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?) "
-                    "AND organization_id = ?",
-                    refund, job_id, job_org_id,
-                )
-            elif source_type == "monthly":
-                monthly_refund = refund
-                one_time_refund = 0
-                if r and r[0]:
-                    try:
-                        refund_params = json.loads(r[0])
-                        monthly_refund = max(
-                            0, int(refund_params.get("monthly_credit_cost", refund))
-                        )
-                        one_time_refund = max(
-                            0, int(refund_params.get("one_time_credit_cost", 0))
-                        )
-                    except (TypeError, ValueError):
-                        monthly_refund = refund
-                        one_time_refund = 0
-                cur.execute(
-                    "UPDATE users SET "
-                    "monthly_credits_remaining = monthly_credits_remaining + "
-                    "CASE WHEN subscription_type = 'monthly' THEN ? ELSE 0 END, "
-                    "one_time_credits_remaining = one_time_credits_remaining + ?, "
-                    "credits_remaining = credits_remaining + ? + ? "
-                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                    monthly_refund, one_time_refund,
-                    monthly_refund, one_time_refund, job_id,
-                )
-            elif source_type == "one_time":
-                cur.execute(
-                    "UPDATE users SET credits_remaining = credits_remaining + ?, "
-                    "one_time_credits_remaining = one_time_credits_remaining + ? "
-                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                    refund, refund, job_id,
-                )
-            else:
-                cur.execute(
-                    "UPDATE users SET credits_remaining = credits_remaining + ? "
-                    "WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)",
-                    refund, job_id,
-                )
-            # Ledger the refund (positive), in the SAME transaction as the state transition +
-            # balance restore so it can never double-count. r[1] is the job's user_id (guard
-            # the read: if the row is unexpectedly gone we still refund via the subquery UPDATE
-            # above, we just can't attribute a ledger row).
-            if r and len(r) > 1 and r[1]:
-                credit_ledger.record(cur, r[1], refund, credit_ledger.REASON_JOB_REFUND, job_id)
+        transitioned, refund, state = provisioning_retry.terminalize_and_refund(
+            cur, job_id, credit_ledger=credit_ledger)
+        if state == provisioning_retry.REFUND_PENDING:
+            # The balance row the refund is owed to does not exist. The UPDATE matched 0 rows,
+            # so nothing was mutated and there is nothing to undo; the ledger row was NOT
+            # written. Record the FULL plan durably IN THIS TRANSACTION so the job can still
+            # terminalize -- leaving a paid job in processing/dispatching forever is worse
+            # than owing a refund that is written down, surfaced and reconciled.
+            try:
+                _record_refund_debt(cur, job_id)
+            except RefundDebtNotRecorded as e:
+                conn.rollback()
+                logging.critical(
+                    f"REFUND_DEBT_NOT_RECORDED: job_id={job_id} NOT marked failed; "
+                    f"rolled back rather than lose the obligation: {e}")
+                return MARK_ALREADY_TERMINAL if not transitioned else MARK_REFUND_BLOCKED
         conn.commit()
-        logging.info(
-            f"job_id={job_id} -> failed (transitioned={transitioned}, "
-            f"credits_refunded={refund if transitioned else 0})"
-        )
     finally:
         conn.close()
+    if not transitioned:
+        logging.info(f"job_id={job_id} already terminal; nothing refunded")
+        return MARK_ALREADY_TERMINAL
+    if state == provisioning_retry.REFUND_PENDING:
+        logging.error(
+            f"REFUND_PENDING: job_id={job_id} marked failed but {refund} credit(s) could not "
+            f"be returned (target row missing). Debt recorded in job_params._failure."
+            f"refund_pending; the reaper's compensator settles it exactly once.")
+        return MARK_REFUND_PENDING
+    logging.info(f"job_id={job_id} -> failed (refunded {refund})")
+    return MARK_TERMINALIZED
+
+
+class TrainingRefundIntegrityError(RuntimeError):
+    """A retrain refund could not be applied to a real balance row.
+
+    lora_trainings.user_id has NO foreign key to users (004; 022 documents the convention),
+    so nothing in the schema stops a training row outliving its owner. When that happens the
+    only safe outcome is to roll back the ENTIRE transaction — the terminal transition
+    included — rather than commit a finished training whose refund silently vanished."""
+
+
+class RefundDebtNotRecorded(RuntimeError):
+    """The refund-pending marker could not be written, so the caller must NOT commit.
+
+    Committing a terminal state whose refund obligation was never recorded loses the debt
+    silently: the job reads 'failed', no credits moved, no ledger row exists, and nothing will
+    ever come back to settle it. Rolling back leaves the job non-terminal for one more tick,
+    which is recoverable."""
+
+
+def _record_refund_debt(cur, job_id):
+    """Persist the refund obligation for a job whose refund could not be paid.
+
+    Two shapes, both durable and both visible to operations:
+      * a COMPLETE plan, when the amount is known and only the target row was missing. The
+        compensator can settle this automatically once the row reappears.
+      * an UNRESOLVED marker, when the evidence for the amount is missing or contradictory.
+        No amount is invented, so nothing can settle it automatically -- it waits for a human.
+
+    Raises RefundDebtNotRecorded if neither marker landed, so the caller rolls back rather
+    than committing a terminal state with no record of what is owed.
+    """
+    try:
+        plan = provisioning_retry.build_refund_plan(
+            cur, job_id, credit_ledger=credit_ledger)
+    except provisioning_retry.RefundPlanInvalid as e:
+        if not provisioning_retry.mark_refund_unresolved(cur, job_id, str(e)):
+            raise RefundDebtNotRecorded(
+                "could not persist the unresolved-refund marker for job %s" % job_id)
+        logging.critical(
+            "REFUND_UNRESOLVED: job_id=%s owes a refund whose amount could not be "
+            "established (%s). NOTHING was moved or ledgered; this needs operator review.",
+            job_id, e)
+        return None
+    if plan is None:
+        raise RefundDebtNotRecorded("job %s row is gone; the refund cannot be recorded"
+                                    % job_id)
+    if not provisioning_retry.mark_refund_pending(cur, job_id, plan):
+        raise RefundDebtNotRecorded(
+            "could not persist the refund-pending marker for job %s" % job_id)
+    logging.error(
+        "REFUND_PENDING: job_id=%s owes %s credit(s) (funding=%s aggregate=%s monthly=%s "
+        "one_time=%s target=%s); recorded in job_params._failure.refund_pending",
+        job_id, plan["total"], plan["funding"], plan["aggregate_delta"],
+        plan["monthly_delta"], plan["one_time_delta"], plan["target"])
+    return plan
+
+
+def _stamp_failure_class_tx(cur, job_id, failure_class, reason, execution_id):
+    """Cursor-level failure-class stamp, so a terminal path can record WHY in the SAME
+    transaction that fails and refunds the job. A crash between a committed refund and a
+    separately-committed stamp used to leave a refunded job with no recorded cause.
+
+    Idempotent — an existing `_failure` stamp is left untouched, so reconciliation retries
+    never rewrite the first (authoritative) reason."""
+    cur.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
+    row = cur.fetchone()
+    if not row:
+        return False
+    try:
+        params = json.loads(row[0]) if row[0] else {}
+    except (TypeError, ValueError):
+        params = {}
+    if isinstance(params.get("_failure"), dict):
+        return False  # already stamped
+    params["_failure"] = {
+        "class": failure_class,
+        "reason": reason,
+        "execution_id": execution_id,
+        "is_infra": failure_class in exec_reconcile.INFRA_CLASSES,
+    }
+    cur.execute("UPDATE jobs SET job_params = ? WHERE job_id = ?",
+                json.dumps(params), job_id)
+    return True
 
 
 def _stamp_failure_class(job_id, failure_class, reason, execution_id):
@@ -2453,62 +2534,88 @@ def _stamp_failure_class(job_id, failure_class, reason, execution_id):
 
     This is what stops an infrastructure failure from being silently indistinguishable from
     a customer/model failure: it preserves the diagnostic reason + the ACA execution id.
-    Idempotent — if a `_failure` stamp already exists it is left untouched, so reconciliation
-    retries never rewrite the first (authoritative) reason."""
+    Own transaction; the terminal paths that need it atomically call _stamp_failure_class_tx
+    on their own cursor instead."""
     conn = new_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
-        row = cur.fetchone()
-        if not row:
-            return
-        try:
-            params = json.loads(row[0]) if row[0] else {}
-        except (TypeError, ValueError):
-            params = {}
-        if isinstance(params.get("_failure"), dict):
-            return  # already stamped
-        params["_failure"] = {
-            "class": failure_class,
-            "reason": reason,
-            "execution_id": execution_id,
-            "is_infra": failure_class in exec_reconcile.INFRA_CLASSES,
-        }
-        cur.execute("UPDATE jobs SET job_params = ? WHERE job_id = ?",
-                    json.dumps(params), job_id)
+        _stamp_failure_class_tx(cur, job_id, failure_class, reason, execution_id)
         conn.commit()
     finally:
         conn.close()
 
 
-def _fetch_execution_outcome(job_id):
-    """Read the whole container execution status from ACA, then optionally enrich it with
-    preflight diagnostics. A preflight exit 0 is never treated as container success."""
+def _preflight_diagnostics(exec_id):
+    """Best-effort read of the GPU probe's diagnostic blob. Returns (exit_code, reason).
+
+    The blob write is best-effort inside the container, so its ABSENCE proves nothing — it is
+    never evidence that the container failed to start. (None, None) simply means unknown."""
     try:
-        from shared.queue_trigger import get_job_execution_outcome
+        raw = download_blob("diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
+        result = (json.loads(raw) or {}).get("result") or {}
+        return result.get("exit_code"), result.get("reason")
+    except Exception:
+        return None, None
+
+
+def _stamp_first_terminal(job_id, exec_id):
+    """Guarded per-attempt stamp of first_terminal_observed_at. Own tiny transaction: it is
+    an OBSERVATION, not a decision, and must be durable before the next pass reasons about
+    age. Never overwrites, never retries, never refunds."""
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            stamped = provisioning_retry.stamp_first_terminal(cur, "jobs", job_id, exec_id)
+            conn.commit()
+            return stamped
+        finally:
+            conn.close()
+    except Exception:
+        logging.exception(f"could not stamp first_terminal_observed_at for job_id={job_id}")
+        return False
+
+
+def _fetch_execution_outcome(job_id):
+    """Assemble the full evidence structure for this job's CURRENT ACA execution.
+
+    Two independent sources (ARM status, Log Analytics lifecycle events) plus the preflight
+    blob, kept separate by execution_evidence so a probe exit is never mistaken for a container
+    exit and a telemetry outage is never mistaken for "nothing happened".
+
+    Reads external_execution_id and first_terminal_observed_at in ONE query so the evidence is
+    tied to the exact execution whose age we then measure. If ARM reports this execution
+    terminal and the row has no stamp yet, stamp it here (guarded on the same execution id) so
+    a LATER pass has a monotonic age to reason about — this pass deliberately makes no
+    decision from the fact that it stamped."""
+    try:
+        from shared.queue_trigger import get_execution_evidence
 
         conn = new_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT external_execution_id FROM jobs WHERE job_id = ?", job_id)
+            cur.execute(
+                "SELECT external_execution_id, first_terminal_observed_at "
+                "FROM jobs WHERE job_id = ?", job_id)
             r = cur.fetchone()
         finally:
             conn.close()
         exec_id = r[0] if r else None
         if not exec_id:
             return None
-        outcome = get_job_execution_outcome(str(exec_id))
-        outcome.setdefault("events", [])
-        try:
-            raw = download_blob(
-                "diagnostics", f"preflight/{str(exec_id).replace('/', '_')}.json")
-            diag = json.loads(raw)
-            result = diag.get("result") or {}
-            outcome["preflight_exit_code"] = result.get("exit_code")
-            outcome["diagnostic_reason"] = result.get("reason")
-        except Exception:
-            pass
-        return outcome
+        terminal_at = _epoch_or_none(r[1] if r and len(r) > 1 else None)
+        preflight_exit, diag_reason = _preflight_diagnostics(exec_id)
+        evidence = get_execution_evidence(
+            str(exec_id), preflight_exit_code=preflight_exit,
+            terminal_observed_at=terminal_at)
+        if diag_reason:
+            evidence["_diagnostic_reason"] = diag_reason
+        if terminal_at is None and (evidence.get("arm_status") or "") in _ARM_TERMINAL_STATES:
+            if _stamp_first_terminal(job_id, exec_id):
+                logging.info(
+                    f"job_id={job_id} execution={exec_id} first observed terminal; "
+                    f"stamped, deciding on a later pass")
+        return evidence
     except Exception:
         logging.exception(f"could not fetch ACA execution outcome for job_id={job_id}")
         return None
@@ -2548,7 +2655,8 @@ def _recover_completed_job(job_id, result_paths):
 
 def _reconcile_execution_outcome(job_id, exec_data, now, *,
                                  mark_failed=None, stamp=None, classify=None,
-                                 list_results=None, recover_completed=None):
+                                 list_results=None, recover_completed=None,
+                                 retry_provisioning=None, orphan_policy=None):
     """Classify one execution outcome and, when a refund is owed, stamp the class+reason and
     fail+refund EXACTLY ONCE. The one-refund guarantee is _mark_failed's rowcount guard
     (status NOT IN ('failed','completed')); stamping is separately idempotent. Deps are
@@ -2558,10 +2666,45 @@ def _reconcile_execution_outcome(job_id, exec_data, now, *,
     classify = classify or exec_reconcile.classify_execution
     list_results = list_results or _list_delivered_results
     recover_completed = recover_completed or _recover_completed_job
+    retry_provisioning = retry_provisioning or _retry_provisioning_job
+    orphan_policy = orphan_policy or _reconcile_orphaned_execution
     decision = classify(exec_data, now)
+    if decision["action"] == exec_reconcile.ACTION_RETRY:
+        # The ONE class Azure can fix by trying again. Bounded, idempotent per execution, and
+        # atomic with its outbox row. Anything other than a granted retry (budget spent,
+        # duplicate observation, corrupt history) resolves through the ordinary terminal path
+        # below — this branch never leaves a job in limbo and never refunds mid-retry.
+        outcome = retry_provisioning(job_id, decision)
+        if outcome.get("plan") == provisioning_retry.PLAN_RETRY:
+            return {**decision, "reason": (
+                "re-dispatched after pre-container provisioning failure "
+                f"(attempt {outcome.get('attempts')}/"
+                f"{provisioning_retry.MAX_PROVISIONING_EXECUTIONS})")}
+        if outcome.get("plan") == provisioning_retry.PLAN_ALREADY_HANDLED:
+            # This execution already had its verdict. That is normally a harmless duplicate
+            # reconcile — but it is ALSO the shape of a row pinned to a spent execution, which
+            # would otherwise reconcile to "nothing to do" on every tick forever. Hand it to
+            # the bounded orphan lifecycle: recover toward the current attempt if one exists,
+            # otherwise observe against a DURABLE clock and terminalize once when it expires.
+            return orphan_policy(job_id, decision, now)
+        # Budget exhausted (or a fail-closed stop). The refund and the failure-class stamp
+        # both happened inside the exhaustion transaction, so nothing more is written here.
+        # `refunded` reports what ACTUALLY happened rather than assuming it.
+        if outcome.get("refunded"):
+            return {**decision, "action": exec_reconcile.ACTION_REFUND,
+                    "reason": outcome.get("reason") or (
+                        "pre-container provisioning failed on all "
+                        f"{provisioning_retry.MAX_PROVISIONING_EXECUTIONS} execution(s)")}
+        # Exhausted but nothing was transitioned (already terminal, or the row moved on).
+        # Reporting ACTION_REFUND here would claim a refund that never occurred.
+        return {**decision, "action": exec_reconcile.ACTION_NONE,
+                "failure_class": exec_reconcile.CLASS_PENDING,
+                "reason": outcome.get("reason") or "exhausted; no transition performed"}
     if decision["action"] == exec_reconcile.ACTION_REFUND:
         stamp(job_id, decision["failure_class"], decision["reason"], decision["execution_id"])
-        mark_failed(job_id)   # idempotent; refunds only on the real state transition
+        outcome = mark_failed(job_id)   # idempotent; refunds only on the real transition
+        return {**decision, "refund_outcome": outcome,
+                "refund_pending": outcome == MARK_REFUND_PENDING}
     elif decision["action"] == exec_reconcile.ACTION_VERIFY_DELIVERY:
         result_paths = list_results(job_id)
         if result_paths is None:
@@ -2582,9 +2725,205 @@ def _reconcile_execution_outcome(job_id, exec_data, now, *,
             "reason": "ACA execution succeeded but no result images were delivered",
         }
         stamp(job_id, missing["failure_class"], missing["reason"], missing["execution_id"])
-        mark_failed(job_id)
-        return missing
+        outcome = mark_failed(job_id)
+        return {**missing, "refund_outcome": outcome,
+                "refund_pending": outcome == MARK_REFUND_PENDING}
     return decision
+
+
+def _reconcile_orphaned_execution(job_id, decision, now, *, find_execution=None):
+    """Bounded lifecycle for a row pinned to an ALREADY-RECONCILED execution.
+
+    Before bounded retries, one job had exactly one ACA execution, so "this execution was
+    already handled" could only mean a harmless duplicate tick. Retries make it possible for
+    the row's external_execution_id to point at a SPENT execution (a crash-window recovery
+    that adopted the wrong one, or a late worker's write). Without this, such a row returns
+    ACTION_NONE on every reaper tick forever: paid, undelivered, unrefunded, non-terminal.
+
+    Order is deliberate — RECOVER before REFUND. A newer, unhandled execution usually means
+    the row is merely pointing at the wrong attempt, and the current attempt may be perfectly
+    healthy; refunding it would be premature and would strand a live A100's output.
+    """
+    find_execution = find_execution or _find_current_execution
+    exec_id = decision.get("execution_id")
+    if not exec_id:
+        return {**decision, "action": exec_reconcile.ACTION_NONE,
+                "failure_class": exec_reconcile.CLASS_PENDING,
+                "reason": "no execution id to reconcile"}
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status, provisioning_execution_ids, first_terminal_observed_at, "
+            "dispatched_at FROM jobs WHERE job_id = ? AND external_execution_id = ?",
+            job_id, str(exec_id))
+        row = cur.fetchone()
+        if row is None:
+            return {**decision, "action": exec_reconcile.ACTION_NONE,
+                    "failure_class": exec_reconcile.CLASS_PENDING,
+                    "reason": "row already moved off this execution"}
+        status, raw_history, first_terminal_at, dispatched_at = row[0], row[1], row[2], row[3]
+        try:
+            history = provisioning_retry.parse_history(raw_history)
+        except provisioning_retry.HistoryCorrupt as e:
+            # Fail closed AND finite: an unreadable history is not a licence to adopt anything,
+            # but it is also not a licence to skip the row forever. Hand it to the bounded
+            # corrupt-history lifecycle and stop here.
+            logging.error(f"PROVISIONING_HISTORY_CORRUPT: job_id={job_id}: {e}")
+            conn.rollback()
+            conn.close()
+            _reconcile_corrupt_history(job_id)
+            return {**decision, "action": exec_reconcile.ACTION_NONE,
+                    "failure_class": provisioning_retry.CLASS_PROVISIONING_HISTORY_CORRUPT,
+                    "reason": "provisioning history unreadable: %s" % e}
+        # Discovery excludes every id already reconciled, so a spent execution can never be
+        # re-adopted, and is bounded below by this attempt's dispatched_at.
+        candidate = find_execution(job_id, exclude=set(history) | {str(exec_id)},
+                                   not_before=dispatched_at)
+        age = None
+        terminal_at = _epoch_or_none(first_terminal_at)
+        if terminal_at is not None and now is not None:
+            age = max(0.0, float(now) - terminal_at)
+        plan, why = provisioning_retry.plan_orphan(
+            status=status, current_execution_id=exec_id, history=history,
+            candidate_execution_id=candidate, age=age)
+
+        if plan == provisioning_retry.ORPHAN_RECOVER:
+            adopted = provisioning_retry.adopt_execution(cur, job_id, exec_id, why)
+            conn.commit()
+            logging.warning(
+                f"ORPHAN_RECOVERED: job_id={job_id} was pinned to spent execution={exec_id}; "
+                f"adopted current execution={why} (applied={adopted})")
+            return {**decision, "action": exec_reconcile.ACTION_NONE,
+                    "failure_class": exec_reconcile.CLASS_PENDING,
+                    "reason": f"adopted current execution {why}"}
+
+        if plan == provisioning_retry.ORPHAN_OBSERVE:
+            conn.rollback()
+            if terminal_at is None:
+                # Start the DURABLE clock so a later tick can actually age this out. Guarded
+                # and never overwritten, so the ceiling cannot be reset by re-reading.
+                provisioning_retry.stamp_first_terminal(cur, "jobs", job_id, exec_id)
+                conn.commit()
+            return {**decision, "action": exec_reconcile.ACTION_NONE,
+                    "failure_class": exec_reconcile.CLASS_PENDING, "reason": why}
+
+        # ORPHAN_TERMINAL: ceiling expired with no newer execution. Terminalize, refund and
+        # stamp the class in ONE transaction, exactly once.
+        transitioned, refund, state = provisioning_retry.terminalize_orphan(
+            cur, job_id, exec_id, credit_ledger=credit_ledger)
+        if transitioned:
+            _stamp_failure_class_tx(
+                cur, job_id, exec_reconcile.CLASS_UNCLASSIFIED_TERMINAL_FAILURE, why, exec_id)
+            if state == provisioning_retry.REFUND_PENDING:
+                try:
+                    _record_refund_debt(cur, job_id)
+                except RefundDebtNotRecorded as e:
+                    conn.rollback()
+                    logging.critical(f"REFUND_DEBT_NOT_RECORDED: job_id={job_id}: {e}")
+                    return {**decision, "action": exec_reconcile.ACTION_NONE,
+                            "failure_class": exec_reconcile.CLASS_PENDING,
+                            "reason": "refund debt could not be recorded; rolled back"}
+        conn.commit()
+    finally:
+        conn.close()
+
+    logging.warning(
+        f"ORPHAN_TERMINALIZED: job_id={job_id} execution={exec_id} "
+        f"(transitioned={transitioned} refunded={refund}) — {why}")
+    if not transitioned:
+        return {**decision, "action": exec_reconcile.ACTION_NONE,
+                "failure_class": exec_reconcile.CLASS_PENDING,
+                "reason": "already terminal; nothing refunded"}
+    return {**decision, "action": exec_reconcile.ACTION_REFUND,
+            "failure_class": exec_reconcile.CLASS_UNCLASSIFIED_TERMINAL_FAILURE,
+            "is_infra": False, "reason": why}
+
+
+def _find_current_execution(job_id, *, exclude=(), not_before=None):
+    """Newest ACA execution of this job that has NOT already been reconciled, or None."""
+    try:
+        from shared.queue_trigger import find_execution_for_job
+        return find_execution_for_job(job_id, exclude=exclude, not_before=not_before)
+    except Exception:
+        logging.exception(f"could not list ACA executions for job_id={job_id}")
+        return None
+
+
+def _retry_provisioning_job(job_id, decision):
+    """Own ONE transaction for a retryable inference execution, then ONE fast-path send.
+
+    Exactly one commit covers: history + attempt counter + status -> 'queued' +
+    external_execution_id -> NULL + first_terminal_observed_at -> NULL + the outbox row. The
+    state change is NEVER committed before the outbox insert, and nothing is ever enqueued
+    directly — the fast-path send after commit is the outbox's own best-effort helper, and the
+    outbox_dispatcher backstops it if the process dies here.
+
+    On budget exhaustion the SAME single transaction records the final execution id,
+    terminalizes the job and refunds it, so terminalization and refund can never separate.
+
+    A corrupt provisioning history fails CLOSED: no retry, no silent reset. The job falls
+    through to the ordinary terminal path with the corruption recorded as the reason.
+    """
+    exec_id = decision.get("execution_id")
+    if not exec_id:
+        return {"plan": provisioning_retry.PLAN_ALREADY_HANDLED,
+                "reason": "no execution id on the decision"}
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            result = provisioning_retry.retry_job(
+                cur, job_id, exec_id, outbox_add=outbox_add, queue_name=INFERENCE_QUEUE)
+            if result["plan"] == provisioning_retry.PLAN_EXHAUSTED:
+                reason = ("pre-container provisioning failed on all "
+                          f"{provisioning_retry.MAX_PROVISIONING_EXECUTIONS} execution(s)")
+                transitioned, refund, attempts, state = provisioning_retry.exhaust_job(
+                    cur, job_id, exec_id, credit_ledger=credit_ledger)
+                if transitioned:
+                    if state == provisioning_retry.REFUND_PENDING:
+                        _record_refund_debt(cur, job_id)
+                    # Same transaction as the fail + refund, so a refunded job can never be
+                    # left with no recorded cause.
+                    _stamp_failure_class_tx(
+                        cur, job_id, exec_reconcile.CLASS_PRE_CONTAINER_PROVISIONING,
+                        reason, exec_id)
+                conn.commit()
+                logging.warning(
+                    f"PROVISIONING_EXHAUSTED: job_id={job_id} after {attempts} ACA "
+                    f"execution(s); failed={transitioned} refunded={refund}")
+                return {"plan": provisioning_retry.PLAN_EXHAUSTED, "attempts": attempts,
+                        "refunded": bool(transitioned), "credits": refund,
+                        "reason": reason if transitioned else
+                                  "exhausted but the row was already terminal"}
+            conn.commit()
+        except provisioning_retry.HistoryCorrupt as e:
+            conn.rollback()
+            logging.error(
+                f"PROVISIONING_HISTORY_CORRUPT: job_id={job_id} exec={exec_id}: {e}; "
+                f"refusing to retry (history NOT reset)")
+            # Fail closed through the ordinary terminal path — guarded, so still one refund.
+            outcome = _mark_failed(job_id)
+            return {"plan": provisioning_retry.PLAN_EXHAUSTED,
+                    "refunded": outcome == MARK_TERMINALIZED,
+                    "refund_state": outcome,
+                    "reason": "provisioning history unreadable: %s" % e}
+    finally:
+        conn.close()
+
+    if result["plan"] == provisioning_retry.PLAN_RETRY:
+        # Committed. The message exists in the outbox either way; this is latency only.
+        try:
+            outbox_try_send_now(result["outbox_id"], INFERENCE_QUEUE, result["message"])
+        except Exception as e:
+            logging.warning(
+                f"retry fast-path send failed for job_id={job_id} "
+                f"(non-fatal; the dispatcher will deliver): {e}")
+        logging.warning(
+            f"PROVISIONING_RETRY: job_id={job_id} re-queued after pre-container failure "
+            f"of execution={exec_id} (attempt {result['attempts']}/"
+            f"{provisioning_retry.MAX_PROVISIONING_EXECUTIONS})")
+    return result
 
 
 def _revert_claim(job_id: str):
@@ -2601,16 +2940,55 @@ def _revert_claim(job_id: str):
 
 
 def _record_execution_id(job_id: str, execution_id):
+    """Record the ACA execution id ONLY onto the attempt still waiting for one.
+
+    Returns True when this call wrote it. A blind write here used to be able to overwrite a
+    NEWER attempt's execution id with a spent one — see provisioning_retry.record_execution_id
+    — which pinned the row to an execution already in its history, from which no verdict was
+    reachable. The guarded write can fill an empty slot but never replace an occupied one.
+
+    On a lost write the caller's execution is an ORPHAN: it may still be running with nothing
+    in SQL pointing at it. We LOG it loudly and do NOT retry the write; ACA's replicaTimeout
+    bounds the orphan, and re-forcing the id would recreate exactly the corruption this guard
+    exists to prevent.
+    """
     conn = new_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE jobs SET external_execution_id = ? WHERE job_id = ?",
-            execution_id, job_id,
-        )
+        outcome, current = provisioning_retry.record_execution_id(
+            cur, "jobs", job_id, execution_id)
         conn.commit()
     finally:
         conn.close()
+    if outcome == provisioning_retry.RECORD_OK:
+        return True
+    if outcome == provisioning_retry.RECORD_MISSING:
+        logging.error(f"ORPHAN_EXECUTION: job_id={job_id} row missing; execution "
+                      f"{execution_id} is unowned and will be left to replicaTimeout")
+        return False
+    logging.error(
+        f"ORPHAN_EXECUTION: job_id={job_id} already advanced to execution={current}; "
+        f"NOT overwriting it with the late execution={execution_id}. That execution is "
+        f"unowned — it will be bounded by ACA replicaTimeout, not by us.")
+    return False
+
+
+def _record_training_execution_id(training_id: str, execution_id):
+    """Same guard for the training row: fill an empty slot, never replace an occupied one."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        outcome, current = provisioning_retry.record_execution_id(
+            cur, "lora_trainings", training_id, execution_id)
+        conn.commit()
+    finally:
+        conn.close()
+    if outcome == provisioning_retry.RECORD_OK:
+        return True
+    logging.error(
+        f"ORPHAN_EXECUTION: training_id={training_id} outcome={outcome} current={current}; "
+        f"NOT overwriting with late execution={execution_id}")
+    return False
 
 
 def _defer_job(payload: dict, job_id: str):
@@ -2634,7 +3012,11 @@ def _defer_job(payload: dict, job_id: str):
         # in logs. TODO: add a failure_code column with the schema-drift fix.
         # _mark_failed also refunds the credit (guarded, once) — a job that never
         # got to run shouldn't cost the user.
-        _mark_failed(job_id)
+        outcome = _mark_failed(job_id)
+        if outcome == MARK_REFUND_PENDING:
+            logging.error(f"DISPATCH_TIMEOUT: job_id={job_id} failed with a PENDING refund")
+        elif outcome == MARK_ALREADY_TERMINAL:
+            logging.info(f"DISPATCH_TIMEOUT: job_id={job_id} was already terminal")
         return
 
     delay = min(GPU_BACKPRESSURE_BASE * (2 ** defer_count), GPU_BACKPRESSURE_MAX)
@@ -2779,28 +3161,27 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             #
             # Oldest parked job only: fusing carries exactly one job, and any others stay
             # parked and release normally when training finishes.
+            #
+            # The binding is now PERSISTED (migration 034). A first dispatch selects one job
+            # deterministically (ORDER BY created_at, job_id) and writes lora_trainings.
+            # fused_job_id in the SAME transaction as the waiting_lora -> processing claim.
+            # Every later dispatch — including a pre-container retry — RE-READS that link and
+            # reclaims that exact job. It never re-runs the selection, so a retry can no
+            # longer substitute a different job than the first attempt claimed.
             fused_job_id = None
             try:
-                cur.execute(
-                    "SELECT TOP 1 job_id FROM jobs WHERE user_id = ? AND status = 'waiting_lora' "
-                    "ORDER BY created_at",
-                    user_id,
-                )
-                row = cur.fetchone()
-                if row:
-                    candidate = str(row[0])
-                    cur.execute(
-                        "UPDATE jobs SET status = 'processing', dispatched_at = GETUTCDATE() "
-                        "WHERE job_id = ? AND status = 'waiting_lora'",
-                        candidate,
-                    )
-                    if cur.rowcount == 1:
-                        fused_job_id = candidate
-                    conn.commit()
+                fused_job_id, why = provisioning_retry.allocate_fused_job(
+                    cur, training_id, user_id)
+                conn.commit()
+                if fused_job_id:
+                    logging.info(
+                        f"fused training_id={training_id} -> job_id={fused_job_id} ({why})")
             except Exception:
                 # Fusing is an OPTIMISATION. If the claim fails for any reason, fall back to
                 # plain MODE=train — the job stays parked and _finish_training releases it
                 # exactly as it does today. Never let this break the working path.
+                # (FusedLinkConflict lands here too: rolling back releases the job claim, so
+                # the winner's link stands and no job is left 'processing' unlinked.)
                 logging.exception(
                     f"fused-job claim failed for training_id={training_id}; using MODE=train")
                 fused_job_id = None
@@ -2863,17 +3244,8 @@ def _dispatch_training(payload: dict, training_id: str, user_id: str):
             clear_dispatch_pending(owner)
             raise
 
-        conn4 = new_connection()
-        try:
-            c4 = conn4.cursor()
-            c4.execute(
-                "UPDATE lora_trainings SET status = 'training', external_execution_id = ? "
-                "WHERE training_id = ?",
-                execution_id, training_id,
-            )
-            conn4.commit()
-        finally:
-            conn4.close()
+        # Guarded: fills the empty slot on THIS attempt, never overwrites a newer one.
+        _record_training_execution_id(training_id, execution_id)
         clear_dispatch_pending(owner)
         logging.info(
             f"Started training_id={training_id} user={user_id} "
@@ -2906,6 +3278,44 @@ def _defer_training(payload: dict, training_id: str):
     )
 
 
+def _identity_adapter_state(user_id: str):
+    """True / False / None(unknown) for "does this user have a usable identity LoRA?".
+
+    _identity_adapter_exists collapses "no adapter" and "storage unreachable" into False,
+    which is right for an ordinary training FAILURE (be conservative, let them retrain) but
+    wrong for a PRE-CONTAINER provisioning exhaustion: there the container never ran, so
+    nothing could have damaged an existing adapter, and a transient blob outage must not be
+    what marks a paying user's LoRA failed. Callers that need to tell those apart use this.
+    """
+    try:
+        blob = get_blob_client().get_blob_client(
+            container="lora-weights",
+            blob=f"identity/{user_id}/adapter_model.safetensors",
+        )
+        return bool(blob.exists())
+    except Exception as e:
+        logging.warning(f"could not check adapter for user={user_id}: {e}")
+        return None
+
+
+def _has_completed_training(user_id: str) -> bool:
+    """Has this user ever completed a training run? A DB fact, so a blob-storage outage
+    cannot make us forget that they demonstrably have a model."""
+    try:
+        conn = new_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT TOP 1 1 FROM lora_trainings "
+                "WHERE user_id = ? AND status = 'completed'", user_id)
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        logging.exception(f"could not read training history for user={user_id}")
+        return False
+
+
 def _identity_adapter_exists(user_id: str) -> bool:
     """Does this user already have a usable identity LoRA in blob storage?
 
@@ -2926,7 +3336,82 @@ def _identity_adapter_exists(user_id: str) -> bool:
         return False
 
 
-def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None):
+def _terminalize_orphaned_training(conn, cur, training_id, user_id, *, ok, error,
+                                   existing_error, monthly_owed, one_time_owed):
+    """Close a training that cannot be finished normally. ONCE, deterministically.
+
+    THE LOOP THIS ENDS. An earlier design rolled back and let the watcher retry. But a users
+    UPDATE that matched 0 rows has PROVEN the row absent; repeating it cannot bring the user
+    back, so the run never terminalized and every tick logged another CRITICAL. Here the
+    condition is recorded and the training is closed, so the watcher stops seeing it.
+
+    Three outcomes, each implied by the VALIDATED amounts rather than asserted by the caller:
+
+      free                -> amounts valid, both zero. Nothing was charged, nothing is owed.
+      paid                -> amounts valid, aggregate > 0. Credits were taken and cannot be
+                             returned to a user that does not exist.
+      accounting_invalid  -> the amounts could not be validated at all. The marker records
+                             aggregate_owed: null — we do NOT know what is owed, and clamping
+                             a corrupt value to zero would mislabel it as free.
+
+    In EVERY case: no balance is touched, no credit-ledger row is written, no outbox row is
+    added, and the parked jobs are NOT swept. Releasing or failing work owned by a user that
+    does not exist would compound the inconsistency, and `_mark_failed` would refund into the
+    same absent row.
+
+    The marker is written with `error = ?`, NOT `error = COALESCE(error, ?)`: the ordinary
+    path keeps the FIRST error, which would frequently mean the marker was never stored. As
+    much of the original error as fits is preserved AFTER the marker.
+    """
+    marker, payload = training_orphan.build_orphan_marker(
+        training_id, user_id, monthly_owed=monthly_owed, one_time_owed=one_time_owed,
+        # Prefer the root cause already on the row; fall back to this call's error.
+        original_error=existing_error or error)
+    # `ok` stays the TRUTH about the run: a training that genuinely succeeded is recorded as
+    # completed even though it cannot be closed normally. Guarded + rowcount-checked, so a
+    # concurrent terminalization wins and this one writes nothing.
+    cur.execute(
+        "UPDATE lora_trainings SET status = ?, error = ?, completed_at = GETUTCDATE() "
+        "WHERE training_id = ? AND status NOT IN ('completed', 'failed')",
+        "completed" if ok else "failed", marker, training_id,
+    )
+    if cur.rowcount != 1:
+        # Someone else terminalized it first. Fail closed: write nothing, claim nothing.
+        conn.rollback()
+        logging.info(
+            f"ORPHAN_USER: training_id={training_id} already terminal; no marker written")
+        return
+    conn.commit()
+
+    reason = payload["reason"]
+    if reason == training_orphan.REASON_INVALID:
+        logging.critical(
+            "ACCOUNTING_INVALID: training_id=%s user_id=%s has retrain charge values that "
+            "are not valid non-negative integers (%s). The amount owed is UNKNOWN and was "
+            "NOT assumed to be zero. Nothing was moved, ledgered or swept. "
+            "dbo.lora_trainings.monthly_credit_cost/one_time_credit_cost are INT NOT NULL "
+            "with NO CHECK constraint, so a negative is representable — this needs operator "
+            "review. Query: SELECT * FROM dbo.lora_trainings WHERE error LIKE 'ORPHAN_USER:%%';",
+            training_id, user_id, payload.get("observed"))
+    elif reason == training_orphan.REASON_PAID:
+        logging.critical(
+            "ORPHAN_USER_PAID: training_id=%s user_id=%s is GONE and %s credit(s) "
+            "(monthly=%s one_time=%s) cannot be returned. No balance moved, no ledger row "
+            "written. credit_transactions has an FK to users, so a paid retrain implies a "
+            "retrain_charge row that references this user — its absence means schema drift, "
+            "manual deletion, or missing ledger history, NOT a transient condition. "
+            "Query: SELECT * FROM dbo.lora_trainings WHERE error LIKE 'ORPHAN_USER:%%';",
+            training_id, user_id, payload["aggregate_owed"],
+            payload["monthly_owed"], payload["one_time_owed"])
+    else:
+        logging.warning(
+            "ORPHAN_USER_FREE: training_id=%s user_id=%s is GONE; nothing was charged so "
+            "nothing is owed. Terminalized with an orphan marker; parked jobs NOT swept.",
+            training_id, user_id)
+
+
+def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None,
+                     *, sweep_parked: bool = True, lora_status_override: str = None):
     """Terminal transition for a training run, and the release of everything parked
     behind it. Guarded by the status check + rowcount so it runs EXACTLY once even if
     the watcher and a retry both see the same completed execution.
@@ -2939,24 +3424,81 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
     conn = new_connection()
     try:
         cur = conn.cursor()
+        # RAW: no ISNULL. Coercing an unexpected NULL to 0 would report schema drift as a
+        # FREE training. A NULL fails validation and becomes accounting_invalid instead.
         cur.execute(
-            "SELECT ISNULL(monthly_credit_cost, 0), ISNULL(one_time_credit_cost, 0) "
+            "SELECT monthly_credit_cost, one_time_credit_cost, error "
             "FROM lora_trainings WITH (UPDLOCK, HOLDLOCK) WHERE training_id = ?",
             training_id,
         )
         charge_row = cur.fetchone()
-        monthly_retrain_charge = int(charge_row[0] or 0) if charge_row else 0
-        one_time_retrain_charge = int(charge_row[1] or 0) if charge_row else 0
-        # COALESCE: never clobber a root cause already recorded by _record_training_error.
-        # The poison handler's "exceeded retry limit" arrives LAST and is the least useful
-        # message; the first error written is the one that explains the failure.
+        # RAW, uncoerced. `int(x or 0)` would turn True into 1, "20" into 20 and -20 into -20,
+        # and a later max(0, ...) would clamp that -20 to 0 and label a corrupt paid retrain
+        # FREE. Migration 026 declares these INT NOT NULL with NO CHECK, so a negative is
+        # representable; the value is validated, never converted.
+        raw_monthly = charge_row[0] if charge_row else None
+        raw_one_time = charge_row[1] if charge_row else None
+        existing_error = charge_row[2] if charge_row and len(charge_row) > 2 else None
+        accounting_invalid = not (training_orphan.is_valid_charge(raw_monthly)
+                                  and training_orphan.is_valid_charge(raw_one_time))
+        monthly_retrain_charge = 0 if accounting_invalid else raw_monthly
+        one_time_retrain_charge = 0 if accounting_invalid else raw_one_time
+
+        # DOES THE OWNER STILL EXIST? Asked ONCE, up front, under UPDLOCK, before any write
+        # that targets the users row. lora_trainings.user_id has no FK, so a training can
+        # outlive its owner — and once a users UPDATE has returned rowcount 0 the row is
+        # PROVEN absent. Re-running it on the next watcher tick cannot recreate it, so
+        # retrying is not recovery, it is an infinite loop. Detect first, decide once.
+        #
+        # ONLY a missing user takes the orphan path. An EXISTING user with corrupt charge
+        # metadata is a DIFFERENT condition: their LoRA state and their parked jobs must
+        # still be resolved, or lora_status stays 'training' FOREVER and every future
+        # retrain is refused with `already_training`. That case continues below and
+        # withholds only the refund.
         cur.execute(
-            "UPDATE lora_trainings SET status = ?, error = COALESCE(error, ?), "
-            "completed_at = GETUTCDATE() "
-            "WHERE training_id = ? AND status NOT IN ('completed', 'failed')",
-            "completed" if ok else "failed", (error[:1000] if error else None), training_id,
-        )
-        transitioned = cur.rowcount == 1
+            "SELECT 1 FROM users WITH (UPDLOCK, HOLDLOCK) WHERE user_id = ?", user_id)
+        if cur.fetchone() is None:
+            return _terminalize_orphaned_training(
+                conn, cur, training_id, user_id, ok=ok, error=error,
+                existing_error=existing_error,
+                monthly_owed=raw_monthly, one_time_owed=raw_one_time)
+
+        if accounting_invalid:
+            # A DISTINCT marker: the user is present, so claiming ORPHAN_USER would send an
+            # operator hunting for a deleted row that is sitting right there. Written with
+            # `error = ?` so it lands ahead of any root cause already recorded.
+            marker, _payload = training_orphan.build_accounting_invalid_marker(
+                training_id, user_id, monthly_owed=raw_monthly, one_time_owed=raw_one_time,
+                original_error=existing_error or error)
+            cur.execute(
+                "UPDATE lora_trainings SET status = ?, error = ?, "
+                "completed_at = GETUTCDATE() "
+                "WHERE training_id = ? AND status NOT IN ('completed', 'failed')",
+                "completed" if ok else "failed", marker, training_id,
+            )
+            transitioned = cur.rowcount == 1
+            if transitioned:
+                logging.critical(
+                    "TRAINING_ACCOUNTING_INVALID: training_id=%s user_id=%s has retrain "
+                    "charge values that are not valid non-negative integers "
+                    "(monthly=%r one_time=%r). NO refund and NO retrain_refund ledger row "
+                    "were written — the amount owed is UNKNOWN and was not assumed to be "
+                    "zero. The user EXISTS, so their LoRA state and parked jobs are "
+                    "resolved normally. Query: SELECT * FROM dbo.lora_trainings "
+                    "WHERE error LIKE 'TRAINING_ACCOUNTING_INVALID:%%';",
+                    training_id, user_id, raw_monthly, raw_one_time)
+        else:
+            # COALESCE: never clobber a root cause already recorded by
+            # _record_training_error. The poison handler's "exceeded retry limit" arrives
+            # LAST and is the least useful message; the first error written explains why.
+            cur.execute(
+                "UPDATE lora_trainings SET status = ?, error = COALESCE(error, ?), "
+                "completed_at = GETUTCDATE() "
+                "WHERE training_id = ? AND status NOT IN ('completed', 'failed')",
+                "completed" if ok else "failed",
+                (error[:1000] if error else None), training_id,
+            )
+            transitioned = cur.rowcount == 1
         if not transitioned:
             conn.commit()
             return
@@ -2968,18 +3510,38 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         # /jobs/submit and take away a product they already had, over a failure that damaged
         # nothing. So on failure, ask blob storage whether an adapter still exists and keep
         # them 'ready' if it does.
-        recovered = not ok and _identity_adapter_exists(user_id)
+        # When the caller supplies lora_status_override it has already decided this from
+        # better evidence (a pre-container exhaustion never ran the container, so nothing
+        # could have damaged the adapter). Skip the fail-closed blob probe entirely rather
+        # than let a storage blip influence anything on that path.
+        recovered = (not ok and lora_status_override is None
+                     and _identity_adapter_exists(user_id))
         if recovered:
             logging.warning(
                 f"training FAILED for user={user_id} but a previous adapter is intact; "
                 f"keeping lora_status='ready' (their existing model still works)"
             )
-        new_status = "ready" if (ok or recovered) else "failed"
+        new_status = lora_status_override or ("ready" if (ok or recovered) else "failed")
         cur.execute(
             "UPDATE users SET lora_status = ? WHERE user_id = ?", new_status, user_id)
+        # THERE IS NO FOREIGN KEY behind this. lora_trainings.user_id is NOT NULL but
+        # unconstrained (004; migration 022 records the convention explicitly: "carry NO FK,
+        # matching lora_trainings (004). Validate in application code."). So nothing in the
+        # database guarantees this user exists — application code is the ONLY guard, and a
+        # rowcount of 0 here means the training row's owner is gone.
+        if cur.rowcount != 1:
+            raise TrainingRefundIntegrityError(
+                "training %s: lora_status update matched %s user rows for user_id=%s"
+                % (training_id, cur.rowcount, user_id))
 
-        if not ok and (monthly_retrain_charge or one_time_retrain_charge):
+        # The refund is the ONLY step accounting corruption withholds: the amount is unknown,
+        # and a negative "refund" would DEBIT the customer and ledger it as a credit.
+        if (not accounting_invalid and not ok
+                and (monthly_retrain_charge or one_time_retrain_charge)):
             retrain_refund = monthly_retrain_charge + one_time_retrain_charge
+            # Restore the EXACT buckets that were charged, then the aggregate — the same
+            # discipline the job-refund path uses. monthly_credit_cost and one_time_credit_cost
+            # are what reserve_training_slot actually debited.
             cur.execute(
                 "UPDATE users SET "
                 "monthly_credits_remaining = monthly_credits_remaining + ?, "
@@ -2988,6 +3550,15 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
                 monthly_retrain_charge, one_time_retrain_charge,
                 retrain_refund, user_id,
             )
+            # LEDGER ONLY AFTER THE MONEY MOVED. Writing REASON_RETRAIN_REFUND on a 0-row
+            # UPDATE would assert a refund that never happened; raising rolls back the WHOLE
+            # transaction — including the training's terminal transition — so the run stays
+            # non-terminal and is retried rather than closed over a lost obligation.
+            if cur.rowcount != 1:
+                raise TrainingRefundIntegrityError(
+                    "training %s: retrain refund of %s credit(s) matched %s user rows for "
+                    "user_id=%s; nothing was ledgered"
+                    % (training_id, retrain_refund, cur.rowcount, user_id))
             credit_ledger.record(
                 cur, user_id, retrain_refund, credit_ledger.REASON_RETRAIN_REFUND)
 
@@ -2996,11 +3567,18 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
         # what parked jobs actually depend on. Conflating the two would either strand the
         # user or log a failed run as "completed".
         usable = ok or recovered
-        cur.execute(
-            "SELECT job_id, job_params FROM jobs WHERE user_id = ? AND status = 'waiting_lora'",
-            user_id,
-        )
-        parked = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        # sweep_parked=False means "this outcome says NOTHING about the other parked jobs".
+        # A pre-container provisioning exhaustion is exactly that: the container never ran, so
+        # the user's adapter (if any) is untouched and their OTHER paid generations must not
+        # be failed as collateral. They stay parked for the next training run.
+        parked = []
+        if sweep_parked:
+            cur.execute(
+                "SELECT job_id, job_params FROM jobs "
+                "WHERE user_id = ? AND status = 'waiting_lora'",
+                user_id,
+            )
+            parked = [(str(r[0]), r[1]) for r in cur.fetchall()]
         released = []   # (outbox_id, message) for the fast-path send after commit
         if usable and parked:
             cur.execute(
@@ -3014,6 +3592,18 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
                 msg = {"job_id": job_id, "user_id": str(user_id), "job_params": job_params}
                 released.append((outbox_add(cur, INFERENCE_QUEUE, msg), msg))
         conn.commit()
+    except TrainingRefundIntegrityError:
+        # Roll back EVERYTHING: the terminal transition, the lora_status change and any
+        # balance work. The training stays non-terminal so the watcher retries it, and the
+        # condition surfaces loudly instead of being committed as a finished run.
+        try:
+            conn.rollback()
+        except Exception:
+            logging.exception("rollback failed after a retrain-refund integrity error")
+        logging.critical(
+            f"TRAINING_REFUND_INTEGRITY: training_id={training_id} user={user_id} left "
+            f"NON-TERMINAL; no balance moved and no ledger row written", exc_info=True)
+        raise
     finally:
         conn.close()
 
@@ -3039,9 +3629,171 @@ def _finish_training(training_id: str, user_id: str, ok: bool, error: str = None
             logging.info(f"released parked job_id={msg['job_id']} for user={user_id}")
     else:
         # Never leave a user waiting on an adapter that will never exist.
-        # _mark_failed refunds their credits (guarded, once).
+        # _mark_failed refunds their credits (guarded, once). Per-job isolation: one job's
+        # failure must not strand the rest of the user's parked work.
         for job_id, _ in parked:
-            _mark_failed(job_id)
+            try:
+                outcome = _mark_failed(job_id)
+            except Exception:
+                logging.exception(f"could not fail parked job_id={job_id}; the reaper will")
+                continue
+            if outcome == MARK_REFUND_PENDING:
+                logging.error(f"parked job_id={job_id} failed with a PENDING refund")
+
+
+def _training_execution_evidence(training_id, exec_id, first_terminal_at):
+    """Evidence for a TRAINING execution. Same collector, same ACA job (bettersnapai-if runs
+    train and infer via MODE), same tri-state rules — a training run's replica fails to
+    provision exactly the way a generation run's does."""
+    from shared.queue_trigger import get_execution_evidence
+
+    preflight_exit, diag_reason = _preflight_diagnostics(exec_id)
+    terminal_at = _epoch_or_none(first_terminal_at)
+    evidence = get_execution_evidence(
+        str(exec_id), preflight_exit_code=preflight_exit, terminal_observed_at=terminal_at)
+    if diag_reason:
+        evidence["_diagnostic_reason"] = diag_reason
+    if terminal_at is None and (evidence.get("arm_status") or "") in _ARM_TERMINAL_STATES:
+        try:
+            conn = new_connection()
+            try:
+                cur = conn.cursor()
+                provisioning_retry.stamp_first_terminal(
+                    cur, "lora_trainings", training_id, exec_id)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logging.exception(
+                f"could not stamp first_terminal_observed_at for training_id={training_id}")
+    return evidence
+
+
+def _retry_provisioning_training(training_id, exec_id):
+    """Own ONE transaction for a retryable FUSED/plain training execution.
+
+    That single commit covers: the linked generation job returned processing -> waiting_lora
+    (found ONLY via the persisted fused_job_id), the training row returned to 'queued' with
+    its execution id cleared and its per-attempt clock reset, the attempt recorded once, and
+    the redispatch outbox row. No direct queue send exists on this path.
+
+    fused_job_id is RETAINED across the retry, so the next _dispatch_training reclaims that
+    exact job. A missing / terminal / wrong-user / unexpected-state link is a FAIL-CLOSED
+    stop — it returns PLAN_EXHAUSTED rather than hunting for a replacement job.
+    """
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            result = provisioning_retry.retry_fused_training(
+                cur, training_id, exec_id, outbox_add=outbox_add, queue_name=TRAINING_QUEUE)
+            conn.commit()
+        except provisioning_retry.HistoryCorrupt as e:
+            conn.rollback()
+            logging.error(
+                f"PROVISIONING_HISTORY_CORRUPT: training_id={training_id} exec={exec_id}: "
+                f"{e}; refusing to retry (history NOT reset)")
+            return {"plan": provisioning_retry.PLAN_EXHAUSTED,
+                    "reason": "provisioning history unreadable: %s" % e}
+    finally:
+        conn.close()
+
+    if result["plan"] == provisioning_retry.PLAN_RETRY:
+        try:
+            outbox_try_send_now(result["outbox_id"], TRAINING_QUEUE, result["message"])
+        except Exception as e:
+            logging.warning(
+                f"training retry fast-path send failed for training_id={training_id} "
+                f"(non-fatal; the dispatcher will deliver): {e}")
+        logging.warning(
+            f"PROVISIONING_RETRY: training_id={training_id} re-queued after pre-container "
+            f"failure of execution={exec_id} (attempt {result['attempts']}/"
+            f"{provisioning_retry.MAX_PROVISIONING_EXECUTIONS}); "
+            f"fused_job_id={result.get('fused_job_id')} retained")
+    return result
+
+
+def _exhaust_provisioning_training(training_id, user_id, exec_id, reason):
+    """Budget spent on a training run whose replica Azure never backed.
+
+    ISOLATION IS THE POINT. A pre-container exhaustion means the training container NEVER RAN:
+    no adapter was written, no adapter was damaged, and nothing was learned about the user's
+    other parked generations. Routing it through the ordinary training-failure sweep would
+    fail and refund every OTHER waiting_lora job the user had parked — unrelated paid work
+    killed as collateral for an Azure capacity problem, and (because the adapter probe fails
+    closed on a storage blip) potentially flipping a working LoRA to 'failed' as well.
+
+    So this path:
+      * terminalizes + refunds ONLY the exact persisted fused_job_id, in one transaction;
+      * retains fused_job_id as permanent audit linkage;
+      * terminalizes the training with sweep_parked=False, leaving other waiting_lora rows
+        untouched and parked for the next training run;
+      * decides lora_status from evidence that a blob outage cannot corrupt.
+
+    Ordinary application/training failures keep the existing sweep behaviour untouched.
+    """
+    fused_job_id = None
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            provisioning_retry.record_training_attempt(cur, training_id, exec_id)
+            cur.execute(
+                "SELECT fused_job_id FROM lora_trainings WITH (UPDLOCK, HOLDLOCK) "
+                "WHERE training_id = ?", training_id)
+            frow = cur.fetchone()
+            fused_job_id = frow[0] if frow else None
+            if fused_job_id:
+                ok, link_reason = provisioning_retry.verify_fused_link(
+                    cur, fused_job_id, user_id,
+                    expected_states=provisioning_retry.FUSED_RECLAIMABLE_STATES)
+                if ok:
+                    transitioned, refund, state = provisioning_retry.terminalize_and_refund(
+                        cur, fused_job_id, credit_ledger=credit_ledger)
+                    if transitioned:
+                        _stamp_failure_class_tx(
+                            cur, fused_job_id,
+                            exec_reconcile.CLASS_PRE_CONTAINER_PROVISIONING, reason, exec_id)
+                        if state == provisioning_retry.REFUND_PENDING:
+                            # The fused job terminalizes either way; the FULL plan is recorded
+                            # and settled later by the compensator, never silently dropped.
+                            _record_refund_debt(cur, fused_job_id)
+                    logging.warning(
+                        f"PROVISIONING_EXHAUSTED: fused job_id={fused_job_id} of "
+                        f"training_id={training_id} failed={transitioned} refunded={refund}")
+                else:
+                    # Not ours to touch, and never a reason to refund a different job.
+                    logging.warning(
+                        f"fused link {fused_job_id} of training_id={training_id} not "
+                        f"terminalizable ({link_reason}); leaving it alone")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            # Do NOT swallow this into the ordinary completion path. The training row stays
+            # non-terminal so the watcher retries the whole step next tick; TRAINING_STUCK_
+            # MINUTES remains the hard backstop. Silently continuing would terminalize the
+            # training while leaving its fused job stranded in 'processing'.
+            logging.exception(
+                f"could not terminalize fused job for training_id={training_id}; "
+                f"leaving the training non-terminal for the next watcher tick")
+            raise
+    finally:
+        conn.close()
+
+    # lora_status from evidence a storage blip cannot corrupt. The container never ran, so
+    # whatever the user had before, they still have.
+    adapter = _identity_adapter_state(user_id)
+    if adapter is None:
+        # Storage unreachable. Fall back to a DB fact rather than assuming the worst: a user
+        # with a completed training demonstrably has a model and must keep 'ready'.
+        adapter = _has_completed_training(user_id)
+    override = "ready" if adapter else "failed"
+    _finish_training(training_id, user_id, ok=False, error=reason,
+                     sweep_parked=False, lora_status_override=override)
+    logging.warning(
+        f"PROVISIONING_EXHAUSTED: training_id={training_id} terminalized WITHOUT the parked-"
+        f"job sweep (lora_status={override}); fused_job_id={fused_job_id} retained for audit")
+    return fused_job_id
 
 
 def _fail_training(training_id: str, error: str):
@@ -3082,7 +3834,12 @@ def handle_poison_job(msg: func.QueueMessage):
     if job_id:
         # Guarded fail + one-time credit refund (same helper as every other
         # failure path) so a poisoned message doesn't silently cost the user.
-        _mark_failed(job_id)
+        outcome = _mark_failed(job_id)
+        if outcome == MARK_REFUND_PENDING:
+            logging.error(f"POISON: job_id={job_id} failed with a PENDING refund; the "
+                          f"compensator will settle it once the target row exists")
+        elif outcome == MARK_ALREADY_TERMINAL:
+            logging.info(f"POISON: job_id={job_id} was already terminal")
 
 
 # ── Timer-trigger reaper ──────────────────────────────────────────────────────
@@ -3122,11 +3879,16 @@ def reaper(timer: func.TimerRequest):
         # (killed / crashed / operator-stopped) is definitively dead — don't make it wait out the
         # full REAPER_STUCK_MINUTES healthy-run window. Bounded to rows with a known execution id;
         # the per-execution status read (an ACA call) is done below, after the DB conn closes.
+        # 'dispatching' is included deliberately. A PRE-CONTAINER provisioning failure can
+        # never reach 'processing' — the container that writes that status never starts — so
+        # scoping the early reconcile to 'processing' left exactly the retryable class waiting
+        # out the full REAPER_DISPATCHING_MINUTES window before anyone looked at it.
         cur.execute(
-            "SELECT job_id, external_execution_id FROM jobs "
-            "WHERE status = 'processing' AND external_execution_id IS NOT NULL"
+            "SELECT job_id, external_execution_id, status FROM jobs "
+            "WHERE status IN ('processing', 'dispatching') "
+            "AND external_execution_id IS NOT NULL"
         )
-        processing_with_exec = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        processing_with_exec = [(str(r[0]), r[1], r[2]) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -3136,47 +3898,213 @@ def reaper(timer: func.TimerRequest):
     # refund case (refunding it would hand the user both a refund AND the delivered images).
     _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
     _stuck_seen = set(stuck)
-    for job_id, exec_id in processing_with_exec:
+    for job_id, exec_id, row_status in processing_with_exec:
         if job_id in _stuck_seen:
             continue
-        state = (execution_status(exec_id) or "").lower()
+        try:
+            state = (execution_status(exec_id) or "").lower()
+        except Exception:
+            # Per-item isolation: one unreadable execution must not abort the whole sweep.
+            logging.exception(f"REAPER: could not read execution {exec_id} for job_id={job_id}")
+            continue
         if state in _DEAD_EXEC_STATES:
             logging.warning(
-                f"REAPER: processing job_id={job_id} has terminal execution status='{state}' "
-                f"— reconciling early (not waiting REAPER_STUCK_MINUTES)"
+                f"REAPER: {row_status} job_id={job_id} has terminal execution status="
+                f"'{state}' — reconciling early (not waiting the full timeout)"
             )
             stuck.append(job_id)
             _stuck_seen.add(job_id)
 
     for job_id, exec_id in dispatching:
-        if not exec_id:
-            recovered = find_execution_for_job(job_id)
-            if recovered:
-                _record_execution_id(job_id, recovered)
-                logging.warning(
-                    f"REAPER: recovered live execution_id={recovered} for job_id={job_id}; not failing"
-                )
-                continue
+        if job_id in _stuck_seen:
+            continue
+        try:
+            if not exec_id:
+                # Exclude everything already reconciled, so recovery can never re-adopt a
+                # spent execution — with retries a job can have several.
+                handled, corrupt = _handled_executions(job_id)
+                if corrupt:
+                    # FAIL CLOSED but FINITE: we cannot prove any execution is unhandled, so
+                    # nothing is adopted and nothing is retried — and the row is terminalized
+                    # once the operator-repair window expires instead of being skipped forever.
+                    _reconcile_corrupt_history(job_id)
+                    continue
+                recovered = find_execution_for_job(job_id, exclude=handled)
+                if recovered:
+                    if _record_execution_id(job_id, recovered):
+                        logging.warning(
+                            f"REAPER: recovered live execution_id={recovered} for "
+                            f"job_id={job_id}; not failing")
+                    continue
+        except Exception:
+            logging.exception(f"REAPER: execution recovery failed for job_id={job_id}")
+            continue
         stuck.append(job_id)
+        _stuck_seen.add(job_id)
 
     now_ts = datetime.now(timezone.utc).timestamp()
     for job_id in stuck:
-        logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
-        exec_data = _fetch_execution_outcome(job_id)   # ACA execution status + optional preflight detail
-        if exec_data is not None:
-            # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, operator stop,
-            # or a genuinely-complete/pending job) and fail+refund EXACTLY ONCE with the class
-            # recorded — so an infra failure is never mislabelled as a customer/model failure,
-            # and a job whose container actually delivered (exit 0) is not spuriously refunded.
-            decision = _reconcile_execution_outcome(job_id, exec_data, now_ts)
-            logging.warning(f"REAPER: job_id={job_id} class={decision['failure_class']} "
-                            f"infra={decision['is_infra']} action={decision['action']}")
-        else:
-            # Safety net (dev's original fail+refund behaviour + a class): stuck past the timeout
-            # with no readable outcome -> fail+refund once, labelled an unclassified infra timeout.
-            _stamp_failure_class(job_id, "infra_timeout",
-                                 "reaper timeout; execution outcome unavailable", None)
-            _mark_failed(job_id)
+        # PER-ITEM ISOLATION. One job's SQL/history/evidence failure must not skip every
+        # remaining stuck job in this tick — the reaper is the only thing that clears an
+        # OOM-killed row, so losing a tick loses real recoveries.
+        try:
+            _reap_one(job_id, now_ts)
+        except Exception:
+            logging.exception(f"REAPER: reconciliation failed for job_id={job_id}; "
+                              f"continuing with the rest of this tick")
+
+    # Settle any refund that was owed but could not be paid when its job terminalized.
+    try:
+        _compensate_pending_refunds()
+    except Exception:
+        logging.exception("REAPER: pending-refund compensation pass failed")
+
+
+def _handled_executions(job_id):
+    """(history_set, corrupt) for this job. NEVER raises.
+
+    A corrupt history used to raise, the reaper's per-item handler caught it, and the job was
+    skipped -- on every tick, forever. Reporting the condition instead lets the caller run a
+    FINITE fail-closed policy: never adopt, never retry, observe, then terminalize.
+    """
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT provisioning_execution_ids FROM jobs WHERE job_id = ?", job_id)
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    try:
+        return set(provisioning_retry.parse_history(row[0] if row else None)), False
+    except provisioning_retry.HistoryCorrupt as e:
+        logging.error(f"PROVISIONING_HISTORY_CORRUPT: job_id={job_id}: {e}")
+        return set(), True
+
+
+def _corrupt_history_age(job_id):
+    """Seconds since this job was dispatched (COALESCE created_at), or None.
+
+    A DURABLE timestamp that already exists. first_terminal_observed_at cannot be used here:
+    its write is guarded on external_execution_id, and the corrupt-history case includes rows
+    that have no execution id at all."""
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DATEDIFF(SECOND, COALESCE(dispatched_at, created_at), GETUTCDATE()) "
+            "FROM jobs WHERE job_id = ?", job_id)
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row or row[0] is None:
+        return None
+    return max(0, int(row[0]))
+
+
+def _reconcile_corrupt_history(job_id):
+    """FINITE fail-closed lifecycle for an unreadable provisioning history.
+
+    The history is never reset or reinterpreted, no execution is ever adopted, and no retry is
+    ever granted -- none of those can be justified when we cannot prove which executions were
+    already reconciled. But the row does not sit forever either: past the operator-repair
+    window it is terminalized and refunded exactly once, labelled honestly.
+    """
+    age = _corrupt_history_age(job_id)
+    plan, why = provisioning_retry.plan_corrupt_history(age)
+    if plan == provisioning_retry.CORRUPT_OBSERVE:
+        logging.warning(f"PROVISIONING_HISTORY_CORRUPT: job_id={job_id} {why}")
+        return provisioning_retry.CORRUPT_OBSERVE
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        transitioned, refund, state = provisioning_retry.terminalize_corrupt_history(
+            cur, job_id, credit_ledger=credit_ledger)
+        if transitioned:
+            _stamp_failure_class_tx(
+                cur, job_id, provisioning_retry.CLASS_PROVISIONING_HISTORY_CORRUPT, why, None)
+            if state == provisioning_retry.REFUND_PENDING:
+                _record_refund_debt(cur, job_id)
+        conn.commit()
+    finally:
+        conn.close()
+    logging.warning(
+        f"PROVISIONING_HISTORY_CORRUPT: job_id={job_id} terminalized "
+        f"(transitioned={transitioned} refund={refund} state={state}) — {why}")
+    return provisioning_retry.CORRUPT_TERMINAL
+
+
+def _compensate_pending_refunds(limit=200):
+    """Settle recorded refund debts whose target row now exists. Exactly once, per job.
+
+    The guard is the credit ledger itself: a settled refund always has one job_refund row for
+    that job_id, so a second compensator (or a duplicate timer tick) finds it and stops. Runs
+    on the reaper's cadence; each job is isolated so one failure cannot skip the rest.
+    """
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        # Parameterised LIKE over the existing job_params column — the marker key is a
+        # module constant, never interpolated. Bounded and ordered so a long backlog is
+        # drained across ticks rather than in one pass.
+        cur.execute(
+            "SELECT TOP (?) job_id FROM jobs "
+            "WHERE status = 'failed' AND job_params LIKE ? "
+            "ORDER BY completed_at DESC",
+            limit, '%"' + provisioning_retry.REFUND_PENDING_KEY + '"%')
+        pending = [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    if not pending:
+        return 0
+    settled = 0
+    for job_id in pending:
+        try:
+            conn = new_connection()
+            try:
+                cur = conn.cursor()
+                try:
+                    state = provisioning_retry.compensate_pending_refund(
+                        cur, job_id, credit_ledger=credit_ledger)
+                except provisioning_retry.RefundMarkerNotCleared as e:
+                    # The payment landed but the debt marker survived. Committing would leave
+                    # a live marker over a paid refund and the next tick would pay it AGAIN,
+                    # so the entire compensation is rolled back and retried later.
+                    conn.rollback()
+                    logging.critical(
+                        f"REFUND_ROLLED_BACK: job_id={job_id} compensation undone because "
+                        f"the pending marker did not clear: {e}")
+                    continue
+                conn.commit()
+            finally:
+                conn.close()
+            if state == provisioning_retry.REFUND_DONE:
+                settled += 1
+                logging.warning(f"REFUND_SETTLED: job_id={job_id} pending refund paid")
+        except Exception:
+            logging.exception(f"could not settle pending refund for job_id={job_id}")
+    logging.info(f"pending-refund compensator: settled {settled}/{len(pending)}")
+    return settled
+
+
+def _reap_one(job_id, now_ts):
+    logging.warning(f"REAPER: reconciling stuck job_id={job_id}")
+    exec_data = _fetch_execution_outcome(job_id)   # ACA execution status + optional preflight detail
+    if exec_data is not None:
+        # Classify (GPU-preflight exit 42/43/44, startup stall, app failure, operator stop,
+        # or a genuinely-complete/pending job) and fail+refund EXACTLY ONCE with the class
+        # recorded — so an infra failure is never mislabelled as a customer/model failure,
+        # and a job whose container actually delivered (exit 0) is not spuriously refunded.
+        decision = _reconcile_execution_outcome(job_id, exec_data, now_ts)
+        logging.warning(f"REAPER: job_id={job_id} class={decision['failure_class']} "
+                        f"infra={decision['is_infra']} action={decision['action']}")
+    else:
+        # Safety net (dev's original fail+refund behaviour + a class): stuck past the timeout
+        # with no readable outcome -> fail+refund once, labelled an unclassified infra timeout.
+        _stamp_failure_class(job_id, "infra_timeout",
+                             "reaper timeout; execution outcome unavailable", None)
+        outcome = _mark_failed(job_id)
+        if outcome == MARK_REFUND_PENDING:
+            logging.error(f"REAPER: job_id={job_id} failed with a PENDING refund")
 
 
 # ── Outbox dispatcher ─────────────────────────────────────────────────────────
@@ -3236,46 +4164,100 @@ def training_watcher(timer: func.TimerRequest):
         cur = conn.cursor()
         cur.execute("""
             SELECT training_id, user_id, external_execution_id,
-                   DATEDIFF(MINUTE, created_at, GETUTCDATE()) AS age_min
+                   DATEDIFF(MINUTE, created_at, GETUTCDATE()) AS age_min,
+                   first_terminal_observed_at
             FROM lora_trainings
             WHERE status IN ('dispatching', 'training')
         """)
-        inflight = [(str(r[0]), str(r[1]), r[2], int(r[3] or 0)) for r in cur.fetchall()]
+        inflight = [(str(r[0]), str(r[1]), r[2], int(r[3] or 0), r[4])
+                    for r in cur.fetchall()]
     finally:
         conn.close()
 
     if not inflight:
         return
 
-    for training_id, user_id, execution_id, age_min in inflight:
-        # Hard timeout: a run past the ceiling is failed so the jobs parked behind it are
-        # released (failed + refunded) instead of waiting forever on a dead container.
-        if age_min > TRAINING_STUCK_MINUTES:
-            logging.warning(
-                f"TRAINING_TIMEOUT: training_id={training_id} age={age_min}min "
-                f"exceeds {TRAINING_STUCK_MINUTES}min; failing"
-            )
-            _finish_training(training_id, user_id, ok=False,
-                             error=f"training exceeded {TRAINING_STUCK_MINUTES} minutes")
-            continue
-
-        if not execution_id:
-            continue  # still dispatching; nothing to poll yet
-
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for row in inflight:
+        # PER-ITEM ISOLATION: one training's SQL/history/evidence failure must not skip the
+        # rest of this tick. The watcher is what releases parked jobs, so a lost tick delays
+        # every other user's paid work.
         try:
-            status = get_execution_status(execution_id)
-        except Exception as e:
-            logging.warning(f"watcher: could not read execution {execution_id}: {e}")
-            continue
+            _watch_one(*row, now_ts=now_ts, get_execution_status=get_execution_status)
+        except Exception:
+            logging.exception(f"watcher: failed for training_id={row[0]}; "
+                              f"continuing with the rest of this tick")
 
-        if status == "succeeded":
-            # The trainer's own FORMAT GATE already refused to upload a broken adapter
-            # (it reloads base SDXL and checks the adapter actually activates), so a
-            # 'succeeded' execution means a usable adapter is in blob storage.
-            _finish_training(training_id, user_id, ok=True)
-        elif status in ("failed", "degraded", "cancelled", "stopped"):
-            _finish_training(training_id, user_id, ok=False,
-                             error=f"training execution {status}")
+
+def _watch_one(training_id, user_id, execution_id, age_min, first_terminal_at, *,
+               now_ts, get_execution_status):
+    # RETRY AGE SEMANTICS: age_min is measured from lora_trainings.created_at and is NOT
+    # reset by a provisioning retry. TRAINING_STUCK_MINUTES is therefore a ceiling on the
+    # WHOLE run — every attempt plus the queue waits between them — not a per-attempt
+    # budget. That is deliberate: a user must not be able to wait 3x the timeout because
+    # Azure failed to provision twice. The per-ATTEMPT clock is
+    # first_terminal_observed_at, which IS reset on every retry.
+    #
+    # Hard timeout: a run past the ceiling is failed so the jobs parked behind it are
+    # released (failed + refunded) instead of waiting forever on a dead container.
+    if age_min > TRAINING_STUCK_MINUTES:
+        logging.warning(
+            f"TRAINING_TIMEOUT: training_id={training_id} age={age_min}min "
+            f"exceeds {TRAINING_STUCK_MINUTES}min; failing"
+        )
+        _finish_training(training_id, user_id, ok=False,
+                         error=f"training exceeded {TRAINING_STUCK_MINUTES} minutes")
+        return
+
+    if not execution_id:
+        return  # still dispatching; nothing to poll yet
+
+    try:
+        status = get_execution_status(execution_id)
+    except Exception as e:
+        logging.warning(f"watcher: could not read execution {execution_id}: {e}")
+        return
+
+    if status == "succeeded":
+        # The trainer's own FORMAT GATE already refused to upload a broken adapter
+        # (it reloads base SDXL and checks the adapter actually activates), so a
+        # 'succeeded' execution means a usable adapter is in blob storage.
+        # fused_job_id is deliberately NOT cleared here: 034 retains it after completion
+        # as permanent audit linkage.
+        _finish_training(training_id, user_id, ok=True)
+    elif status in ("failed", "degraded", "cancelled", "stopped"):
+        # A terminal-failed training execution is no longer assumed to be the training's
+        # fault. Classify it: a replica Azure never backed (pre-container) is retryable
+        # infrastructure, everything else keeps its existing terminal behaviour exactly.
+        decision = None
+        try:
+            evidence = _training_execution_evidence(
+                training_id, execution_id, first_terminal_at)
+            decision = exec_reconcile.classify_execution(evidence, now_ts)
+        except Exception:
+            logging.exception(
+                f"could not classify training execution {execution_id}; "
+                f"falling back to the existing terminal path")
+        action = (decision or {}).get("action")
+        if action == exec_reconcile.ACTION_NONE:
+            # Still gathering evidence (ingestion grace / telemetry unavailable). Leave
+            # the run in flight; TRAINING_STUCK_MINUTES above is the hard backstop.
+            logging.info(
+                f"training_id={training_id} terminal but inconclusive "
+                f"({(decision or {}).get('reason')}); observing")
+            return
+        if action == exec_reconcile.ACTION_RETRY:
+            outcome = _retry_provisioning_training(training_id, execution_id)
+            if outcome.get("plan") == provisioning_retry.PLAN_RETRY:
+                return
+            if outcome.get("plan") == provisioning_retry.PLAN_ALREADY_HANDLED:
+                return
+            _exhaust_provisioning_training(
+                training_id, user_id, execution_id,
+                outcome.get("reason") or "GPU could not be provisioned")
+            return
+        _finish_training(training_id, user_id, ok=False,
+                         error=f"training execution {status}")
 
 
 # ── Subscriptions: Plans ──────────────────────────────────
@@ -5211,9 +6193,10 @@ def admin_cancel_job(req: func.HttpRequest) -> func.HttpResponse:
             stop_execution(exec_id)
         except Exception as e:
             logging.warning(f"admin_cancel_job stop failed job={job_id}: {e}")
-    _mark_failed(job_id)  # fail + refund, guarded once
+    outcome = _mark_failed(job_id)  # fail + refund, guarded once
     _write_audit(get_db().cursor(), admin, "job.cancelled", "job", str(job_id),
-                 previous={"status": status}, new={"status": "failed"})
+                 previous={"status": status},
+                 new={"status": "failed", "refund_outcome": outcome})
     return func.HttpResponse(json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True}),
                              mimetype="application/json", status_code=200)
 

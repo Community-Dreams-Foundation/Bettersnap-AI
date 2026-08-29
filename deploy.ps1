@@ -105,7 +105,24 @@ if (-not $SkipMigrations) {
     if ($LASTEXITCODE -ne 0) { Write-Error "run_migrations.py failed ($LASTEXITCODE) — schema not up to date, refusing to deploy code."; exit 1 }
   } finally { Pop-Location }
 } else {
-  Step 1 "Migrations SKIPPED (-SkipMigrations)"
+  # -SkipMigrations skips APPLYING, never VERIFYING. Shipping runtime code ahead of
+  # migrations 033/034 is not a degraded feature — the training watcher's inflight SELECT
+  # raises on every tick, so no training completes and no parked generation is released.
+  # "I applied them out of band" is exactly the claim that has to be checked.
+  # Required order: migrations 033/034 -> verified schema -> Functions deployment.
+  Step 1 "Migrations SKIPPED (-SkipMigrations) - verifying runtime schema anyway"
+  if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Error "python not found - required for the schema gate. Install Python 3."
+    exit 1
+  }
+  Push-Location (Join-Path $RepoRoot "Bettersnap-aI_Backend")
+  try {
+    python scripts/run_migrations.py --verify-schema
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "Schema gate FAILED ($LASTEXITCODE) - the deployed DB is missing columns this code reads. Refusing to deploy."
+      exit 1
+    }
+  } finally { Pop-Location }
 }
 
 # ── 2. Build + push v23 ─────────────────────────────────────────────────────

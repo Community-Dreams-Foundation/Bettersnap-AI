@@ -237,6 +237,16 @@ class FakeCursor:
         elif "select admin_user_id, seats_purchased, status from organizations" in s:
             self._fetch = self.cfg.get("payment_intent_org_row")  # (admin_user_id, seats_purchased, status) or None
 
+        # -- org_dashboard_summary --
+        # NOTE the ", name," -- this substring is deliberately DIFFERENT from the
+        # payment-intent branch above, so the two cannot shadow each other.
+        elif "select admin_user_id, name, seats_purchased, status from organizations" in s:
+            self._fetch = self.cfg.get("dashboard_org_row")
+        elif "coalesce(sum(credits_remaining), 0) from organization_members" in s:
+            self._fetch = (self.cfg.get("org_credits", 0),)
+        elif "select status, count(*) from jobs where organization_id" in s:
+            self._fetchall_rows = self.cfg.get("org_job_counts", [])
+
         # ── _handle_org_payment: look up who to credit, only if still locked ──
         elif "select admin_user_id, credits_per_seat from organizations" in s and "pending_payment" in s:
             self._fetch = self.cfg.get("webhook_org_row")  # (admin_user_id, credits_per_seat) or None
@@ -839,6 +849,234 @@ class AcceptInvitationTests(unittest.TestCase):
 
         executed_sql = [sql.lower() for sql, _ in cfg["executed"]]
         self.assertTrue(any("status = 'accepted'" in s for s in executed_sql))
+
+
+# ===========================================================================
+# Teams admin GUID comparison -- regression
+# ===========================================================================
+# WHY THIS EXISTS
+# organizations.admin_user_id is UNIQUEIDENTIFIER. SQL Server renders it UPPERCASE
+# through pyodbc; the caller-side id is an Entra oid, which arrives lowercase. Two
+# Teams endpoints compare those two values in PYTHON rather than in SQL:
+#
+#     create_org_payment_intent   function_app.py:510
+#     org_dashboard_summary       function_app.py:558
+#
+# A case-sensitive `!=` there rejects the org's real admin with 403. The fix
+# (str(...).lower() on both sides) is already in HEAD; these tests are what keeps it
+# there. They were written on the abandoned branch codex/merge-features-team
+# (commit ea53384) and never merged, so the runtime fix has shipped with NO
+# regression cover at all.
+#
+# _require_org_admin does NOT need this: it resolves authority in SQL
+# ("WHERE organization_id = ? AND admin_user_id = ?"), and SQL Server compares
+# uniqueidentifier as a binary type, so that predicate is already case-insensitive.
+# The two endpoints above bypass it and compare in Python. That asymmetry is the bug.
+#
+# These drive the REAL endpoint functions end to end -- no source-text scanning.
+UPPER_ADMIN = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+LOWER_ADMIN = "abcdef01-2345-6789-abcd-ef0123456789"
+OTHER_ADMIN = "11111111-2222-4333-8444-555555555555"
+
+
+class TeamsAdminGuidCaseTests(unittest.TestCase):
+    """Same GUID, different casing, must be the same person."""
+
+    def _payment_intent(self, stored_admin, caller):
+        cfg = {"payment_intent_org_row": (stored_admin, 10, "pending_payment")}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(caller)
+        checkout = mock.patch.object(
+            function_app, "create_org_checkout",
+            return_value={"url": "https://stripe.test/checkout", "id": "cs_test_case"})
+        checkout.start(); p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            return function_app.create_org_payment_intent(
+                FakeRequest(route_params={"organization_id": "org-1"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); checkout.stop()
+
+    def _dashboard(self, stored_admin, caller):
+        cfg = {
+            "dashboard_org_row": (stored_admin, "Acme", 10, "active"),
+            "active_members": 1,
+            "org_credits": 10,
+            "org_job_counts": [("completed", 2)],
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(caller)
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            return function_app.org_dashboard_summary(
+                FakeRequest(route_params={"organization_id": "org-1"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+
+    def _my_org(self, stored_admin, caller):
+        cfg = {
+            "my_organization_row": ("org-1", 0, "member-1", "Acme", stored_admin, 10,
+                                    0, None, "active", 10),
+            "lora_status": "none",
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(caller)
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            return function_app.get_my_organization(FakeRequest())
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+
+    # -- create_org_payment_intent (function_app.py:510) --------------------
+    def test_payment_intent_accepts_same_guid_with_different_case(self):
+        """THE REGRESSION: uppercase in SQL, lowercase from the token."""
+        self.assertEqual(self._payment_intent(UPPER_ADMIN, LOWER_ADMIN).status_code, 200)
+
+    def test_payment_intent_accepts_the_reverse_casing_too(self):
+        self.assertEqual(self._payment_intent(LOWER_ADMIN, UPPER_ADMIN).status_code, 200)
+
+    def test_payment_intent_accepts_identical_casing(self):
+        self.assertEqual(self._payment_intent(LOWER_ADMIN, LOWER_ADMIN).status_code, 200)
+
+    def test_payment_intent_rejects_a_different_guid(self):
+        """Case-insensitivity must not become permissiveness."""
+        self.assertEqual(self._payment_intent(UPPER_ADMIN, OTHER_ADMIN).status_code, 403)
+
+    def test_payment_intent_rejects_a_guid_one_hex_digit_apart(self):
+        near = LOWER_ADMIN[:-1] + ("8" if LOWER_ADMIN[-1] != "8" else "a")
+        self.assertEqual(self._payment_intent(UPPER_ADMIN, near).status_code, 403)
+
+    def test_payment_intent_fails_closed_on_a_malformed_caller_id(self):
+        for bad in ("not-a-guid", "", "abcdef01", None):
+            with self.subTest(caller=bad):
+                self.assertEqual(self._payment_intent(UPPER_ADMIN, bad).status_code, 403)
+
+    def test_payment_intent_fails_closed_on_a_malformed_stored_admin(self):
+        self.assertEqual(self._payment_intent("not-a-guid", LOWER_ADMIN).status_code, 403)
+
+    # -- org_dashboard_summary (function_app.py:558) ------------------------
+    def test_dashboard_accepts_same_guid_with_different_case(self):
+        resp = self._dashboard(UPPER_ADMIN, LOWER_ADMIN)
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["job_status_counts"], {"completed": 2})
+        self.assertEqual(body["members_joined"], 1)
+        self.assertEqual(body["credits_remaining_total"], 10)
+
+    def test_dashboard_accepts_the_reverse_casing_too(self):
+        self.assertEqual(self._dashboard(LOWER_ADMIN, UPPER_ADMIN).status_code, 200)
+
+    def test_dashboard_rejects_a_different_guid(self):
+        self.assertEqual(self._dashboard(UPPER_ADMIN, OTHER_ADMIN).status_code, 403)
+
+    def test_dashboard_fails_closed_on_a_malformed_caller_id(self):
+        for bad in ("not-a-guid", "", None):
+            with self.subTest(caller=bad):
+                self.assertEqual(self._dashboard(UPPER_ADMIN, bad).status_code, 403)
+
+    def test_dashboard_404_for_a_missing_org_never_reaches_the_comparison(self):
+        """A wrong-org request must not confirm the org exists."""
+        cfg = {"dashboard_org_row": None}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(LOWER_ADMIN)
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            resp = function_app.org_dashboard_summary(
+                FakeRequest(route_params={"organization_id": "org-nope"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+        self.assertEqual(resp.status_code, 404)
+
+    # -- get_my_organization is_admin flag (function_app.py:6884) -----------
+    def test_is_admin_flag_is_true_for_the_same_guid_in_different_case(self):
+        """Not in ea53384, but the same comparison and the same failure mode: a
+        case-sensitive check here silently demotes the admin to a plain member in the
+        dashboard UI -- a wrong answer with a 200, not an error."""
+        resp = self._my_org(UPPER_ADMIN, LOWER_ADMIN)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(json.loads(resp.body)["organization"]["is_admin"])
+
+    def test_is_admin_flag_is_false_for_a_different_guid(self):
+        resp = self._my_org(UPPER_ADMIN, OTHER_ADMIN)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(json.loads(resp.body)["organization"]["is_admin"])
+
+    def test_is_admin_flag_is_false_for_a_malformed_caller_id(self):
+        resp = self._my_org(UPPER_ADMIN, "not-a-guid")
+        self.assertFalse(json.loads(resp.body)["organization"]["is_admin"])
+
+
+class AcceptInvitationOrgIdCaseTests(unittest.TestCase):
+    """accept_invitation (function_app.py:6682) compares the caller's existing
+    membership org against the invite's org in Python. Same uniqueidentifier casing
+    problem: a case-sensitive check turns "re-accepting your own invite" (a friendly
+    200 no-op) into ALREADY_IN_ANOTHER_ORG 409, locking a member out of their own org."""
+
+    ORG_UPPER = "0FEEDBEE-1234-4567-89AB-CDEF01234567"
+    ORG_LOWER = "0feedbee-1234-4567-89ab-cdef01234567"
+    ORG_OTHER = "99999999-8888-4777-8666-555555555555"
+
+    def _accept(self, invite_org, existing_org):
+        from datetime import datetime, timedelta
+        cfg = {
+            "invite_row": ("inv-1", invite_org, "pending",
+                           datetime.utcnow() + timedelta(days=5)),
+            "existing_membership": (existing_org,),
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("user-2")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            return function_app.accept_invitation(
+                FakeRequest(route_params={"token": "tok-abc"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+
+    def test_re_accepting_own_org_invite_works_across_casing(self):
+        resp = self._accept(self.ORG_UPPER, self.ORG_LOWER)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(json.loads(resp.body)["message"], "Already a member")
+
+    def test_a_genuinely_different_org_is_still_409(self):
+        resp = self._accept(self.ORG_UPPER, self.ORG_OTHER)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(json.loads(resp.body)["error"], "ALREADY_IN_ANOTHER_ORG")
+
+    def test_a_malformed_existing_org_id_fails_closed_as_a_different_org(self):
+        resp = self._accept(self.ORG_UPPER, "not-a-guid")
+        self.assertEqual(resp.status_code, 409)
+
+
+class TheseTestsDriveTheRealFunctions(unittest.TestCase):
+    """Guard against this regression cover degenerating into source-text scanning."""
+
+    def test_the_endpoints_under_test_are_the_real_module_functions(self):
+        import types
+        for name in ("create_org_payment_intent", "org_dashboard_summary",
+                     "get_my_organization", "accept_invitation"):
+            fn = getattr(function_app, name)
+            self.assertIsInstance(fn, types.FunctionType,
+                                  "%s must be a real function" % name)
+            self.assertEqual(fn.__module__, function_app.__name__)
+
+    def test_the_comparison_is_actually_executed_not_asserted_about(self):
+        """Proof the fake reached the real SQL: the endpoint must have issued the
+        organizations lookup whose result feeds the comparison."""
+        cfg = {"dashboard_org_row": (UPPER_ADMIN, "Acme", 10, "active"),
+               "active_members": 0, "org_credits": 0, "org_job_counts": []}
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(LOWER_ADMIN)
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            resp = function_app.org_dashboard_summary(
+                FakeRequest(route_params={"organization_id": "org-1"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+        self.assertEqual(resp.status_code, 200)
+        executed = [sql.lower() for sql, _ in cfg["executed"]]
+        self.assertTrue(
+            any("from organizations where organization_id" in s for s in executed),
+            "the org lookup that feeds the comparison never ran")
+
 
 
 if __name__ == "__main__":

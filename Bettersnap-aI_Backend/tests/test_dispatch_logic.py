@@ -331,8 +331,14 @@ class FakeCursor:
             )
         elif "select status, external_execution_id" in s:
             self._fetch = self.cfg.get("job_row", ("queued", None))
-        elif "where status = 'processing' and external_execution_id is not null" in s:
-            self._fetchall = self.cfg.get("reaper_processing_with_exec", [])
+        elif "where status in ('processing', 'dispatching')" in s:
+            # The early reconcile now covers 'dispatching' too: a PRE-CONTAINER failure can
+            # never reach 'processing', so the old scope missed exactly the retryable class.
+            # Rows are (job_id, execution_id, status).
+            self._fetchall = [
+                r if len(r) == 3 else (r[0], r[1], "processing")
+                for r in self.cfg.get("reaper_processing_with_exec", [])
+            ]
         elif "select job_id from jobs where status = 'processing'" in s:
             self._fetchall = self.cfg.get("reaper_processing", [])
         elif "select job_id, external_execution_id from jobs where status = 'dispatching'" in s:
@@ -345,9 +351,37 @@ class FakeCursor:
             self.rowcount = self.cfg.get("training_claim_rowcount", 1)
         elif "update lora_trainings set status = ?" in s:
             self.rowcount = self.cfg.get("training_finish_rowcount", 1)
-        elif ("select isnull(monthly_credit_cost" in s
+        elif "select 1 from users with (updlock, holdlock)" in s:
+            # The owner-existence probe _finish_training now makes BEFORE any users write.
+            # Default: the user exists. Set user_missing=True to model an orphaned training.
+            self._fetch = None if self.cfg.get("user_missing") else (1,)
+        elif ("select monthly_credit_cost, one_time_credit_cost, error" in s
               and "from lora_trainings" in s):
-            self._fetch = self.cfg.get("training_credit_costs", (0, 0))
+            costs = self.cfg.get("training_credit_costs", (0, 0))
+            # now also returns `error`, so the orphan path can preserve the root cause
+            self._fetch = tuple(costs) + (self.cfg.get("training_error"),)
+        elif "update lora_trainings set status = ?, error = ?, completed_at" in s:
+            # The orphan terminal write: error = ? (NOT COALESCE), so the marker lands first.
+            self.rowcount = self.cfg.get("training_finish_rowcount", 1)
+        elif "update users set lora_status = ?" in s:
+            # rowcount is load-bearing: lora_trainings.user_id has NO FK to users, so this
+            # UPDATE is one of the places a vanished owner is detected.
+            self.rowcount = self.cfg.get("lora_status_rowcount", 1)
+        elif "update users set monthly_credits_remaining = monthly_credits_remaining + ?" in s:
+            self.rowcount = self.cfg.get("retrain_refund_rowcount", 1)
+        elif "update jobs set external_execution_id = ? where job_id = ? and status = ?" in s:
+            # Guarded: fills an empty slot only. cfg drives whether this attempt still owns
+            # the row, so a test can model a LATE writer losing to a newer attempt.
+            self.rowcount = self.cfg.get("record_exec_rowcount", 1)
+        elif "select provisioning_execution_ids from jobs" in s:
+            self._fetch = (self.cfg.get("provisioning_execution_ids"),)
+        elif "select status from jobs with (updlock" in s:
+            # terminalize_corrupt_history locks and re-reads the row before failing it.
+            self._fetch = (self.cfg.get("corrupt_status", "dispatching"),)
+        elif "datediff(second, coalesce(dispatched_at, created_at)" in s:
+            self._fetch = (self.cfg.get("corrupt_age_s", 0),)
+        elif "job_params like ?" in s:
+            self._fetchall = self.cfg.get("pending_refunds", [])
         elif "update jobs set status = 'failed'" in s:
             # guarded fail transition; rowcount drives the one-time refund
             self.rowcount = self.cfg.get("fail_rowcount", 1)
@@ -359,6 +393,17 @@ class FakeCursor:
                            self.cfg.get("one_time_credits", 0),
                            self.cfg.get("suspended_at"))  # None = active (submit_job suspend gate)
         # _mark_failed reads the amount actually charged so it refunds the FULL cost.
+        elif "select job_params, user_id, source_type, organization_id from jobs" in s:
+            self._fetch = (self.cfg.get("job_params", json.dumps({"credit_cost": 1})),
+                           self.cfg.get("job_user_id", "user-1"),
+                           self.cfg.get("job_source_type"),
+                           self.cfg.get("job_org_id"))
+        elif "update users set credits_remaining = credits_remaining + ? where user_id = ?" in s:
+            self.rowcount = self.cfg.get("refund_rowcount", 1)
+        elif "update users set monthly_credits_remaining" in s:
+            self.rowcount = self.cfg.get("refund_rowcount", 1)
+        elif "update organization_members set credits_remaining" in s:
+            self.rowcount = self.cfg.get("org_refund_rowcount", 1)
         elif "select job_params, user_id, source_type from jobs" in s:
             self._fetch = (self.cfg.get("job_params",
                                         json.dumps({"credit_cost": 1})), "user-1",
@@ -1928,11 +1973,61 @@ class ReaperTests(unittest.TestCase):
                                side_effect=lambda: FakeConn(cfg)):
             function_app.reaper(None)
 
+        # The write is now GUARDED (status + external_execution_id IS NULL), so it carries the
+        # expected status as a third parameter. That guard is what stops a late worker from
+        # overwriting a newer attempt's execution id.
         self.assertTrue(any(
-            "set external_execution_id" in sql.lower() and params == ("exec-live", "job-7")
+            "set external_execution_id" in sql.lower()
+            and params[:2] == ("exec-live", "job-7")
+            and "external_execution_id is null" in sql.lower()
             for sql, params in cfg["executed"]
         ))
-        self.assertFalse(any("status = 'failed'" in sql.lower() for sql, _ in cfg["executed"]))
+        self.assertFalse(any("update jobs set status = 'failed'" in sql.lower()
+                             for sql, _ in cfg["executed"]))
+
+    def test_reaper_recovery_excludes_already_reconciled_executions(self):
+        """With bounded retries a job can have several executions. Recovery must never
+        re-adopt one that was already reconciled — that pins the row to a spent verdict."""
+        cfg = {"reaper_dispatching": [("job-7", None)],
+               "provisioning_execution_ids": json.dumps(["exec-spent"])}
+        qt = sys.modules["shared.queue_trigger"]
+        qt.find_execution_for_job.reset_mock()
+        qt.find_execution_for_job.return_value = None   # only the spent one exists
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+        _, kwargs = qt.find_execution_for_job.call_args
+        self.assertEqual(kwargs.get("exclude"), {"exec-spent"})
+
+    def test_reaper_terminalizes_a_corrupt_history_row_at_the_ceiling(self):
+        """FINITE fail-closed: a corrupt history is never reset and never adopted, but the
+        row must not be skipped forever either."""
+        cfg = {"reaper_dispatching": [("job-9", None)],
+               "provisioning_execution_ids": "{not json",
+               "corrupt_age_s": 10 ** 6}
+        qt = sys.modules["shared.queue_trigger"]
+        qt.find_execution_for_job.reset_mock()
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+        qt.find_execution_for_job.assert_not_called()
+        self.assertTrue(any("update jobs set status = 'failed'" in sql.lower()
+                            for sql, _ in cfg["executed"]),
+                        "the corrupt-history row must terminalize at the ceiling")
+
+    def test_reaper_observes_a_corrupt_history_row_inside_the_ceiling(self):
+        cfg = {"reaper_dispatching": [("job-9", None)],
+               "provisioning_execution_ids": "{not json",
+               "corrupt_age_s": 1}
+        qt = sys.modules["shared.queue_trigger"]
+        qt.find_execution_for_job.reset_mock()
+        with mock.patch.object(function_app, "new_connection",
+                               side_effect=lambda: FakeConn(cfg)):
+            function_app.reaper(None)
+        qt.find_execution_for_job.assert_not_called()
+        self.assertFalse(any("update jobs set status = 'failed'" in sql.lower()
+                             for sql, _ in cfg["executed"]),
+                         "inside the repair window nothing may be terminalized")
 
 
 class RegistrationTests(unittest.TestCase):

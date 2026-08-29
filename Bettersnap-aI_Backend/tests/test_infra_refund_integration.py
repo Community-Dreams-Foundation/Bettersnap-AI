@@ -30,8 +30,25 @@ class FakeCursor:
 
     def execute(self, sql, *params):
         s = " ".join(sql.split()).lower()
+        self._rows = []
         J = STATE["jobs"]
-        if "select external_execution_id from jobs" in s:
+        if "select external_execution_id, first_terminal_observed_at from jobs" in s:
+            # _fetch_execution_outcome reads the execution id and the per-attempt terminal
+            # stamp in ONE query, so the evidence is tied to the exact execution whose age is
+            # then measured. first_terminal_observed_at is None until a pass stamps it.
+            self._fetch = (J[params[0]].get("external_execution_id"),
+                           J[params[0]].get("first_terminal_observed_at"))
+        elif "update jobs set first_terminal_observed_at" in s:
+            jid, exec_id = params[0], params[1]
+            row = J.get(jid)
+            if (row and row.get("external_execution_id") == exec_id
+                    and row.get("first_terminal_observed_at") is None
+                    and row["status"] not in ("completed", "failed")):
+                row["first_terminal_observed_at"] = "stamped"
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+        elif "select external_execution_id from jobs" in s:
             self._fetch = (J[params[0]].get("external_execution_id"),)
         elif "update jobs set status = 'failed'" in s:
             jid = params[0]
@@ -48,14 +65,28 @@ class FakeCursor:
                 self.rowcount = 1
             else:
                 self.rowcount = 0
-        elif "select job_params, user_id, source_type from jobs" in s:
+        elif "select job_params, user_id, source_type, organization_id from jobs" in s:
+            # build_refund_plan reads everything it needs in ONE locked read.
             jid = params[0]
-            self._fetch = (J[jid]["job_params"], J[jid]["user_id"], J[jid].get("source_type"))
-        elif "update users set credits_remaining" in s:
-            refund, jid = params[0], params[1]
-            uid = J[jid]["user_id"]
-            STATE["users"][uid] += refund
-            STATE["user_updates"] += 1     # count actual credit mutations
+            self._fetch = (J[jid]["job_params"], J[jid]["user_id"],
+                           J[jid].get("source_type"), J[jid].get("organization_id"))
+        elif "update users set credits_remaining = credits_remaining + ? where user_id = ?" in s:
+            # apply_refund_plan keys on user_id directly, and its rowcount is load-bearing.
+            refund, uid = params[0], params[1]
+            if uid not in STATE["users"]:
+                self.rowcount = 0
+            else:
+                STATE["users"][uid] += refund
+                STATE["user_updates"] += 1
+                self.rowcount = 1
+        elif "update users set monthly_credits_remaining" in s:
+            monthly, one_time, aggregate, uid = params
+            if uid not in STATE["users"]:
+                self.rowcount = 0
+            else:
+                STATE["users"][uid] += aggregate
+                STATE["user_updates"] += 1
+                self.rowcount = 1
         elif "select job_params from jobs" in s:
             self._fetch = (J[params[0]]["job_params"],)
         elif "update jobs set job_params = ?" in s:
@@ -66,6 +97,12 @@ class FakeCursor:
 
     def fetchone(self):
         return self._fetch
+
+    def fetchall(self):
+        # build_refund_plan cross-checks the reserve ledger and already_refunded reads the
+        # refund rows; this STATE has no ledger, which models a genuinely legacy job with no
+        # reserve row -- an explicitly supported compatibility case.
+        return getattr(self, "_rows", [])
 
 
 class FakeConn:
@@ -163,6 +200,25 @@ class InfraRefundIntegrationTests(unittest.TestCase):
             "execution_id": execution_id,
             "execution_status": STATE["execution_status"],
         }
+        # _fetch_execution_outcome now returns the execution_evidence STRUCTURE (built by
+        # queue_trigger.get_execution_evidence) instead of the flat legacy outcome dict, so the
+        # stub must provide it. Built with the REAL execution_evidence.make_evidence so the
+        # tri-state rules under test here are the production ones; only ARM/Log-Analytics I/O
+        # is faked. telemetry_ok=False models "Log Analytics has nothing yet", which is what
+        # these preflight-driven cases actually look like.
+        from shared import execution_evidence as _ee
+
+        def _fake_evidence(execution_id, *, job_name=None, preflight_exit_code=None,
+                           terminal_observed_at=None, **kw):
+            return _ee.make_evidence(
+                execution_id=execution_id,
+                arm_status=STATE["execution_status"],
+                preflight_exit_code=preflight_exit_code,
+                terminal_observed_at=terminal_observed_at,
+                telemetry_ok=False,
+                telemetry_error="no rows ingested yet")
+
+        queue_trigger.get_execution_evidence = _fake_evidence
         # Override ONLY the two functions we need, scoped to this test (auto-restored),
         # regardless of what the initial import bound them to.
         self._patchers = [
@@ -255,10 +311,12 @@ class InfraRefundIntegrationTests(unittest.TestCase):
         self.assertEqual(STATE["users"]["u1"], 60)
 
     def test_missing_preflight_blob_does_not_hide_aca_failure(self):
+        """A missing diagnostic blob is UNKNOWN, never evidence. ARM's own verdict survives
+        it, and preflight_exit_code stays None rather than defaulting to anything."""
         STATE["blobs"].clear()
         outcome = function_app._fetch_execution_outcome("J1")
-        self.assertEqual(outcome["execution_status"], "failed")
-        self.assertNotIn("preflight_exit_code", outcome)
+        self.assertEqual(outcome["arm_status"], "failed")
+        self.assertIsNone(outcome["preflight_exit_code"])
 
 
 class ReaperWiringTests(unittest.TestCase):

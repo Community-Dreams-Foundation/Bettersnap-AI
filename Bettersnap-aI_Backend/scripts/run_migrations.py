@@ -11,7 +11,8 @@ with GO must be split first).
 
 Usage:
   python scripts/run_migrations.py            # apply all pending migrations
-  python scripts/run_migrations.py --dry-run  # list what WOULD be applied (read-only)
+  python scripts/run_migrations.py --dry-run       # list what WOULD be applied (read-only)
+  python scripts/run_migrations.py --verify-schema # fail-fast: are the runtime columns present?
   python scripts/run_migrations.py --baseline # record all current files as applied WITHOUT
                                               # running them — use once when adopting this
                                               # runner on a DB that was already hand-migrated.
@@ -105,9 +106,40 @@ def apply_migration(conn, cur, name: str, sql: str):
         raise
 
 
+# Columns the RUNTIME retry/reconcile code reads unconditionally. If any of these is
+# missing, the deployed Functions app does not merely lose the retry feature — the training
+# watcher's inflight SELECT raises on EVERY tick, so no training ever completes and no parked
+# generation is ever released. That is a total outage, and it must be impossible to reach by
+# shipping code ahead of its schema.
+#
+# REQUIRED ORDER:  migrations 033/034  ->  verify_retry_schema  ->  Functions deployment.
+#
+# The check runs even with --skip-apply (the deploy script's -SkipMigrations path), because
+# "I applied migrations out of band" is exactly the claim that needs verifying.
+REQUIRED_RUNTIME_COLUMNS = {
+    "dbo.jobs": ("provisioning_attempts", "provisioning_execution_ids",
+                 "first_terminal_observed_at"),
+    "dbo.lora_trainings": ("provisioning_attempts", "provisioning_execution_ids",
+                           "first_terminal_observed_at", "fused_job_id"),
+}
+
+
+def verify_runtime_schema(cur):
+    """Return the list of missing 'table.column' names the runtime requires. Empty == safe."""
+    missing = []
+    for table, columns in REQUIRED_RUNTIME_COLUMNS.items():
+        for column in columns:
+            cur.execute("SELECT COL_LENGTH(?, ?)", table, column)
+            row = cur.fetchone()
+            if row is None or row[0] is None:
+                missing.append("%s.%s" % (table, column))
+    return missing
+
+
 def main():
     dry = "--dry-run" in sys.argv
     baseline = "--baseline" in sys.argv
+    verify_only = "--verify-schema" in sys.argv
 
     conn = new_connection()
     # One explicit transaction per migration file. GO only separates driver batches;
@@ -122,6 +154,21 @@ def main():
     if table_exists:
         cur.execute("SELECT filename FROM dbo.schema_migrations")
         applied = {r[0] for r in cur.fetchall()}
+
+    if verify_only:
+        # Fail-fast gate. No apply, no tracking-table write: purely "is the deployed schema
+        # able to run the code we are about to ship?"
+        missing = verify_runtime_schema(cur)
+        conn.close()
+        if missing:
+            print("SCHEMA GATE FAILED - the runtime requires columns that do not exist:")
+            for name in missing:
+                print("  missing: %s" % name)
+            print("Apply migrations 033_provisioning_retry.sql and 034_fused_job_link.sql "
+                  "BEFORE deploying this code. Required order: migrations -> verify -> deploy.")
+            sys.exit(2)
+        print("schema gate OK - every runtime-required column is present.")
+        return
 
     files = _migration_files()
     names = [os.path.basename(f) for f in files]
@@ -160,7 +207,16 @@ def main():
         sql = open(f, encoding="utf-8").read()
         apply_migration(conn, cur, name, sql)
     print("migrations up to date.")
+    missing = verify_runtime_schema(cur)
     conn.close()
+    if missing:
+        # Applying every pending file should make this impossible; if it did not, the schema
+        # is not what the code expects and shipping would be an outage.
+        print("SCHEMA GATE FAILED after applying migrations - still missing:")
+        for name in missing:
+            print("  missing: %s" % name)
+        sys.exit(2)
+    print("schema gate OK - every runtime-required column is present.")
 
 
 if __name__ == "__main__":
