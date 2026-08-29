@@ -1,6 +1,6 @@
 # BetterSnap SuperAdmin authentication
 
-The dashboard has one MVP administrator: `sivmm29@gmail.com`. Microsoft Entra assigns this account the backend `Admin` application role. The frontend presents it as `SuperAdmin` and grants access to every dashboard section.
+The dashboard has one MVP administrator: `admin@bettersnap.ai`. Microsoft Entra assigns this account the backend `Admin` application role. The frontend presents it as `SuperAdmin` and grants access to every dashboard section.
 
 There are no OperationsAdmin, FinanceAdmin, SupportAdmin, or ProductAdmin accounts in the current MVP. Frontend authorization gates remain user-experience controls only; the backend must validate the Entra token and `Admin` role for every `/api/superadmin/*` request.
 
@@ -30,7 +30,7 @@ For local development, Vite forwards `/api` to the production Functions host. A 
 
 1. `/login` starts an MSAL Microsoft Entra popup.
 2. The application requests the `access_as_admin` API scope.
-3. Only `sivmm29@gmail.com` with the Entra `Admin` role is accepted by the frontend.
+3. Only `admin@bettersnap.ai` with the Entra `Admin` role is accepted by the frontend.
 4. The central API client attaches `Authorization: Bearer <token>` to protected requests.
 5. `GET /api/superadmin/me` is the preferred backend-authored administrator identity. Until that route is deployed, a `404` falls back to the Entra ID-token email and `Admin` role for frontend session creation. `401` and `403` never fall back.
 6. A `401` clears the frontend session and redirects to `/login`.

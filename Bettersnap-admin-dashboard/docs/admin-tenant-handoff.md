@@ -40,7 +40,7 @@ No client secret is required or allowed in this SPA.
 
 After the backend settings are active:
 
-1. Sign in as `sivmm29@gmail.com` using the work/organization identity.
+1. Sign in as `admin@bettersnap.ai` using the work/organization identity.
 2. Verify `GET /api/superadmin/me` returns the expected email and `roles: ["Admin"]`.
 3. Verify the users, jobs, payments, subscriptions, credits, audit, and system-health routes return authenticated data.
 4. Verify an unassigned account receives `403`.

@@ -27,7 +27,7 @@ export async function signIn(): Promise<AccountInfo> {
     if (!app || !apiScope) throw new Error('Microsoft Entra is not configured. Add the VITE_ENTRA_* values to .env.')
     // Calls are serialized above, so any remaining interaction marker belongs
     // to an abandoned popup and can be safely replaced by this new request.
-    const result = await app.loginPopup({scopes:[apiScope],loginHint:'sivmm29@gmail.com',prompt:'select_account',overrideInteractionInProgress:true})
+    const result = await app.loginPopup({scopes:[apiScope],loginHint:'admin',prompt:'select_account',overrideInteractionInProgress:true})
     app.setActiveAccount(result.account)
     return result.account
   })()

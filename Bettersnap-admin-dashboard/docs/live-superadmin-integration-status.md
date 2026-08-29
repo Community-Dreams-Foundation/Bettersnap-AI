@@ -1,6 +1,6 @@
 # Live SuperAdmin Integration Status
 
-The frontend uses `/api/superadmin/*`, never `/api/admin/*`. Microsoft Entra uses admin tenant `e853dd89-1910-4e66-805b-909b4477acdb`, app `a33131bf-3632-49a0-b4c3-693accec62cd`, and the single authorized dashboard identity is `sivmm29@gmail.com`. The browser only contains public SPA configuration; it never contains `ADMIN_API_KEY` or `ADMIN_TEST_SECRET`.
+The frontend uses `/api/superadmin/*`, never `/api/admin/*`. Microsoft Entra uses admin tenant `e853dd89-1910-4e66-805b-909b4477acdb`, app `a33131bf-3632-49a0-b4c3-693accec62cd`, and the single authorized dashboard identity is `admin@bettersnap.ai`. The browser only contains public SPA configuration; it never contains `ADMIN_API_KEY` or `ADMIN_TEST_SECRET`.
 
 ## Integrated now
 
