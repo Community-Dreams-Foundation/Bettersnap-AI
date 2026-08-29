@@ -1,6 +1,13 @@
 import { Activity,Bot,ChevronDown,CircleDollarSign,Coins,CreditCard,FileClock,Gauge,LayoutDashboard,LogOut,Menu,Users,X,type LucideIcon } from 'lucide-react'
 import { useState,type ReactNode } from 'react'
-import { PERMISSIONS,useAuth,type Permission } from '../auth'
+// Leaf modules, NOT the '../auth' barrel. The barrel re-exports ProtectedRoute,
+// which imports '../components' -> this file -> back into the barrel while it is
+// still initializing. Anything entering at src/auth/index.ts therefore saw
+// PERMISSIONS as undefined and threw here on PERMISSIONS.DASHBOARD_READ.
+// Importing the leaves directly removes the cycle rather than hiding it behind
+// export ordering, which would only work until someone reorders the barrel.
+import { useAuth } from '../auth/AuthProvider'
+import { PERMISSIONS,type Permission } from '../auth/rbac'
 import { Link,useRouter } from '../lib/router'
 const nav:{label:string;to:string;icon:LucideIcon;permission:Permission}[]=[
   {label:'Dashboard',to:'/dashboard',icon:LayoutDashboard,permission:PERMISSIONS.DASHBOARD_READ},{label:'Users',to:'/users',icon:Users,permission:PERMISSIONS.USERS_READ},{label:'AI Jobs',to:'/jobs',icon:Bot,permission:PERMISSIONS.JOBS_READ},{label:'Payments',to:'/payments',icon:CircleDollarSign,permission:PERMISSIONS.BILLING_READ},{label:'Subscriptions',to:'/subscriptions',icon:CreditCard,permission:PERMISSIONS.SUBSCRIPTIONS_READ},{label:'Credits',to:'/credits',icon:Coins,permission:PERMISSIONS.CREDITS_READ},{label:'System Health',to:'/system-health',icon:Activity,permission:PERMISSIONS.HEALTH_READ},{label:'Audit Logs',to:'/audit-logs',icon:FileClock,permission:PERMISSIONS.AUDIT_READ},{label:'Catalog & Plans',to:'/catalog-plans',icon:Gauge,permission:PERMISSIONS.CATALOG_READ},

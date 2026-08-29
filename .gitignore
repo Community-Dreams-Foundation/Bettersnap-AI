@@ -38,3 +38,4 @@ deploy.zip
 /Bettersnap-admin-dashboard/.DS_Store
 /Bettersnap-admin-dashboard/node_modules/
 /Bettersnap-admin-dashboard/dist/
+/Bettersnap-admin-dashboard/.firebase/
