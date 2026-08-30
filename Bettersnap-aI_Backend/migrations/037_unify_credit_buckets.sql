@@ -60,15 +60,25 @@ BEGIN
 END;
 GO
 
--- 2. Move legacy balances into the one-time bucket -----------------------------
--- Only where BOTH buckets are empty and the legacy column holds real credits, so this
--- cannot double-count an account that already has bucket balances. This is what
--- preserves the 13 trial users' 4 credits and the 3 monthly users' 150/125/100.
+-- 2. Move stranded legacy credits into the one-time bucket ---------------------
+-- Moves only the EXCESS the mirror holds over the buckets, so it covers both shapes:
+--
+--   fully legacy   cr=4    monthly=0   one_time=0    -> excess 4   -> one_time 4
+--   partly bucketed cr=174 monthly=145 one_time=4    -> excess 25  -> one_time 29
+--
+-- An earlier version only handled the first shape (both buckets empty). Three real
+-- accounts had the second — 112, 25 and 20 credits stranded in the mirror alongside a
+-- non-empty bucket — so they matched neither this step nor the raise-only step 3, and
+-- the verification below correctly refused to commit. Generalising to "move the excess"
+-- covers both and is still strictly credit-preserving: the customer's TOTAL is
+-- unchanged, it just moves into the column the runtime actually charges against.
 UPDATE dbo.users
-SET    one_time_credits_remaining = credits_remaining
-WHERE  ISNULL(monthly_credits_remaining, 0) = 0
-  AND  ISNULL(one_time_credits_remaining, 0) = 0
-  AND  credits_remaining > 0;
+SET    one_time_credits_remaining =
+           ISNULL(one_time_credits_remaining, 0)
+         + (credits_remaining - (ISNULL(monthly_credits_remaining, 0)
+                               + ISNULL(one_time_credits_remaining, 0)))
+WHERE  credits_remaining > (ISNULL(monthly_credits_remaining, 0)
+                          + ISNULL(one_time_credits_remaining, 0));
 GO
 
 -- 3. Repair mirrors that drifted below the authoritative bucket total ----------
