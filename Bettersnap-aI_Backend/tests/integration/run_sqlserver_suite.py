@@ -6,7 +6,7 @@ The offline fakes honour WHERE clauses, rowcount and commit/rollback visibility,
 NO LOCK MANAGER, NO constraint engine and NO DDL. Everything below needs a real engine:
 UPDLOCK/HOLDLOCK actually serializing connections, a trusted FK actually refusing an orphan, a
 filtered unique index actually rejecting a duplicate, THROW 50034/50035 actually firing, and
-migrations 000-034 actually applying and replaying.
+migrations 000-036 actually applying and replaying.
 
 EVERY CASE CALLS THE REAL PRODUCTION FUNCTION. No SQL is copied out of shared/ into this file
 to make a test pass; where a statement appears here it is seeding, drift injection, or
@@ -44,7 +44,7 @@ from tests.integration.harness import (                          # noqa: E402
     Harness, REACHABLE, DRIFT, same_guid,
 )
 
-# The EXACT migration set this plan covers. Pinned, not counted: if a 035 appears, the scope of
+# The EXACT migration set this plan covers. Pinned, not counted: if a 037 appears, the scope of
 # this suite changed and that needs a reviewed plan update, not a silently wider run.
 CANONICAL_MIGRATIONS = (
     "000_baseline.sql", "001_gpu_dispatch_lease.sql", "002_jobs_dispatch_idempotency.sql",
@@ -60,7 +60,8 @@ CANONICAL_MIGRATIONS = (
     "026_retrain_credit_buckets.sql", "027_catalog_tables.sql", "028_biometric_consent.sql",
     "029_audit_log.sql", "030_admin_audit_log.sql", "031_admin_user_status_and_notes.sql",
     "032_fix_org_status_constraint.sql", "033_provisioning_retry.sql",
-    "034_fused_job_link.sql", "035_teams_pricing_snapshot.sql",
+    "034_fused_job_link.sql", "035_organization_branding.sql",
+    "036_teams_pricing_snapshot.sql",
 )
 
 # SQL Server native error numbers raised by migration 034's shape guards.

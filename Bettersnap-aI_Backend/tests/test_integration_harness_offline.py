@@ -208,13 +208,14 @@ class MigrationScope(unittest.TestCase):
                          "update docs/sqlserver_integration_plan.md and CANONICAL_MIGRATIONS "
                          "together, deliberately")
 
-    def test_it_is_exactly_000_through_035(self):
-        # 035 adds the Teams pricing snapshot (contract teams_basic_v1). Updated
-        # deliberately, together with CANONICAL_MIGRATIONS — this test exists so an
-        # accidental migration cannot slip into the covered set unnoticed.
-        self.assertEqual(len(suite.CANONICAL_MIGRATIONS), 36)
+    def test_it_is_exactly_000_through_036(self):
+        # 035 persists organization branding (T-013); 036 adds the Teams pricing snapshot
+        # (contract teams_basic_v1) — renumbered from 035 after both landed on that number
+        # independently. Updated deliberately, together with CANONICAL_MIGRATIONS: this
+        # test exists so an accidental migration cannot slip into the covered set unnoticed.
+        self.assertEqual(len(suite.CANONICAL_MIGRATIONS), 37)
         self.assertTrue(suite.CANONICAL_MIGRATIONS[0].startswith("000_"))
-        self.assertTrue(suite.CANONICAL_MIGRATIONS[-1].startswith("035_"))
+        self.assertTrue(suite.CANONICAL_MIGRATIONS[-1].startswith("036_"))
 
     def test_versions_are_unique_and_ordered(self):
         prefixes = [n.split("_", 1)[0] for n in suite.CANONICAL_MIGRATIONS]
