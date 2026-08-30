@@ -7501,15 +7501,19 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
     except ValueError:
         return func.HttpResponse("Invalid JSON", status_code=400)
 
-    emails = body.get("emails") or []
-    if isinstance(emails, str):          # tolerate a single address
-        emails = [emails]
-    # Normalize before de-duping so "A@x.com" and "a@x.com " don't both get a seat.
-    emails = [e.strip().lower() for e in emails if isinstance(e, str) and e.strip()]
-    emails = list(dict.fromkeys(emails))  # de-dupe, preserve order
+    raw_emails = body.get("emails") or []
+    if isinstance(raw_emails, list) and len(raw_emails) > MAX_INVITE_BATCH:
+        return func.HttpResponse(
+            json.dumps({"error": "BATCH_TOO_LARGE", "max": MAX_INVITE_BATCH,
+                        "received": len(raw_emails)}),
+            mimetype="application/json", status_code=400)
+
+    # Same normalizer the preview endpoint uses, so a roster that previewed
+    # cleanly cannot behave differently when it is actually submitted.
+    emails, invalid_emails, dup_in_request = _normalize_email_list(raw_emails)
     if not emails:
         return func.HttpResponse(
-            json.dumps({"error": "NO_EMAILS"}),
+            json.dumps({"error": "NO_EMAILS", "invalid_email": invalid_emails}),
             mimetype="application/json", status_code=400)
 
     conn = new_connection()
@@ -7589,6 +7593,14 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
     sent = sum(1 for i in created if i["email_sent"])
     logging.info(f"invitations created: org={org_id} count={len(created)} "
                  f"emailed={sent} skipped={len(skipped)}")
+
+    # Invalid and in-file duplicate addresses never reached the seat check, so
+    # they are not in `skipped` — surface them here rather than silently dropping
+    # rows the admin thought they were inviting.
+    for addr in invalid_emails:
+        skipped.append({"email": addr, "reason": "INVALID_EMAIL"})
+    for addr in dup_in_request:
+        skipped.append({"email": addr, "reason": "DUPLICATE_IN_REQUEST"})
 
     return func.HttpResponse(
         json.dumps({"created": created, "skipped": skipped,
@@ -8083,4 +8095,367 @@ def get_my_org_branding(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps({"organization_id": str(org_id),
                     "branding": _branding_row_to_dict(cur.fetchone())}),
+        mimetype="application/json", status_code=200)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — organization image export (audit T-012)
+#
+# Append to the END of function_app.py, after the branding block.
+#
+# Uses only helpers already imported at the top of the file: get_user_id,
+# get_db, get_blob_client, get_secret, generate_blob_sas, BlobSasPermissions,
+# _write_event, _require_org_admin, _utc_iso.
+#
+# No migration required.
+#
+# ── WHY THIS IS A MANIFEST, NOT A SERVER-BUILT ZIP ────────────────────────
+# The audit asks for "authorized asynchronous ZIP export". Building the ZIP
+# server-side needs a queue trigger, a worker that streams potentially hundreds
+# of blobs into an archive, somewhere to put the archive, and an expiry sweep —
+# a multi-day build with new infrastructure.
+#
+# It also cannot be done synchronously: a 25-seat org with 10 credits each can
+# hold ~250 images at 1–2 MB, so a single response would blow past the Functions
+# response limit and the request timeout long before it finished.
+#
+# This endpoint instead returns a MANIFEST: one short-lived read SAS per image,
+# grouped by member, with everything the client needs to name the files. The
+# frontend downloads them (or zips them locally). That delivers the actual user
+# need — an admin getting the team's headshots — today, with no new
+# infrastructure, and the server-side async archive can be layered on later
+# using the same authorization and audit code.
+#
+# Flag this to the team as a deliberate scope call, not as T-012 fully closed.
+# ══════════════════════════════════════════════════════════════════════════
+ 
+# How long the download links stay valid. Long enough to pull a few hundred
+# images over a slow connection; short enough that a leaked manifest expires.
+EXPORT_SAS_HOURS = int(os.environ.get("EXPORT_SAS_HOURS", "4"))
+ 
+# Hard ceiling on images per response. Protects the response size and makes the
+# cost of a single call predictable. An org past this gets a truncated manifest
+# and `truncated: true` — paging is a follow-up if any org ever hits it.
+EXPORT_MAX_IMAGES = int(os.environ.get("EXPORT_MAX_IMAGES", "500"))
+ 
+ 
+@app.route(route="orgs/{org_id}/export", methods=["GET"])
+def export_org_images(req: func.HttpRequest) -> func.HttpResponse:
+    """Admin-only manifest of every completed image belonging to this org.
+ 
+    Authorization is the point of this endpoint: the jobs are queried by
+    organization_id, and _require_org_admin has already proved the caller owns
+    that org. A member cannot call this for their own org, and an admin of one
+    org cannot reach another's — the org is matched against admin_user_id, not
+    taken from the caller's claim about it.
+ 
+    Query params:
+      ?member=<user_id>  restrict to one member's images
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    org_id = req.route_params.get("org_id")
+    member_filter = req.params.get("member")
+ 
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    org, err = _require_org_admin(cur, user_id, org_id)
+    if err:
+        return err
+    org_name = org[4]
+ 
+    # Only completed jobs have output blobs. expired jobs are excluded because
+    # retention has already removed their blobs — a SAS for those would 404.
+    sql = """
+        SELECT j.job_id, j.user_id, u.email, u.full_name,
+               j.output_blob_path, j.created_at
+        FROM jobs j
+        LEFT JOIN users u ON u.user_id = j.user_id
+        WHERE j.organization_id = ?
+          AND j.status = 'completed'
+          AND (j.expired IS NULL OR j.expired = 0)
+          AND j.output_blob_path IS NOT NULL
+    """
+    args = [org_id]
+    if member_filter:
+        sql += " AND j.user_id = ?"
+        args.append(member_filter)
+    sql += " ORDER BY j.created_at DESC"
+ 
+    cur.execute(sql, *args)
+    rows = cur.fetchall()
+ 
+    blob_client = get_blob_client()
+    account_name = blob_client.account_name
+    account_key = get_secret("storage-account-key")
+    expiry = datetime.now(timezone.utc) + timedelta(hours=EXPORT_SAS_HOURS)
+ 
+    members = {}
+    total_images = 0
+    truncated = False
+ 
+    for job_id, member_id, email, full_name, raw_paths, created_at in rows:
+        if total_images >= EXPORT_MAX_IMAGES:
+            truncated = True
+            break
+ 
+        # output_blob_path is json.dumps([...]) from the inference container; a
+        # legacy single-path string still works. Same parse as jobs/{id}/result-url.
+        try:
+            paths = json.loads(raw_paths)
+            if not isinstance(paths, list):
+                paths = [raw_paths]
+        except (TypeError, ValueError):
+            paths = [raw_paths]
+        paths = [p for p in paths if p]
+        if not paths:
+            continue
+ 
+        key = str(member_id)
+        if key not in members:
+            members[key] = {
+                "user_id": key,
+                "email": email,
+                "full_name": full_name,
+                "images": [],
+            }
+ 
+        for idx, blob_name in enumerate(paths, start=1):
+            if total_images >= EXPORT_MAX_IMAGES:
+                truncated = True
+                break
+            sas_token = generate_blob_sas(
+                account_name=account_name,
+                container_name="outputs",
+                blob_name=blob_name,
+                account_key=account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=expiry,
+            )
+            members[key]["images"].append({
+                "job_id": str(job_id),
+                # Suggested filename for the client to save as, so a downloaded
+                # set is identifiable without opening every file.
+                "filename": _export_filename(email, job_id, idx, blob_name),
+                "created_at": _utc_iso(created_at),
+                "url": (f"https://{account_name}.blob.core.windows.net/"
+                        f"outputs/{blob_name}?{sas_token}"),
+            })
+            total_images += 1
+ 
+    # Drop members whose jobs all turned out to have no usable blobs.
+    member_list = [m for m in members.values() if m["images"]]
+ 
+    # Audit: an admin reading every member's generated images is exactly the kind
+    # of access SOC 2 expects to see recorded. Refs and counts only, no URLs —
+    # the SAS tokens are credentials and must not be persisted.
+    _write_event(
+        user_id, "org.export",
+        target=str(org_id),
+        detail={"images": total_images, "members": len(member_list),
+                "member_filter": member_filter, "truncated": truncated},
+        ip=req.headers.get("X-Forwarded-For"),
+    )
+ 
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": str(org_id),
+            "organization_name": org_name,
+            "generated_at": _utc_iso(datetime.now(timezone.utc).replace(tzinfo=None)),
+            "expires_at": expiry.isoformat().replace("+00:00", "Z"),
+            "total_images": total_images,
+            "truncated": truncated,
+            "members": member_list,
+        }),
+        mimetype="application/json", status_code=200)
+ 
+ 
+def _export_filename(email, job_id, index, blob_name):
+    """A stable, human-readable filename for a downloaded image.
+ 
+    Uses the local part of the email so a folder of downloads is sortable by
+    person. Falls back to the job id when there's no email on file.
+    """
+    base = (email or "").split("@")[0].strip() if email else ""
+    base = "".join(ch for ch in base if ch.isalnum() or ch in ("-", "_")) or str(job_id)[:8]
+    ext = ".png"
+    if "." in blob_name.rsplit("/", 1)[-1]:
+        ext = "." + blob_name.rsplit(".", 1)[-1]
+    return f"{base}_{str(job_id)[:8]}_{index}{ext}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — CSV roster import support (audit T-014)
+#
+# Append to the END of function_app.py, after the export block.
+#
+# ── SCOPE: WHY THE BACKEND DOESN'T PARSE THE CSV ──────────────────────────
+# The frontend parses the file (papaparse is already a dependency) and sends a
+# JSON array of addresses. That keeps this API uniform with the existing
+# invitations endpoint, avoids multipart handling in Functions, and means a
+# malformed file is reported to the admin in the browser rather than as a 400.
+#
+# What the backend genuinely owes T-014 is the part the frontend CANNOT do:
+# PREVIEW. "Validated CSV import with preview, duplicate detection, seat-limit
+# handling and per-row errors" needs seat counts and existing members, which
+# only the server knows. An admin uploading 200 rows must be able to see what
+# WOULD happen before committing — today the only way to find out is to send
+# the invites for real.
+#
+# This adds a dry-run that returns the same created/skipped shape the real
+# endpoint returns, without writing anything or sending any email.
+# ══════════════════════════════════════════════════════════════════════════
+ 
+# Cap on addresses per request. A 5,000-row paste should be rejected cleanly
+# rather than becoming one enormous transaction. Well above any realistic org.
+MAX_INVITE_BATCH = int(os.environ.get("MAX_INVITE_BATCH", "500"))
+ 
+ 
+def _valid_email(addr: str) -> bool:
+    """Deliberately permissive: one @, something either side, a dot in the domain,
+    no whitespace. Full RFC 5322 validation rejects addresses that work in
+    practice, and the invite email itself is the real deliverability test."""
+    if not addr or len(addr) > 320 or any(c.isspace() for c in addr):
+        return False
+    parts = addr.split("@")
+    if len(parts) != 2:
+        return False
+    local, domain = parts
+    return bool(local) and "." in domain and not domain.startswith(".") \
+        and not domain.endswith(".") and len(domain) > 2
+ 
+ 
+def _normalize_email_list(raw):
+    """Shared by preview and create so the two can never disagree about what a
+    given input would do. Returns (clean, invalid, duplicates)."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return [], [], []
+ 
+    seen, clean, invalid, duplicates = set(), [], [], []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        addr = item.strip().lower()
+        if not addr:
+            continue
+        if not _valid_email(addr):
+            invalid.append(addr)
+            continue
+        if addr in seen:
+            # Duplicates WITHIN the file — distinct from "already invited",
+            # which is a duplicate against the database.
+            duplicates.append(addr)
+            continue
+        seen.add(addr)
+        clean.append(addr)
+    return clean, invalid, duplicates
+ 
+ 
+@app.route(route="orgs/{org_id}/invitations/preview", methods=["POST"])
+def preview_invitations(req: func.HttpRequest) -> func.HttpResponse:
+    """Dry run for a roster upload. Writes NOTHING and sends NO email.
+ 
+    Body: {"emails": ["a@x.com", ...]}  — same shape as the real endpoint.
+ 
+    Returns each address sorted into what would happen to it, so the admin can
+    fix the file before committing:
+      will_invite      — a seat is available and the address is new
+      already_member   — already on the plan
+      already_invited  — holds a live pending invite
+      invalid_email    — failed format validation
+      duplicate_in_file— appeared more than once in the upload
+      no_seats         — valid and new, but the plan is full
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    org_id = req.route_params.get("org_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+ 
+    raw = body.get("emails") or []
+    if isinstance(raw, list) and len(raw) > MAX_INVITE_BATCH:
+        return func.HttpResponse(
+            json.dumps({"error": "BATCH_TOO_LARGE", "max": MAX_INVITE_BATCH,
+                        "received": len(raw)}),
+            mimetype="application/json", status_code=400)
+ 
+    clean, invalid, duplicates = _normalize_email_list(raw)
+ 
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    org, err = _require_org_admin(cur, user_id, org_id)
+    if err:
+        return err
+    seats_purchased = org[1]
+ 
+    cur.execute(
+        "SELECT COUNT(*) FROM organization_members "
+        "WHERE organization_id = ? AND status = 'active'", org_id)
+    active_members = cur.fetchone()[0]
+    cur.execute(
+        "SELECT COUNT(*) FROM invitations WHERE organization_id = ? "
+        "AND status = 'pending' AND expires_at > SYSUTCDATETIME()", org_id)
+    pending_invites = cur.fetchone()[0]
+    seats_left = max(0, seats_purchased - active_members - pending_invites)
+ 
+    # Existing members of THIS org, by email. LEFT-side lookup is on users
+    # because organization_members holds no address of its own.
+    cur.execute("""
+        SELECT LOWER(u.email)
+        FROM organization_members m
+        JOIN users u ON u.user_id = m.user_id
+        WHERE m.organization_id = ? AND m.status = 'active' AND u.email IS NOT NULL
+    """, org_id)
+    member_emails = {r[0] for r in cur.fetchall()}
+ 
+    cur.execute(
+        "SELECT LOWER(email) FROM invitations WHERE organization_id = ? "
+        "AND status = 'pending' AND expires_at > SYSUTCDATETIME()", org_id)
+    invited_emails = {r[0] for r in cur.fetchall()}
+ 
+    will_invite, already_member, already_invited, no_seats = [], [], [], []
+    for addr in clean:
+        if addr in member_emails:
+            already_member.append(addr)
+        elif addr in invited_emails:
+            already_invited.append(addr)
+        elif len(will_invite) < seats_left:
+            will_invite.append(addr)
+        else:
+            no_seats.append(addr)
+ 
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": str(org_id),
+            "seats_purchased": seats_purchased,
+            "seats_available": seats_left,
+            "summary": {
+                "will_invite": len(will_invite),
+                "already_member": len(already_member),
+                "already_invited": len(already_invited),
+                "invalid_email": len(invalid),
+                "duplicate_in_file": len(duplicates),
+                "no_seats": len(no_seats),
+            },
+            "will_invite": will_invite,
+            "already_member": already_member,
+            "already_invited": already_invited,
+            "invalid_email": invalid,
+            "duplicate_in_file": duplicates,
+            "no_seats": no_seats,
+        }),
         mimetype="application/json", status_code=200)
