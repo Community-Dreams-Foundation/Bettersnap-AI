@@ -6895,3 +6895,206 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
             "lora_status": lora_status,
         }),
         mimetype="application/json", status_code=200)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — organization branding (audit T-013)
+#
+# Append to the END of function_app.py, after the existing Teams block
+# (create_invitations / accept_invitation / list_org_members / get_my_organization).
+#
+# Needs at the top of function_app.py — check before adding, most are already there:
+#   from shared import catalog
+#   from shared.org_credits import get_active_membership   (already present)
+#
+# Migration 035_organization_branding.sql must be applied first.
+# ══════════════════════════════════════════════════════════════════════════
+ 
+ 
+def _branding_row_to_dict(row):
+    """Shared shape for both the admin and member views of branding."""
+    if not row:
+        return None
+    return {
+        "default_attire_ref": row[0],
+        "default_background_ref": row[1],
+        "style_key": row[2],
+        "use_case_key": row[3],
+        "max_images_per_member": row[4],
+        "enforcement_mode": row[5],
+        "updated_at": _utc_iso(row[6]),
+    }
+ 
+ 
+_BRANDING_SELECT = (
+    "SELECT default_attire_ref, default_background_ref, style_key, use_case_key, "
+    "max_images_per_member, enforcement_mode, updated_at "
+    "FROM organization_branding WHERE organization_id = ?"
+)
+ 
+ 
+# ── Admin: save the org's brand settings ──────────────────
+@app.route(route="orgs/{org_id}/branding", methods=["PUT"])
+def set_org_branding(req: func.HttpRequest) -> func.HttpResponse:
+    """Admin saves the organization's look-and-feel. Full replace, not a patch.
+ 
+    PUT rather than PATCH deliberately: the setup wizard submits the whole brand
+    form, and a partial-update endpoint would make "clear this field" ambiguous
+    (absent key vs explicit null). Send every field you want kept.
+ 
+    Body (all optional, null clears):
+      {"default_attire_ref": "business:navy_suit",
+       "default_background_ref": "studio:grey_seamless",
+       "style_key": "corporate",
+       "use_case_key": "linkedin",
+       "max_images_per_member": 20,
+       "enforcement_mode": "default"}
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    org_id = req.route_params.get("org_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+ 
+    attire_ref = (body.get("default_attire_ref") or None)
+    background_ref = (body.get("default_background_ref") or None)
+    style_key = (body.get("style_key") or None)
+    use_case_key = (body.get("use_case_key") or None)
+    max_images = body.get("max_images_per_member")
+    enforcement = (body.get("enforcement_mode") or "default").strip().lower()
+ 
+    # Validate catalog refs against the SAME helpers the generation path uses, so a
+    # brand can never be saved pointing at an attire or background that a member
+    # could not actually generate with.
+    if attire_ref and not catalog.valid_attire_ref(attire_ref):
+        return func.HttpResponse(
+            json.dumps({"error": "INVALID_ATTIRE_REF", "value": attire_ref}),
+            mimetype="application/json", status_code=400)
+    if background_ref and not catalog.valid_background_ref(background_ref):
+        return func.HttpResponse(
+            json.dumps({"error": "INVALID_BACKGROUND_REF", "value": background_ref}),
+            mimetype="application/json", status_code=400)
+ 
+    if enforcement not in ("default", "enforce"):
+        return func.HttpResponse(
+            json.dumps({"error": "INVALID_ENFORCEMENT_MODE", "value": enforcement}),
+            mimetype="application/json", status_code=400)
+ 
+    if max_images is not None:
+        try:
+            max_images = int(max_images)
+            if max_images < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return func.HttpResponse(
+                json.dumps({"error": "INVALID_MAX_IMAGES"}),
+                mimetype="application/json", status_code=400)
+ 
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+ 
+        org, err = _require_org_admin(cur, user_id, org_id)
+        if err:
+            return err
+ 
+        # MERGE rather than delete-then-insert: one row per org, and a concurrent
+        # save from a second admin tab must not briefly leave the org with no brand.
+        cur.execute("""
+            MERGE dbo.organization_branding AS target
+            USING (SELECT ? AS organization_id) AS source
+                ON target.organization_id = source.organization_id
+            WHEN MATCHED THEN UPDATE SET
+                default_attire_ref = ?, default_background_ref = ?,
+                style_key = ?, use_case_key = ?,
+                max_images_per_member = ?, enforcement_mode = ?,
+                updated_by_user_id = ?, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT
+                (organization_id, default_attire_ref, default_background_ref,
+                 style_key, use_case_key, max_images_per_member, enforcement_mode,
+                 updated_by_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+            org_id,
+            attire_ref, background_ref, style_key, use_case_key,
+            max_images, enforcement, user_id,
+            org_id, attire_ref, background_ref, style_key, use_case_key,
+            max_images, enforcement, user_id)
+ 
+        cur.execute(_BRANDING_SELECT, org_id)
+        saved = _branding_row_to_dict(cur.fetchone())
+        conn.commit()
+    finally:
+        conn.close()
+ 
+    logging.info(f"org branding saved: org={org_id} by={user_id} mode={enforcement}")
+    return func.HttpResponse(
+        json.dumps({"organization_id": str(org_id), "branding": saved}),
+        mimetype="application/json", status_code=200)
+ 
+ 
+# ── Admin: read the org's brand settings ──────────────────
+@app.route(route="orgs/{org_id}/branding", methods=["GET"])
+def get_org_branding(req: func.HttpRequest) -> func.HttpResponse:
+    """Admin view. Returns branding: null when nothing has been configured yet,
+    so the setup wizard can distinguish "unset" from "set to blank"."""
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    org_id = req.route_params.get("org_id")
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    org, err = _require_org_admin(cur, user_id, org_id)
+    if err:
+        return err
+ 
+    cur.execute(_BRANDING_SELECT, org_id)
+    return func.HttpResponse(
+        json.dumps({"organization_id": str(org_id),
+                    "branding": _branding_row_to_dict(cur.fetchone())}),
+        mimetype="application/json", status_code=200)
+ 
+ 
+# ── Member: read my org's brand settings ──────────────────
+@app.route(route="me/organization/branding", methods=["GET"])
+def get_my_org_branding(req: func.HttpRequest) -> func.HttpResponse:
+    """A MEMBER's view of their org's brand, for pre-selecting the generate form.
+ 
+    Separate from the admin endpoint because a member does not know their
+    organization_id and must not be able to read another org's settings by guessing
+    one. Resolved from the token via the same membership helper the credit path uses.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    membership = get_active_membership(cur, user_id)
+    if not membership:
+        # Not a Teams member — an individual user has no org brand. 200 with null
+        # rather than 404 so the frontend can call this unconditionally.
+        return func.HttpResponse(
+            json.dumps({"organization_id": None, "branding": None}),
+            mimetype="application/json", status_code=200)
+ 
+    org_id = membership[0]
+    cur.execute(_BRANDING_SELECT, org_id)
+    return func.HttpResponse(
+        json.dumps({"organization_id": str(org_id),
+                    "branding": _branding_row_to_dict(cur.fetchone())}),
+        mimetype="application/json", status_code=200)
