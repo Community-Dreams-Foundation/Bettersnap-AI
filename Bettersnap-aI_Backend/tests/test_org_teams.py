@@ -27,6 +27,7 @@ import sys
 import json
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -283,6 +284,68 @@ class FakeCursor:
         elif "update invitations set status = 'accepted'" in s:
             pass
 
+        # ── Teams graduated pricing (teams_basic_v1) ──────────────────────
+        # Durable quotes. Checkout loads one under a lock and consumes it.
+        elif "insert into teams_quotes" in s:
+            if self.cfg.get("quote_insert_raises"):
+                raise RuntimeError("quote insert failed")
+            self.cfg["issued_quote_params"] = params
+        elif "from teams_quotes with (updlock, holdlock)" in s:
+            self._fetch = self.cfg.get("quote_row")
+        elif "update teams_quotes" in s:
+            self.rowcount = self.cfg.get("quote_consume_rowcount", 1)
+
+        # The organization's single live checkout attempt.
+        elif "from organization_live_checkout l with (updlock, holdlock)" in s:
+            self._fetch = self.cfg.get("live_attempt_row")
+        elif "insert into organization_live_checkout" in s:
+            if self.cfg.get("live_insert_raises"):
+                raise RuntimeError("live slot already claimed")
+            self.rowcount = 1
+        elif "delete from organization_live_checkout" in s:
+            self.cfg["live_slot_released"] = True
+            self.rowcount = 1
+
+        # Expiry path: locate an attempt by Stripe session id, then retire it.
+        elif "select attempt_id, organization_id, status" in s:
+            self._fetch = self.cfg.get("attempt_by_session")
+        elif "set status = 'expired'" in s:
+            self.rowcount = self.cfg.get("expire_rowcount", 1)
+        # cancel_org_checkout's admin lookup.
+        elif "select admin_user_id from organizations" in s:
+            self._fetch = self.cfg.get("cancel_admin_row")
+
+        # Checkout attempts. "attempt_insert_raises" proves the endpoint refuses the
+        # checkout when the durable record cannot be written BEFORE Stripe is called.
+        elif "insert into organization_checkout_sessions" in s:
+            if self.cfg.get("snapshot_insert_raises") or self.cfg.get("attempt_insert_raises"):
+                raise RuntimeError("attempt insert failed")
+        # _handle_org_payment loads the snapshot it must validate the payment against.
+        elif "from organization_checkout_sessions with (updlock, holdlock)" in s:
+            self._fetch = self.cfg.get("checkout_snapshot")
+        elif "update organization_checkout_sessions" in s:
+            if self.cfg.get("promote_raises") and "status = 'pending'" in s:
+                raise RuntimeError("promote failed")
+            self.rowcount = self.cfg.get("snapshot_update_rowcount", 1)
+        # teams_checkout_status' authoritative read.
+        elif "from organization_checkout_sessions cs" in s:
+            self._fetch = self.cfg.get("checkout_status_row")
+
+        # Legacy allowlist — the ONLY evidence that admits a snapshot-less session.
+        elif "from organization_legacy_checkout_allowlist with (updlock, holdlock)" in s:
+            self._fetch = self.cfg.get("legacy_allowlist_row")
+        elif "update organization_legacy_checkout_allowlist" in s:
+            self.rowcount = self.cfg.get("legacy_claim_rowcount", 1)
+        # Fulfilment persists the AUTHORISED entitlement onto the org.
+        elif "update organizations set credits_per_seat" in s:
+            self.rowcount = 1
+        elif "update organizations set seats_purchased" in s:
+            self.rowcount = 1
+        elif "update organizations set updated_at" in s:
+            self.rowcount = 1
+        elif "update organization_payments" in s:
+            self.rowcount = 1
+
         else:
             self._fetch = None
         return self
@@ -312,6 +375,16 @@ class FakeConn:
 
     def close(self):
         pass
+
+
+def _teams_checkout_on():
+    """Enable the Teams checkout kill switch for one test.
+
+    The flag FAILS CLOSED — only the exact string "1" enables checkout — so every test
+    that exercises a real checkout path has to turn it on explicitly. That is the point:
+    a test which forgets sees 503, not a silent success.
+    """
+    return mock.patch.dict(os.environ, {"TEAMS_CHECKOUT_ENABLED": "1"})
 
 
 def _patched(cfg):
@@ -540,33 +613,70 @@ class CreateOrganizationTests(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # Payment gating — an org must be worthless until Stripe confirms payment
 # ═══════════════════════════════════════════════════════════════════════════
+GATING_ADMIN = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
 class PaymentGatingTests(unittest.TestCase):
     def test_payment_intent_blocked_once_already_active(self):
-        cfg = {"payment_intent_org_row": ("admin-1", 10, "active")}
+        cfg = {"payment_intent_org_row": (GATING_ADMIN, 10, "active")}
+        # Checkout requires a persisted quote; this one is valid so the GATE under test
+        # is what decides the outcome.
+        _exp = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
+        _qid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        cfg["quote_row"] = (_qid, GATING_ADMIN, None, 10, 34700, 30,
+                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None)
         conn, p1, p2 = _patched(cfg)
-        auth1, auth2 = _auth_as("admin-1")
+        auth1, auth2 = _auth_as(GATING_ADMIN)
+        flag = _teams_checkout_on(); flag.start()
         p1.start(); p2.start(); auth1.start(); auth2.start()
         try:
-            req = FakeRequest(route_params={"organization_id": "org-1"})
+            req = FakeRequest(body={"quote_id": _qid},
+                              route_params={"organization_id": "org-1"})
             resp = function_app.create_org_payment_intent(req)
         finally:
-            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); flag.stop()
         self.assertEqual(resp.status_code, 409)
 
-    def test_payment_intent_allowed_while_locked(self):
+    def test_payment_intent_refused_when_checkout_is_disabled(self):
+        """The kill switch must beat every other outcome, including a payable org."""
         cfg = {"payment_intent_org_row": ("admin-1", 10, "pending_payment")}
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as("admin-1")
+        # No _teams_checkout_on() — the flag is absent, which must read as DISABLED.
+        off = mock.patch.dict(os.environ, {}, clear=False)
+        os.environ.pop("TEAMS_CHECKOUT_ENABLED", None)
+        off.start(); p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            resp = function_app.create_org_payment_intent(
+                FakeRequest(route_params={"organization_id": "org-1"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); off.stop()
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(json.loads(resp.body)["error"], "TEAMS_CHECKOUT_DISABLED")
+
+    def test_payment_intent_allowed_while_locked(self):
+        cfg = {"payment_intent_org_row": (GATING_ADMIN, 10, "pending_payment")}
+        # Checkout requires a persisted quote; this one is valid so the GATE under test
+        # is what decides the outcome.
+        _exp = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
+        _qid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        cfg["quote_row"] = (_qid, GATING_ADMIN, None, 10, 34700, 30,
+                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None)
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as(GATING_ADMIN)
+        flag = _teams_checkout_on(); flag.start()
         checkout_patch = mock.patch.object(
-            function_app, "create_org_checkout",
+            function_app, "create_org_seats_checkout",
             return_value={"url": "https://stripe.test/checkout", "id": "cs_test_1"})
         checkout_patch.start()
         p1.start(); p2.start(); auth1.start(); auth2.start()
         try:
-            req = FakeRequest(route_params={"organization_id": "org-1"})
+            req = FakeRequest(body={"quote_id": _qid},
+                              route_params={"organization_id": "org-1"})
             resp = function_app.create_org_payment_intent(req)
         finally:
-            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); checkout_patch.stop()
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+            checkout_patch.stop(); flag.stop()
         self.assertEqual(resp.status_code, 200)
 
     def test_invitations_blocked_while_org_still_pending_payment(self):
@@ -588,13 +698,28 @@ class PaymentGatingTests(unittest.TestCase):
         self.assertEqual(json.loads(resp.body)["error"], "ORG_NOT_ACTIVE")
 
     def test_webhook_unlocks_org_and_raises_admin_credits_from_zero(self):
-        cfg = {"webhook_org_row": ("admin-1", 10), "webhook_membership_rowcount": 1}
+        # Snapshot-backed: a session with no snapshot now fails closed, so fulfilment is
+        # exercised through the authorised path it will actually take in production.
+        # The last column is breakdown_json: the version's validator proves the bands
+        # are contiguous, complete and correctly priced rather than trusting the total.
+        cfg = {"webhook_org_row": ("admin-1", 30), "webhook_membership_rowcount": 1,
+               "checkout_snapshot": ("org-1", "teams_basic_v1", "teams_basic", 10, 30,
+                                     34700, "usd", "pending",
+                                     "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                                     json.dumps([
+                                         {"from_seat": 1, "to_seat": 9,
+                                          "unit_price_cents": 3500, "seats": 9,
+                                          "subtotal_cents": 31500},
+                                         {"from_seat": 10, "to_seat": 24,
+                                          "unit_price_cents": 3200, "seats": 1,
+                                          "subtotal_cents": 3200},
+                                     ]))}
         conn, p1, p2 = _patched(cfg)
         p1.start(); p2.start()
         try:
             function_app._handle_org_payment(
-                {"metadata": {"organization_id": "org-1"}, "amount_total": 20000,
-                 "currency": "usd", "payment_intent": "pi_1"},
+                {"id": "cs_unlock", "metadata": {"organization_id": "org-1"},
+                 "amount_total": 34700, "currency": "usd", "payment_intent": "pi_1"},
                 "evt_unlock_1",
             )
         finally:
@@ -607,8 +732,8 @@ class PaymentGatingTests(unittest.TestCase):
 
         grant_call = next(
             p for sql, p in cfg["executed"] if "set credits_granted = ?, credits_remaining = ?" in sql.lower())
-        self.assertEqual(grant_call, (10, 10, "org-1", "admin-1"),
-                          "must raise the admin's own row from 0 to the real per-seat grant")
+        self.assertEqual(grant_call, (30, 30, "org-1", "admin-1"),
+                          "must raise the admin's own row from 0 to the AUTHORISED grant")
 
     def test_webhook_no_op_if_org_already_active(self):
         """A duplicate/replayed event landing after the org is already unlocked
@@ -883,18 +1008,33 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
     """Same GUID, different casing, must be the same person."""
 
     def _payment_intent(self, stored_admin, caller):
-        cfg = {"payment_intent_org_row": (stored_admin, 10, "pending_payment")}
+        # Checkout now requires a persisted quote. These tests are about WHO the caller
+        # is, so the quote is made valid for the caller and the org — the admin check is
+        # what must decide the outcome, and it runs before the quote is even loaded.
+        from datetime import datetime, timedelta, timezone
+        expires = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
+        quote_id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        cfg = {
+            "payment_intent_org_row": (stored_admin, 10, "pending_payment"),
+            "quote_row": (quote_id, caller, None, 10, 34700, 30,
+                          "teams_basic_v1", "teams_basic", "usd", expires, "issued", None),
+        }
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(caller)
+        # Checkout is enabled here on purpose: these tests are about WHO the caller is,
+        # so the kill switch must not be what decides the outcome.
+        flag = _teams_checkout_on(); flag.start()
         checkout = mock.patch.object(
-            function_app, "create_org_checkout",
+            function_app, "create_org_seats_checkout",
             return_value={"url": "https://stripe.test/checkout", "id": "cs_test_case"})
         checkout.start(); p1.start(); p2.start(); auth1.start(); auth2.start()
         try:
             return function_app.create_org_payment_intent(
-                FakeRequest(route_params={"organization_id": "org-1"}))
+                FakeRequest(body={"quote_id": quote_id},
+                            route_params={"organization_id": "org-1"}))
         finally:
-            p1.stop(); p2.stop(); auth1.stop(); auth2.stop(); checkout.stop()
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+            checkout.stop(); flag.stop()
 
     def _dashboard(self, stored_admin, caller):
         cfg = {

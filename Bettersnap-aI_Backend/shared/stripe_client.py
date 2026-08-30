@@ -152,6 +152,105 @@ def create_org_checkout(organization_id: str, admin_email: str, seats: int,
     }, admin_email))
 
 
+def expire_org_checkout_session(checkout_session_id: str) -> dict:
+    """Ask Stripe to EXPIRE an open Checkout Session, making its hosted page unpayable.
+
+    This is the operation that was missing: cancelling our own row released the
+    organization's live slot while the customer's original Stripe URL stayed payable, so
+    a "replaced" checkout could still be paid. Only Stripe can retire a Stripe page.
+
+    Returns the updated Session. Stripe refuses to expire a session that is already
+    complete, which is the behaviour we want — the caller must not release or replace a
+    session that may have been paid.
+    """
+    return _post(f"checkout/sessions/{checkout_session_id}/expire", {})
+
+
+def get_checkout_session(checkout_session_id: str) -> dict:
+    """Read a Checkout Session's authoritative state from Stripe."""
+    return _get(f"checkout/sessions/{checkout_session_id}")
+
+
+def create_org_seats_checkout(organization_id: str, admin_email: str, quote,
+                              success_url: str, cancel_url: str,
+                              quote_id: str = "", idempotency_key: str | None = None,
+                              expires_at: int | None = None) -> dict:
+    """Teams checkout for the GRADUATED contract — one Stripe line item per price band.
+
+    `quote` is a shared.teams_pricing.TeamsQuote. Its breakdown is rendered as separate
+    line items ("seats 1-9 @ $35", "seat 10 @ $32") rather than one blended unit price,
+    for two reasons:
+
+      • Stripe's `unit_amount` is integer cents, so a blended rate is often not
+        representable — 24 seats is $795/24 = $33.125 per seat. Rounding either way makes
+        Stripe's total disagree with the authorised total, and the webhook's amount check
+        would then reject a legitimate payment.
+      • The customer's Stripe receipt shows the same band breakdown the quote showed
+        them, so the discount is visible rather than implied.
+
+    The line items are DERIVED from the quote the server computed. No amount from the
+    client reaches this function. `_assert_total_matches` re-adds them as a last guard
+    before the network call, so a future edit to the breakdown logic cannot silently
+    charge a total different from the one recorded in the payment snapshot.
+
+    `payment_method_types` is deliberately NOT set: omitting it lets Stripe serve the
+    methods enabled on the account (cards, wallets, local methods), which is both wider
+    coverage and one less thing to keep in sync. Automatic tax is likewise not enabled —
+    turning it on changes what the customer is charged, so it is a pricing decision, not
+    an implementation detail.
+    """
+    computed = sum(b.subtotal_cents for b in quote.breakdown)
+    if computed != quote.total_cents:
+        raise ValueError(
+            f"teams checkout refused: line items total {computed} but the quote says "
+            f"{quote.total_cents}"
+        )
+
+    params = {
+        "mode": "payment",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata[organization_id]": organization_id,
+        "metadata[payment_type]": "org_seats",
+        # Stamped so fulfilment can refuse a session priced under a contract that has
+        # since been superseded, instead of granting credits at a stale rate.
+        "metadata[pricing_version]": quote.pricing_version,
+        "metadata[plan_id]": quote.plan_id,
+        "metadata[seats]": str(quote.seats),
+        "metadata[credits_per_seat]": str(quote.credits_per_seat),
+        "metadata[expected_total_cents]": str(quote.total_cents),
+        "metadata[quote_id]": quote_id,
+    }
+    # BOUNDED LIFETIME. Stripe accepts expires_at between 30 minutes and 24 hours from
+    # creation; anything outside that is rejected. A session that never expires is a
+    # payable page with no end date, which is exactly what made a "replaced" checkout
+    # dangerous. Stripe then emits checkout.session.expired, and THAT event — not a local
+    # timer — is what releases the organization's live slot.
+    if expires_at is not None:
+        params["expires_at"] = str(int(expires_at))
+    for i, band in enumerate(quote.breakdown):
+        label = (
+            f"{quote.plan_name} — seat {band.lower}"
+            if band.seats == 1 else
+            f"{quote.plan_name} — seats {band.lower}-{band.lower + band.seats - 1}"
+        )
+        params[f"line_items[{i}][price_data][currency]"] = quote.currency
+        params[f"line_items[{i}][price_data][product_data][name]"] = label
+        params[f"line_items[{i}][price_data][product_data][description]"] = (
+            f"{band.seats} seat(s) at ${band.unit_cents / 100:.2f} each · "
+            f"{quote.credits_per_seat} headshots per seat"
+        )
+        params[f"line_items[{i}][price_data][unit_amount]"] = str(band.unit_cents)
+        params[f"line_items[{i}][quantity]"] = str(band.seats)
+
+    # The idempotency key is DETERMINISTIC (organization + quote), not random. Replaying
+    # it — a double-click, a retry after an ambiguous timeout, or recovery of a stranded
+    # 'creating' attempt — makes Stripe return THE ORIGINAL session rather than creating a
+    # second payable one. Without it, a retry after a network timeout is a second charge
+    # opportunity even though the first session may already exist.
+    return _post("checkout/sessions", _maybe_email(params, admin_email), idempotency_key)
+
+
 def create_topup_checkout(user_id: str, email: str, pack: str, success_url: str, cancel_url: str) -> dict:
     """Credit top-up for an ACTIVE monthly subscriber — buy more images generated from the
     EXISTING model (no new training, no plan change). Reuses the one-time pack sizes + Stripe

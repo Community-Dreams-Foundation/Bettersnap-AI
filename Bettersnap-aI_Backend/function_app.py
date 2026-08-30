@@ -207,17 +207,129 @@ from shared import catalog
 from shared.stripe_client import (
     ONE_TIME_PLANS, MONTHLY_PLANS,
     create_onetime_checkout, create_monthly_checkout, create_org_checkout,
-    create_topup_checkout,
+    create_topup_checkout, create_org_seats_checkout, expire_org_checkout_session,
     cancel_subscription, find_checkout_session_by_token, get_subscription,
     reactivate_subscription, create_billing_portal, upgrade_subscription,
     monthly_plan_for_price_id, subscription_period_end, verify_webhook,
 )
 from shared.org_credits import effective_credits, get_active_membership
 from shared.invite_email import send_invite_email
+from shared import teams_pricing
+from shared import teams_checkout
 
 # ── Teams / Organizations (one-time-purchase model) ───────────────────────
+# LEGACY, still read by the pre-teams_basic_v1 path. The graduated contract supersedes
+# both of these: seat price now comes from shared.teams_pricing.quote() and credits per
+# seat from teams_pricing.CREDITS_PER_SEAT. They are NOT deleted yet because existing
+# organization rows carry a credits_per_seat SNAPSHOT taken from ORG_CREDITS_PER_SEAT at
+# creation time, and fulfilment still honours each org's own snapshot rather than
+# retroactively repricing anyone.
 ORG_CREDITS_PER_SEAT = int(os.environ.get("ORG_CREDITS_PER_SEAT", "10"))
 ORG_PRICE_PER_SEAT_CENTS = int(os.environ.get("ORG_PRICE_PER_SEAT_CENTS", "2000"))
+
+# ── Teams checkout kill switch (FAIL CLOSED) ──────────────────────────────
+# Only the exact string "1" enables Teams checkout. Anything else — unset, "", "0",
+# "true", "TRUE", a typo — leaves it DISABLED. Written this way round deliberately: a
+# misconfigured or missing setting must never be the thing that switches real payments
+# on. Read at call time, not import time, so the flag can be flipped without a restart.
+def _teams_checkout_enabled() -> bool:
+    return os.environ.get("TEAMS_CHECKOUT_ENABLED", "") == "1"
+
+
+# How long a returned quote is presented as valid. ADVISORY: it drives the UI's
+# "refresh your quote" prompt only. It is NOT a security control, because the server
+# never trusts a client-supplied amount — checkout RECOMPUTES the price from the seat
+# count and stores that recomputation as the authoritative snapshot.
+TEAMS_QUOTE_TTL_SECONDS = teams_checkout.QUOTE_TTL_SECONDS
+
+# Deployment cutoff for the legacy fulfilment path, as an ISO-8601 UTC instant. A Stripe
+# session created AFTER this moment MUST carry a snapshot — it was created by a server
+# that writes them. Left unset the cutoff is not applied, and the explicit allowlist is
+# the only evidence that admits a snapshot-less session.
+TEAMS_SNAPSHOT_CUTOFF_UTC = os.environ.get("TEAMS_SNAPSHOT_CUTOFF_UTC", "")
+
+
+def _teams_checkout_disabled_response() -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({
+            "error": "TEAMS_CHECKOUT_DISABLED",
+            "message": "Teams checkout is not currently available.",
+        }),
+        mimetype="application/json", status_code=503)
+
+
+def _teams_pricing_error_response(exc: "teams_pricing.TeamsPricingError") -> func.HttpResponse:
+    """Map a pricing rejection to its HTTP shape.
+
+    Contact Sales is a 200, not an error: 50+ seats is a legitimate, expected outcome
+    that the UI renders as a sales hand-off. Only a malformed or too-small seat count is
+    a client error.
+    """
+    if isinstance(exc, teams_pricing.ContactSalesRequired):
+        return func.HttpResponse(
+            json.dumps(teams_pricing.contact_sales_payload(exc.seats)),
+            mimetype="application/json", status_code=200)
+    body = {"error": exc.code, "message": str(exc)}
+    if isinstance(exc, teams_pricing.BelowMinimumSeats):
+        body["minimum_seats"] = exc.minimum
+    return func.HttpResponse(
+        json.dumps(body), mimetype="application/json", status_code=400)
+
+
+def _teams_checkout_error_response(exc: "teams_checkout.CheckoutError") -> func.HttpResponse:
+    """Every quote/lifecycle rejection answers with its own machine-readable code.
+
+    A missing or malformed quote is a 400 (the client sent something wrong); an expired,
+    reused or mismatched quote is a 409 (the request was well-formed but the world moved).
+    None of them reaches Stripe, and none of them changes organization state.
+    """
+    return func.HttpResponse(
+        json.dumps({"error": exc.code, "message": str(exc)}),
+        mimetype="application/json", status_code=exc.http_status)
+
+
+# Origins a Teams checkout may return the customer to. A Stripe success_url is a
+# server-controlled redirect target: accepting an arbitrary client-supplied URL turns
+# this endpoint into an open redirect, and one that a customer arrives at immediately
+# after paying — the highest-trust moment in the flow. The allowlist is exact-match on
+# scheme+host+port, never a prefix or substring test, so "https://bettersnap.ai.evil.com"
+# cannot pass by starting with an allowed origin.
+TEAMS_CHECKOUT_DEFAULT_ORIGIN = "https://bettersnap.ai"
+TEAMS_CHECKOUT_SUCCESS_PATH = "/team/checkout/success"
+TEAMS_CHECKOUT_CANCEL_PATH = "/team/checkout/cancel"
+
+
+def _teams_allowed_origins() -> set:
+    """Allowlisted return origins. Extra entries come from TEAMS_CHECKOUT_ALLOWED_ORIGINS
+    (comma-separated) so local development can add http://localhost:5173 without a code
+    change; the production origin is always present."""
+    configured = os.environ.get("TEAMS_CHECKOUT_ALLOWED_ORIGINS", "")
+    origins = {TEAMS_CHECKOUT_DEFAULT_ORIGIN}
+    origins.update(o.strip().rstrip("/") for o in configured.split(",") if o.strip())
+    return origins
+
+
+def _teams_checkout_urls(body: dict) -> tuple:
+    """Build the success/cancel URLs the SERVER will hand to Stripe.
+
+    The client may propose an origin; it may not propose a URL. The PATHS are fixed
+    constants here, so even an allowlisted origin cannot steer the customer to an
+    arbitrary page, and no query string, fragment or credentials from the caller survive.
+    Anything unrecognised falls back to the production origin.
+    """
+    proposed = str(body.get("origin") or "").strip().rstrip("/")
+    origin = proposed if proposed in _teams_allowed_origins() else TEAMS_CHECKOUT_DEFAULT_ORIGIN
+    if proposed and origin != proposed:
+        logging.warning(
+            f"Teams checkout: rejected non-allowlisted return origin {proposed!r}; "
+            f"using {origin}."
+        )
+    # Stripe substitutes the real id for this placeholder on redirect, which is what lets
+    # the success page ask the SERVER whether the session actually paid.
+    return (
+        f"{origin}{TEAMS_CHECKOUT_SUCCESS_PATH}?session_id={{CHECKOUT_SESSION_ID}}",
+        f"{origin}{TEAMS_CHECKOUT_CANCEL_PATH}",
+    )
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -477,9 +589,433 @@ def create_organization(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json", status_code=201)
 
 
-# ── Organizations: Create Stripe payment (one-time, N seats) ────────────
+# ── Organizations: Create Stripe payment (one-time, N seats) ────
 @app.route(route="orgs/{organization_id}/payment-intent", methods=["POST"])
 def create_org_payment_intent(req: func.HttpRequest) -> func.HttpResponse:
+    """Open (or re-open) the single Stripe Checkout for this workspace.
+
+    AT MOST ONE PAYABLE SESSION PER ORGANIZATION. A double-click, a client retry after a
+    timeout, or two browser tabs must never produce two payable Stripe pages — rejecting
+    the second webhook would prevent duplicate CREDITS but not a duplicate CHARGE. The
+    organization-scoped applock serialises requests, dbo.organization_live_checkout holds
+    the invariant as a primary key, and the deterministic idempotency key means even a
+    replayed Stripe call returns the ORIGINAL session.
+
+    ORDER OF OPERATIONS. The attempt row is written and COMMITTED as 'creating' BEFORE
+    Stripe is called, so a Stripe Session can never exist without a durable server record.
+    It is promoted to 'pending' once the session id is known. A crash in between leaves a
+    recoverable 'creating' row, not an orphaned payable page.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    if not _teams_checkout_enabled():
+        return _teams_checkout_disabled_response()
+
+    organization_id = req.route_params.get("organization_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    success_url, cancel_url = _teams_checkout_urls(body)
+    email = (payload.get("email") or payload.get("preferred_username")
+             or payload.get("upn") or "")
+
+    # FAIL CLOSED on a missing or malformed quote id, before any DB write and before
+    # Stripe. There is no such thing as a partially valid quote.
+    try:
+        quote_id = teams_checkout.parse_quote_id(body.get("quote_id"))
+    except teams_checkout.CheckoutError as exc:
+        return _teams_checkout_error_response(exc)
+
+    conn = new_connection()
+    reuse = None
+    attempt_id = None
+    idem_key = None
+    snapshot = None
+    # Requested once, so the value stored locally and the value sent to Stripe are the
+    # same instant rather than two clock reads.
+    stripe_expires_at = teams_checkout.checkout_session_expires_at()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        # Serialise this ORGANIZATION's checkout requests. Scoped per org, so unrelated
+        # workspaces never wait on each other.
+        if not teams_checkout.acquire_org_checkout_lock(cur, organization_id):
+            conn.rollback()
+            conn.close()
+            return _teams_checkout_error_response(
+                teams_checkout.CheckoutLockUnavailable(
+                    "Another checkout is already being prepared for this workspace."))
+
+        cur.execute(
+            "SELECT admin_user_id, seats_purchased, status FROM organizations "
+            "WITH (UPDLOCK, HOLDLOCK) WHERE organization_id = ?",
+            organization_id,
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            conn.close()
+            return func.HttpResponse("Organization not found", status_code=404)
+        admin_user_id, _seats_purchased, status = row
+        if not provisioning_retry.same_user_id(admin_user_id, user_id):
+            conn.rollback()
+            conn.close()
+            return func.HttpResponse("Forbidden", status_code=403)
+        if status != "pending_payment":
+            conn.rollback()
+            conn.close()
+            return func.HttpResponse(
+                json.dumps({"error": f"Organization is '{status}', not payable"}),
+                mimetype="application/json", status_code=409)
+
+        live = teams_checkout.find_live_attempt(cur, organization_id)
+
+        # DIFFERENT QUOTE, LIVE ATTEMPT: refuse. Do NOT settle it here.
+        #
+        # Cancelling our own row would release the organization while the customer's
+        # ORIGINAL Stripe page stayed payable — only Stripe can retire a Stripe page, and
+        # that is a network call which can fail or race an in-flight payment. Silently
+        # "replacing" a checkout is therefore a way to end up with two payable URLs and
+        # one live slot. Changing seats mid-checkout goes through the explicit
+        # cancel endpoint, which expires the session AT STRIPE first.
+        if live and str(live["quote_id"]).lower() != quote_id.lower():
+            conn.rollback()
+            conn.close()
+            return func.HttpResponse(
+                json.dumps({
+                    "error": teams_checkout.CheckoutAlreadyOpen.code,
+                    "message": "A checkout is already open for this team. Finish or "
+                               "cancel it before changing the number of seats.",
+                    # SAFE FIELDS ONLY. Enough for the UI to offer "resume" or "cancel",
+                    # and nothing that identifies another person or exposes a payable URL
+                    # this caller did not create.
+                    "seats": live["seats"],
+                    "total_cents": live["expected_total_cents"],
+                    "status": live["status"],
+                }),
+                mimetype="application/json", status_code=409)
+
+        # REUSE: the same quote is already backed by a live attempt. Hand back the page
+        # that already exists rather than opening a second payable one.
+        if live and str(live["quote_id"]).lower() == quote_id.lower():
+            if live["status"] == "pending" and live["checkout_url"]:
+                conn.commit()
+                conn.close()
+                return func.HttpResponse(
+                    json.dumps({
+                        "checkout_url": live["checkout_url"],
+                        "session_id": live["checkout_session_id"],
+                        "seats": live["seats"],
+                        "total_cents": live["expected_total_cents"],
+                        "credits_per_seat": live["credits_per_seat"],
+                        "pricing_version": live["pricing_version"],
+                        "reused": True,
+                    }),
+                    mimetype="application/json", status_code=200)
+            # 'creating': Stripe may or may not already hold a session for this attempt.
+            # Replaying the SAME idempotency key below is what makes this safe.
+            reuse = live
+            attempt_id = live["attempt_id"]
+            idem_key = live["idempotency_key"]
+
+        quote_row = teams_checkout.load_quote_for_update(cur, quote_id)
+        try:
+            if reuse is not None:
+                # RECOVERY of this very attempt. Deliberately does NOT apply expiry or
+                # current-pricing-version checks: the amount was authorised when the
+                # attempt was reserved, and replaying the deterministic key returns the
+                # ORIGINAL session at the ORIGINAL price. Enforcing the new-purchase
+                # rules here would strand the workspace's single live slot the moment
+                # the quote aged out or the price list changed.
+                teams_checkout.validate_quote_for_recovery(
+                    quote_row, user_id, organization_id, reuse,
+                    supported_versions=teams_pricing.SUPPORTED_PRICING_VERSIONS)
+            else:
+                # A GENUINELY NEW purchase. Strictest path: unspent, unexpired, and the
+                # CURRENT contract specifically — being merely "supported" is not enough
+                # to sell under. An expired or superseded quote can never buy anything.
+                teams_checkout.validate_quote_for_new_checkout(
+                    quote_row, user_id, organization_id,
+                    teams_pricing.CURRENT_PRICING_VERSION)
+        except teams_checkout.CheckoutError as exc:
+            conn.rollback()
+            conn.close()
+            return _teams_checkout_error_response(exc)
+
+        # Display-consistency check only. The PERSISTED quote is what is charged; this
+        # can make the purchase fail, never set a price.
+        shown = body.get("quoted_total_cents")
+        if shown is not None:
+            try:
+                agrees = int(shown) == quote_row["total_cents"]
+            except (TypeError, ValueError):
+                agrees = False
+            if not agrees:
+                conn.rollback()
+                conn.close()
+                return func.HttpResponse(
+                    json.dumps({
+                        "error": "QUOTE_STALE",
+                        "message": "Pricing changed since you were quoted. Please review "
+                                   "the updated total.",
+                        "total_cents": quote_row["total_cents"],
+                        "seats": quote_row["seats"],
+                        "pricing_version": quote_row["pricing_version"],
+                    }),
+                    mimetype="application/json", status_code=409)
+
+        if reuse is None:
+            # No live attempt exists (a different-quote one was refused above), so this
+            # is a clean first reservation.
+            attempt_id = teams_checkout.reserve_attempt(
+                cur, organization_id, quote_row, user_id, quote_id,
+                expires_at=stripe_expires_at)
+            if not teams_checkout.consume_quote(cur, quote_id, attempt_id):
+                conn.rollback()
+                conn.close()
+                return _teams_checkout_error_response(
+                    teams_checkout.QuoteAlreadyUsed("That quote has already been used."))
+            idem_key = teams_checkout.idempotency_key(organization_id, quote_id)
+
+        # The IMMUTABLE authorised terms. On recovery these come from the attempt row
+        # written when the money was first authorised — including its band breakdown —
+        # so the replayed Stripe request is byte-for-byte the original order rather than
+        # today's price for the same seat count.
+        if reuse is not None:
+            try:
+                stored_breakdown = json.loads(reuse.get("breakdown_json") or "[]")
+            except (TypeError, ValueError):
+                stored_breakdown = []
+            snapshot = {
+                "seats": reuse["seats"],
+                "credits_per_seat": reuse["credits_per_seat"],
+                "total_cents": reuse["expected_total_cents"],
+                "currency": reuse["currency"],
+                "pricing_version": reuse["pricing_version"],
+                "plan_id": reuse["plan_id"],
+                "breakdown": stored_breakdown,
+                "recovered": True,
+            }
+        else:
+            snapshot = {
+                "seats": quote_row["seats"],
+                "credits_per_seat": quote_row["credits_per_seat"],
+                "total_cents": quote_row["total_cents"],
+                "currency": quote_row["currency"],
+                "pricing_version": quote_row["pricing_version"],
+                "plan_id": quote_row["plan_id"],
+                "breakdown": None,
+                "recovered": False,
+            }
+        # DURABLE BEFORE STRIPE. Everything above commits now; only then is a payable
+        # session allowed to come into existence.
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        logging.error(f"Teams checkout reservation failed for org={organization_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "CHECKOUT_NOT_RECORDED",
+                        "message": "Could not start checkout. Please try again."}),
+            mimetype="application/json", status_code=500)
+
+    # ── Outside the transaction: create (or replay) the Stripe session ──────
+    try:
+        if snapshot["recovered"]:
+            # REBUILD, never reprice. Calling teams_pricing.quote() here would charge
+            # today's rate for an order authorised earlier — and the webhook, which
+            # validates against the stored snapshot, would then reject the payment we
+            # ourselves caused.
+            quote = teams_pricing.quote_from_snapshot(
+                seats=snapshot["seats"],
+                credits_per_seat=snapshot["credits_per_seat"],
+                total_cents=snapshot["total_cents"],
+                breakdown=snapshot["breakdown"],
+                pricing_version=snapshot["pricing_version"],
+                plan_id=snapshot["plan_id"],
+                currency=snapshot["currency"],
+            )
+        else:
+            quote = teams_pricing.quote(snapshot["seats"])
+        session = create_org_seats_checkout(
+            organization_id, email, quote, success_url, cancel_url,
+            quote_id=quote_id, idempotency_key=idem_key,
+            expires_at=int(stripe_expires_at.timestamp()),
+        )
+    except Exception as e:
+        # The attempt stays 'creating' and the organization stays claimed. A retry with
+        # the same quote replays the same idempotency key, so this cannot become a second
+        # charge opportunity; reconciliation settles it later.
+        logging.error(
+            f"Stripe org checkout failed for org={organization_id} "
+            f"attempt={attempt_id}: {e}"
+        )
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return func.HttpResponse(
+            json.dumps({"error": "Payment provider error"}),
+            mimetype="application/json", status_code=502)
+
+    session_id = session.get("id") or ""
+    checkout_url = session.get("url") or ""
+    try:
+        cur = conn.cursor()
+        teams_checkout.promote_attempt(cur, attempt_id, session_id, checkout_url)
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # The session EXISTS at Stripe but we failed to record it. Do NOT hand the
+        # customer a page we cannot later validate: fulfilment would find the attempt
+        # still 'creating' and fail closed. The row is the reconciliation handle.
+        logging.error(
+            f"Teams checkout promote failed for org={organization_id} "
+            f"attempt={attempt_id} session={session_id}: {e}. MANUAL RECONCILIATION."
+        )
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return func.HttpResponse(
+            json.dumps({"error": "CHECKOUT_NOT_RECORDED",
+                        "message": "Could not start checkout. Please try again."}),
+            mimetype="application/json", status_code=500)
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+    return func.HttpResponse(
+        json.dumps({
+            "checkout_url": checkout_url,
+            "session_id": session_id,
+            "seats": snapshot["seats"],
+            "total_cents": snapshot["total_cents"],
+            "credits_per_seat": snapshot["credits_per_seat"],
+            "pricing_version": snapshot["pricing_version"],
+        }),
+        mimetype="application/json", status_code=200)
+
+
+# ── Teams: authoritative pricing quote ────────────────────────────────────
+@app.route(route="teams/pricing-quote", methods=["POST"])
+def teams_pricing_quote(req: func.HttpRequest) -> func.HttpResponse:
+    """Price a prospective Teams order. Body: {"seats": 25}
+
+    AUTHENTICATED, and deliberately NOT org-scoped: an admin needs a price before the
+    organization exists, so this prices a hypothetical order for any signed-in user. It
+    reads nothing and writes nothing, so there is no object to authorise against beyond
+    a valid token.
+
+    The returned quote_id and expires_at are for traceability and the UI's refresh
+    prompt. They are NOT a bearer of price: /payment-intent recomputes the total from
+    the seat count it is given and ignores every amount the client sends, so a forged or
+    stale quote cannot move money. See `_teams_checkout_snapshot`.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        token_payload = validate_token(token)
+        user_id = token_payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    if not _teams_checkout_enabled():
+        return _teams_checkout_disabled_response()
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    if "seats" not in body:
+        return func.HttpResponse(
+            json.dumps({"error": "INVALID_SEAT_COUNT", "message": "seats is required."}),
+            mimetype="application/json", status_code=400)
+
+    try:
+        quote = teams_pricing.quote(body.get("seats"))
+    except teams_pricing.TeamsPricingError as exc:
+        return _teams_pricing_error_response(exc)
+
+    # PERSIST IT. A quote id that exists only in the client is not a quote — nothing can
+    # be looked up, so ownership, expiry and single-use are unenforceable. Checkout loads
+    # this row under a lock and charges from IT, never from anything the client echoes.
+    # Contact Sales returns above, before this point: there is nothing to persist.
+    organization_id = body.get("organization_id")
+    try:
+        organization_id = str(UUID(str(organization_id))) if organization_id else None
+    except (ValueError, AttributeError, TypeError):
+        organization_id = None  # unusable scope hint; the quote stays org-agnostic
+
+    conn = new_connection()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        quote_id, expires_at = teams_checkout.issue_quote(
+            cur, user_id, organization_id, quote,
+            ttl_seconds=TEAMS_QUOTE_TTL_SECONDS)
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.error(f"Teams quote could not be issued for user={user_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "QUOTE_NOT_ISSUED",
+                        "message": "Couldn't price your team. Please try again."}),
+            mimetype="application/json", status_code=500)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    payload = quote.to_dict()
+    payload["quote_id"] = quote_id
+    payload["expires_at"] = expires_at.isoformat()
+    payload["minimum_seats"] = teams_pricing.MIN_SEATS
+    payload["contact_sales_threshold"] = teams_pricing.CONTACT_SALES_MIN
+    return func.HttpResponse(
+        json.dumps(payload), mimetype="application/json", status_code=200)
+
+
+# ── Teams: cancel the open checkout (authoritative, Stripe first) ─────────
+@app.route(route="orgs/{organization_id}/checkout/cancel", methods=["POST"])
+def cancel_org_checkout(req: func.HttpRequest) -> func.HttpResponse:
+    """Retire this workspace's open Checkout Session so a new one can be started.
+
+    STRIPE IS ASKED FIRST, AND ITS ANSWER DECIDES. Marking our row cancelled without
+    expiring the session at Stripe would release the workspace while the customer's
+    original URL stayed payable — a second payable page for the same organization. So:
+
+      1. lock and load the live attempt; require 'pending';
+      2. ask Stripe to EXPIRE the session;
+      3. only once Stripe confirms, mark the attempt expired and release the slot.
+
+    If Stripe reports the session complete/paid, nothing is released — the payment
+    webhook owns that outcome. If the call fails or the answer is ambiguous, the slot is
+    RETAINED and the request fails closed. Navigating to the cancel page proves nothing
+    and never reaches this endpoint's effects.
+    """
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
     try:
         payload = validate_token(token)
@@ -488,48 +1024,185 @@ def create_org_payment_intent(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     organization_id = req.route_params.get("organization_id")
+    conn = new_connection()
     try:
-        body = req.get_json()
-    except ValueError:
-        body = {}
-    success_url = body.get("success_url", "https://bettersnap.ai/orgs/success")
-    cancel_url = body.get("cancel_url", "https://bettersnap.ai/orgs/cancel")
-    email = (payload.get("email") or payload.get("preferred_username")
-             or payload.get("upn") or "")
+        conn.autocommit = False
+        cur = conn.cursor()
+        if not teams_checkout.acquire_org_checkout_lock(cur, organization_id):
+            conn.rollback()
+            return _teams_checkout_error_response(
+                teams_checkout.CheckoutLockUnavailable(
+                    "This workspace's checkout is busy. Try again in a moment."))
+
+        cur.execute(
+            "SELECT admin_user_id FROM organizations WITH (UPDLOCK, HOLDLOCK) "
+            "WHERE organization_id = ?", organization_id)
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return func.HttpResponse("Organization not found", status_code=404)
+        if not provisioning_retry.same_user_id(row[0], user_id):
+            conn.rollback()
+            return func.HttpResponse("Forbidden", status_code=403)
+
+        live = teams_checkout.find_live_attempt(cur, organization_id)
+        if live is None:
+            conn.rollback()
+            return func.HttpResponse(
+                json.dumps({"error": "NO_OPEN_CHECKOUT",
+                            "message": "There is no open checkout for this team."}),
+                mimetype="application/json", status_code=404)
+        if live["status"] != "pending" or not live["checkout_session_id"]:
+            # 'creating' has no confirmed Stripe session to expire. Deleting it locally
+            # could strand a session Stripe DID create, so recovery goes through a retry
+            # with the same quote (deterministic idempotency key), not through here.
+            conn.rollback()
+            return _teams_checkout_error_response(
+                teams_checkout.CheckoutNotCancellable(
+                    "This checkout is still being prepared. Please try again shortly."))
+
+        session_id = live["checkout_session_id"]
+        attempt_id = live["attempt_id"]
+        # Release the transaction before the network call; the state change is re-guarded
+        # under a fresh lock afterwards.
+        conn.rollback()
+
+        try:
+            expired = expire_org_checkout_session(session_id)
+        except Exception as e:
+            logging.error(
+                f"Teams checkout expire failed at Stripe for org={organization_id} "
+                f"session={session_id}: {e}. Slot RETAINED."
+            )
+            return func.HttpResponse(
+                json.dumps({"error": "CHECKOUT_NOT_CANCELLED",
+                            "message": "Couldn't cancel the checkout. Please try again."}),
+                mimetype="application/json", status_code=502)
+
+        # Stripe's own verdict. Only 'expired' authorises releasing the workspace.
+        stripe_status = str(expired.get("status") or "")
+        if stripe_status != "expired":
+            logging.error(
+                f"Teams checkout expire returned status={stripe_status!r} for "
+                f"session={session_id}; slot RETAINED pending webhook reconciliation."
+            )
+            return _teams_checkout_error_response(
+                teams_checkout.CheckoutNotCancellable(
+                    "That checkout can no longer be cancelled. If you completed payment, "
+                    "your workspace will unlock shortly."))
+
+        cur = conn.cursor()
+        conn.autocommit = False
+        if not teams_checkout.acquire_org_checkout_lock(cur, organization_id):
+            conn.rollback()
+            # Stripe already expired it; the webhook will settle our row.
+            return func.HttpResponse(
+                json.dumps({"status": "expired_at_stripe", "reconciling": True}),
+                mimetype="application/json", status_code=202)
+        if not teams_checkout.expire_attempt(cur, attempt_id):
+            conn.rollback()
+            # Something else moved the row — most likely a payment that won the race.
+            logging.info(
+                f"Teams checkout {session_id} expired at Stripe but the local attempt "
+                f"was no longer pending; leaving it to the webhook."
+            )
+            return func.HttpResponse(
+                json.dumps({"status": "expired_at_stripe", "reconciling": True}),
+                mimetype="application/json", status_code=202)
+        conn.commit()
+        return func.HttpResponse(
+            json.dumps({"status": "cancelled"}),
+            mimetype="application/json", status_code=200)
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.error(f"Teams checkout cancel failed for org={organization_id}: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "CHECKOUT_NOT_CANCELLED",
+                        "message": "Couldn't cancel the checkout. Please try again."}),
+            mimetype="application/json", status_code=500)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Teams: authoritative checkout status ──────────────────────────────────
+@app.route(route="teams/checkout-status", methods=["GET"])
+def teams_checkout_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Has this Teams checkout actually been paid? Query: ?session_id=cs_...
+
+    THE ONLY source of truth the success page may believe. Landing on the success URL
+    proves only that Stripe redirected the browser — the customer can navigate there
+    directly, and even a genuine redirect can beat the webhook that grants entitlement.
+    So the success page polls THIS, which reads the server's own record, and reports
+    'paid' only once fulfilment has actually committed.
+
+    Authorisation: the caller must be the admin of the organization the session was
+    created for. 404 rather than 403 for someone else's session, so this cannot be used
+    to probe which session ids exist.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = validate_token(token)
+        user_id = payload["oid"]
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    session_id = (req.params.get("session_id") or "").strip()
+    if not session_id:
+        return func.HttpResponse(
+            json.dumps({"error": "MISSING_SESSION_ID",
+                        "message": "session_id is required."}),
+            mimetype="application/json", status_code=400)
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT admin_user_id, seats_purchased, status FROM organizations WHERE organization_id = ?",
-        organization_id,
+        """SELECT cs.organization_id, cs.status, cs.seats, cs.credits_per_seat,
+                  cs.expected_total_cents, cs.currency, cs.pricing_version,
+                  o.status, o.admin_user_id
+           FROM organization_checkout_sessions cs
+           JOIN organizations o ON o.organization_id = cs.organization_id
+           WHERE cs.checkout_session_id = ?""",
+        session_id,
     )
+    # 'creating' is reported as pending: the customer has nothing to act on either way,
+    # and it must never read as a terminal failure while reconciliation may still settle it.
     row = cur.fetchone()
     if not row:
-        return func.HttpResponse("Organization not found", status_code=404)
-    admin_user_id, seats_purchased, status = row
-    if str(admin_user_id).lower() != str(user_id).lower():
-        return func.HttpResponse("Forbidden", status_code=403)
-    # Payable exactly once, while locked. Already-active means it was paid
-    # already (or, before this fix, was active from the moment of creation and
-    # this check never actually did anything) — either way, re-paying isn't valid.
-    if status != "pending_payment":
-        return func.HttpResponse(
-            json.dumps({"error": f"Organization is '{status}', not payable"}),
-            mimetype="application/json", status_code=409)
+        return func.HttpResponse("Checkout session not found", status_code=404)
 
-    try:
-        session = create_org_checkout(
-            organization_id, email, seats_purchased,
-            ORG_PRICE_PER_SEAT_CENTS, success_url, cancel_url,
-        )
-    except Exception as e:
-        logging.error(f"Stripe org checkout failed for org={organization_id}: {e}")
-        return func.HttpResponse(
-            json.dumps({"error": "Payment provider error"}),
-            mimetype="application/json", status_code=502)
+    (org_id, session_status, seats, credits_per_seat, total_cents,
+     currency, pricing_version, org_status, admin_user_id) = row
+    if str(admin_user_id).lower() != str(user_id).lower():
+        return func.HttpResponse("Checkout session not found", status_code=404)
+
+    # 'paid' is reported ONLY when the organization is genuinely usable. If the snapshot
+    # says paid but the org somehow is not active, that is a reconciliation problem, and
+    # telling the admin "you're all set" would be a lie.
+    if session_status == "paid" and org_status == "active":
+        state = "paid"
+    elif session_status in ("failed", "expired", "cancelled"):
+        state = session_status
+    else:
+        state = "pending"
 
     return func.HttpResponse(
-        json.dumps({"checkout_url": session["url"], "session_id": session["id"]}),
+        json.dumps({
+            "state": state,
+            "session_status": session_status,
+            "organization_id": str(org_id),
+            "organization_status": org_status,
+            "seats": seats,
+            "credits_per_seat": credits_per_seat,
+            "total_cents": total_cents,
+            "currency": currency,
+            "pricing_version": pricing_version,
+        }),
         mimetype="application/json", status_code=200)
 
 
@@ -5045,13 +5718,18 @@ def stripe_webhook(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         elif event_type == "checkout.session.expired":
-            # Release a monthly-checkout reservation whose Stripe session expired unpaid.
             session = event["data"]["object"]
             metadata = session.get("metadata", {})
-            user_id = metadata.get("user_id")
-            checkout_token = metadata.get("checkout_token")
-            if user_id and checkout_token:
-                _release_monthly_checkout(user_id, checkout_token)
+            if metadata.get("payment_type") == "org_seats":
+                # Teams: Stripe's expiry is the ONLY thing that releases the workspace's
+                # single live checkout slot.
+                _handle_org_checkout_expired(session, event_id)
+            else:
+                # Release a monthly-checkout reservation whose Stripe session expired unpaid.
+                user_id = metadata.get("user_id")
+                checkout_token = metadata.get("checkout_token")
+                if user_id and checkout_token:
+                    _release_monthly_checkout(user_id, checkout_token)
 
         # invoice.paid is the single source of truth for renewal grants. Stripe may ALSO emit
         # invoice.payment_succeeded for the same invoice with a DIFFERENT event id — handling
@@ -5182,11 +5860,183 @@ def _handle_onetime_payment(session: dict, event_id: str):
         conn.close()
 
 
+def _load_checkout_snapshot(cur, checkout_session_id: str):
+    """The immutable record of what the SERVER authorised for this Stripe session.
+
+    Returns None when there is no snapshot, which means one of two things: the session
+    predates migration 035, or it was never created by this server. The caller
+    distinguishes them — a legacy org fulfils on the old path, an unknown session for a
+    post-035 org does not fulfil at all.
+    """
+    if not checkout_session_id:
+        return None
+    cur.execute(
+        """SELECT organization_id, pricing_version, plan_id, seats, credits_per_seat,
+                  expected_total_cents, currency, status, attempt_id, breakdown_json
+           FROM organization_checkout_sessions WITH (UPDLOCK, HOLDLOCK)
+           WHERE checkout_session_id = ?""",
+        checkout_session_id,
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    # The band breakdown is part of what was authorised, so the version's validator can
+    # prove the bands are contiguous, complete and correctly priced rather than trusting
+    # a bare total.
+    try:
+        breakdown = json.loads(row[9]) if row[9] else []
+    except (TypeError, ValueError):
+        breakdown = None  # malformed; the validator reports it
+    return {
+        "organization_id": row[0], "pricing_version": row[1], "plan_id": row[2],
+        "seats": row[3], "credits_per_seat": row[4],
+        "expected_total_cents": row[5], "currency": row[6], "status": row[7],
+        "attempt_id": row[8], "breakdown": breakdown,
+    }
+
+
+def _claim_legacy_session(cur, checkout_session_id: str, organization_id, session: dict):
+    """May a SNAPSHOT-LESS session be fulfilled? Returns (allowed, reason).
+
+    FAILS CLOSED BY DEFAULT. "No snapshot" previously meant "fulfil unconditionally",
+    which would accept any signed org session — including one created outside this server,
+    or one whose snapshot write failed. A Stripe signature proves Stripe sent the event;
+    it does not prove this server ever authorised the charge, and metadata is attacker-
+    controllable at creation time, so neither is evidence of provenance.
+
+    The only admissible evidence is an EXPLICIT allowlist row, imported from a read-only
+    Stripe + SQL inventory taken before rollout (see migration 035's notes), optionally
+    reinforced by a deployment cutoff compared against Stripe's OWN `created` timestamp on
+    the signed event — not against anything in metadata.
+
+    The allowlist row is claimed here, so a replay finds it already consumed.
+    """
+    cur.execute(
+        """SELECT organization_id, stripe_created_at, expected_total_cents, status
+           FROM organization_legacy_checkout_allowlist WITH (UPDLOCK, HOLDLOCK)
+           WHERE checkout_session_id = ?""",
+        checkout_session_id,
+    )
+    row = cur.fetchone()
+    if not row:
+        return False, "not recorded in the legacy allowlist"
+    allow_org, stripe_created_at, expected_cents, status = row
+    if status != "open":
+        return False, f"legacy allowlist entry is '{status}', not open"
+    if not provisioning_retry.same_user_id(allow_org, organization_id):
+        return False, "legacy allowlist entry names a different organization"
+
+    # Independent corroboration: Stripe's own creation timestamp on the signed event.
+    created = session.get("created")
+    if TEAMS_SNAPSHOT_CUTOFF_UTC and created is not None:
+        try:
+            cutoff = datetime.fromisoformat(TEAMS_SNAPSHOT_CUTOFF_UTC)
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+            created_at = datetime.fromtimestamp(int(created), tz=timezone.utc)
+        except (TypeError, ValueError):
+            return False, "could not evaluate the legacy cutoff"
+        if created_at >= cutoff:
+            return False, (
+                f"session was created at {created_at.isoformat()}, at or after the "
+                f"snapshot cutoff {cutoff.isoformat()}; a snapshot is required"
+            )
+
+    if expected_cents is not None and session.get("amount_total") != expected_cents:
+        return False, "amount does not match the recorded legacy inventory"
+
+    cur.execute(
+        """UPDATE organization_legacy_checkout_allowlist
+           SET status = 'consumed', consumed_at = SYSUTCDATETIME()
+           WHERE checkout_session_id = ? AND status = 'open'""",
+        checkout_session_id,
+    )
+    if cur.rowcount != 1:
+        return False, "legacy allowlist entry was claimed concurrently"
+    return True, "recorded legacy session"
+
+
+def _org_payment_mismatches(snapshot: dict, session: dict) -> list:
+    """Every way the money that ARRIVED disagrees with what was authorised.
+
+    Returns a list of human-readable differences; empty means the payment matches.
+
+    VALIDATED UNDER THE SNAPSHOT'S OWN CONTRACT, NOT TODAY'S. This function used to
+    require snapshot["pricing_version"] == the CURRENT version, which was a live money
+    bug: the moment a v2 shipped, a customer legitimately quoted, charged and paid under
+    v1 would have their payment refused — money taken, workspace never activated, credits
+    never granted. Fulfilment is a promise about an order that already happened, so it is
+    judged by the rules in force when that order was authorised.
+
+    The version is resolved through an explicit registry. An unknown or retired version
+    has no validator and fails closed: an arbitrary stored version string is never
+    accepted, and nothing is ever "recomputed at today's prices" to fill the gap.
+    """
+    version = snapshot.get("pricing_version")
+    validator = teams_pricing.snapshot_validator(version)
+    if validator is None:
+        return [
+            f"pricing_version {version!r} is not in the supported set "
+            f"{sorted(teams_pricing.SUPPORTED_PRICING_VERSIONS)}; refusing to fulfil"
+        ]
+    return validator(snapshot, session)
+
+
+def _handle_org_checkout_expired(session: dict, event_id: str):
+    """Stripe says a Teams Checkout Session has expired. Release the workspace.
+
+    THIS is what frees an abandoned checkout — not a local timer. A timer comparing our
+    stored expires_at to the clock could release the slot while Stripe still considers
+    the session open and payable, which is the same two-payable-pages bug from the other
+    direction. Only Stripe's own expiry event is proof.
+
+    Grants nothing and activates nothing. Guarded on 'pending', so an expiry racing a
+    payment loses to the payment, and a duplicate expiry event is a no-op.
+    """
+    checkout_session_id = session.get("id") or ""
+    if not checkout_session_id:
+        return
+
+    conn = new_connection()
+    try:
+        cur = conn.cursor()
+        attempt = teams_checkout.find_attempt_by_session(cur, checkout_session_id)
+        if attempt is None:
+            conn.rollback()
+            return  # not a Teams attempt this server created
+        if attempt["status"] != "pending":
+            # Already paid, already expired, or never promoted. Nothing to do — and
+            # emphatically nothing to release if it was paid.
+            conn.rollback()
+            logging.info(
+                f"Teams checkout {checkout_session_id} expiry ignored; attempt is "
+                f"'{attempt['status']}'."
+            )
+            return
+        if not teams_checkout.expire_attempt(cur, attempt["attempt_id"]):
+            conn.rollback()
+            logging.info(
+                f"Teams checkout {checkout_session_id} expiry lost a race; left as is."
+            )
+            return
+        conn.commit()
+        logging.info(
+            f"Teams checkout expired: session={checkout_session_id} "
+            f"org={attempt['organization_id']}; workspace released."
+        )
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Teams checkout expiry failed for {checkout_session_id}: {e}")
+    finally:
+        conn.close()
+
+
 def _handle_org_payment(session: dict, event_id: str):
     organization_id = session.get("metadata", {}).get("organization_id")
     amount_total = session.get("amount_total")
     currency = session.get("currency", "usd")
     payment_intent_id = session.get("payment_intent", "")
+    checkout_session_id = session.get("id") or ""
 
     if not organization_id or amount_total is None:
         logging.error(f"org_seats payment missing metadata: {session}")
@@ -5199,6 +6049,81 @@ def _handle_org_payment(session: dict, event_id: str):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping org payment.")
             return
+
+        # ── Validate against what the server authorised ──────────────────────
+        # The snapshot is locked for the life of this transaction, so two concurrent
+        # deliveries of the same session cannot both pass this gate.
+        snapshot = _load_checkout_snapshot(cur, checkout_session_id)
+        snapshot_seats = None
+        snapshot_credits = None
+        if snapshot is not None:
+            # STRICT STATE GATE. Fulfilment may proceed from 'pending' and nothing else.
+            #
+            # 'paid' is an idempotent no-op. Every other state means the money arrived
+            # against an attempt this server does not consider payable — a session we
+            # cancelled or expired locally, one that failed, one still 'creating' (never
+            # safely promoted, so never legitimately presented), or a state we do not
+            # recognise. All of those grant nothing and are surfaced for reconciliation:
+            # an unfulfilled real payment is recoverable by hand, credits granted against
+            # an attempt we retired are not.
+            state = snapshot["status"]
+            if state == "paid":
+                conn.rollback()
+                logging.info(
+                    f"Teams checkout {checkout_session_id} already fulfilled; skipping."
+                )
+                return
+            if state != "pending":
+                conn.rollback()
+                logging.error(
+                    f"PAYMENT NOT APPLIED (org_seats): session={checkout_session_id} "
+                    f"org={organization_id} amount={amount_total} arrived against an "
+                    f"attempt in state '{state}', which is not payable. No credits "
+                    f"granted, organization not activated. "
+                    f"MANUAL RECONCILIATION REQUIRED (likely refund)."
+                )
+                return
+            if str(snapshot["organization_id"]).lower() != str(organization_id).lower():
+                conn.rollback()
+                logging.error(
+                    f"PAYMENT NOT APPLIED (org_seats): session={checkout_session_id} was "
+                    f"authorised for org={snapshot['organization_id']} but the event names "
+                    f"org={organization_id}. MANUAL RECONCILIATION REQUIRED."
+                )
+                return
+            problems = _org_payment_mismatches(snapshot, session)
+            if problems:
+                # FAIL CLOSED. Money may have moved, but we will not grant entitlement we
+                # cannot justify. A human reconciles (refund, or correct and replay).
+                conn.rollback()
+                logging.error(
+                    f"PAYMENT NOT APPLIED (org_seats): session={checkout_session_id} "
+                    f"org={organization_id} failed authorisation checks: "
+                    f"{'; '.join(problems)}. MANUAL RECONCILIATION REQUIRED."
+                )
+                return
+            snapshot_seats = snapshot["seats"]
+            snapshot_credits = snapshot["credits_per_seat"]
+        else:
+            # NO SNAPSHOT. This is either a genuine pre-035 checkout or a session this
+            # server never authorised. Only bounded, recorded evidence distinguishes them,
+            # and without it we FAIL CLOSED — an unfulfilled legitimate payment is
+            # recoverable by hand; credits granted against an unknown session are not.
+            allowed, reason = _claim_legacy_session(
+                cur, checkout_session_id, organization_id, session)
+            if not allowed:
+                conn.rollback()
+                logging.error(
+                    f"PAYMENT NOT APPLIED (org_seats): session={checkout_session_id} "
+                    f"org={organization_id} has no checkout snapshot and was rejected: "
+                    f"{reason}. MANUAL RECONCILIATION REQUIRED."
+                )
+                return
+            logging.warning(
+                f"org_seats payment has no checkout snapshot: session={checkout_session_id} "
+                f"org={organization_id}. Fulfilling on the legacy path ({reason})."
+            )
+
         cur.execute(
             """INSERT INTO organization_payments
                 (payment_id, organization_id, stripe_payment_intent_id, stripe_event_id,
@@ -5231,6 +6156,24 @@ def _handle_org_payment(session: dict, event_id: str):
             return
         admin_user_id, credits_per_seat = org_row
 
+        # The AUTHORISED entitlement wins over whatever the org row was created with.
+        # organizations.credits_per_seat was snapshotted from ORG_CREDITS_PER_SEAT at
+        # creation time (10 under the old default); the paid contract says 30. Persisting
+        # it here is what makes every LATER invitee receive the entitlement that was
+        # actually paid for — accept_invitation reads this column, so leaving it stale
+        # would silently short every employee who joins after the admin.
+        if snapshot_credits is not None:
+            credits_per_seat = snapshot_credits
+            cur.execute(
+                "UPDATE organizations SET credits_per_seat = ? WHERE organization_id = ?",
+                credits_per_seat, organization_id,
+            )
+        if snapshot_seats is not None:
+            cur.execute(
+                "UPDATE organizations SET seats_purchased = ? WHERE organization_id = ?",
+                snapshot_seats, organization_id,
+            )
+
         cur.execute(
             "UPDATE organizations SET status = 'active' WHERE organization_id = ?",
             organization_id,
@@ -5258,10 +6201,53 @@ def _handle_org_payment(session: dict, event_id: str):
             )
             return
 
+        if snapshot is not None:
+            # Close the snapshot out. UQ_orgcs_one_paid_per_org makes a SECOND paid
+            # session for the same organization impossible at the database level, so a
+            # double charge surfaces as an integrity error here rather than as silently
+            # doubled credits.
+            # Settle the attempt. Guarded on 'pending' ALONE — the same state the gate
+            # above admitted — so a concurrent expiry that moved the row cannot be
+            # overwritten, and a replay cannot re-mark a paid attempt.
+            cur.execute(
+                """UPDATE organization_checkout_sessions
+                   SET status = 'paid', fulfilled_at = SYSUTCDATETIME(),
+                       settled_at = SYSUTCDATETIME()
+                   WHERE checkout_session_id = ? AND status = 'pending'""",
+                checkout_session_id,
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                logging.error(
+                    f"PAYMENT NOT APPLIED (org_seats): could not mark session "
+                    f"{checkout_session_id} paid (rowcount={cur.rowcount}). "
+                    f"MANUAL RECONCILIATION REQUIRED."
+                )
+                return
+            # Release the organization's single live slot now the attempt has settled.
+            cur.execute(
+                "DELETE FROM organization_live_checkout WHERE attempt_id = ?",
+                snapshot["attempt_id"],
+            )
+            cur.execute(
+                """UPDATE organization_payments
+                   SET checkout_session_id = ?, pricing_version = ?, seats_paid = ?,
+                       credits_per_seat = ?
+                   WHERE stripe_event_id = ?""",
+                checkout_session_id, snapshot["pricing_version"], snapshot_seats,
+                snapshot_credits, event_id,
+            )
+            cur.execute(
+                "UPDATE organizations SET updated_at = SYSUTCDATETIME() "
+                "WHERE organization_id = ?",
+                organization_id,
+            )
+
         conn.commit()
         logging.info(
             f"Org seat payment recorded and unlocked: org={organization_id} "
-            f"amount={amount_total} admin_credits={credits_per_seat}"
+            f"amount={amount_total} seats={snapshot_seats} admin_credits={credits_per_seat} "
+            f"contract={snapshot['pricing_version'] if snapshot else 'legacy'}"
         )
     finally:
         conn.close()
