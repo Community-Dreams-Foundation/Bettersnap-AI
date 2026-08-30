@@ -61,7 +61,7 @@ CANONICAL_MIGRATIONS = (
     "029_audit_log.sql", "030_admin_audit_log.sql", "031_admin_user_status_and_notes.sql",
     "032_fix_org_status_constraint.sql", "033_provisioning_retry.sql",
     "034_fused_job_link.sql", "035_organization_branding.sql",
-    "036_teams_pricing_snapshot.sql",
+    "036_teams_pricing_snapshot.sql", "037_unify_credit_buckets.sql",
 )
 
 # SQL Server native error numbers raised by migration 034's shape guards.

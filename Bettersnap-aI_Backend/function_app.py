@@ -7597,9 +7597,20 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
     # Invalid and in-file duplicate addresses never reached the seat check, so
     # they are not in `skipped` — surface them here rather than silently dropping
     # rows the admin thought they were inviting.
+    # ONE ENTRY PER ADDRESS. A repeated address whose first copy was already reported
+    # (ALREADY_INVITED, NO_SEATS_AVAILABLE) must not appear a second time as a
+    # duplicate: the admin sees one row per person, and anything counting len(skipped)
+    # against seats stays honest. Only addresses not already accounted for are added.
+    reported = {entry["email"] for entry in skipped} | {c["email"] for c in created}
     for addr in invalid_emails:
+        if addr in reported:
+            continue
+        reported.add(addr)
         skipped.append({"email": addr, "reason": "INVALID_EMAIL"})
     for addr in dup_in_request:
+        if addr in reported:
+            continue
+        reported.add(addr)
         skipped.append({"email": addr, "reason": "DUPLICATE_IN_REQUEST"})
 
     return func.HttpResponse(
@@ -8267,7 +8278,13 @@ def export_org_images(req: func.HttpRequest) -> func.HttpResponse:
             "organization_id": str(org_id),
             "organization_name": org_name,
             "generated_at": _utc_iso(datetime.now(timezone.utc).replace(tzinfo=None)),
-            "expires_at": expiry.isoformat().replace("+00:00", "Z"),
+            # Same helper as generated_at above. The hand-rolled
+            # .isoformat().replace("+00:00","Z") produced an identical string here,
+            # because expiry is tz-aware — but it stays correct ONLY while that holds.
+            # Make expiry naive by accident and the Z silently vanishes, and a browser
+            # then reads the instant as local time. That is the bug _utc_iso exists to
+            # make unrepresentable, so there is one way to serialise a timestamp.
+            "expires_at": _utc_iso(expiry.replace(tzinfo=None)),
             "total_images": total_images,
             "truncated": truncated,
             "members": member_list,
