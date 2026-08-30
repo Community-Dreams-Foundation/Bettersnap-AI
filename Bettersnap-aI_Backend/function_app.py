@@ -7501,15 +7501,19 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
     except ValueError:
         return func.HttpResponse("Invalid JSON", status_code=400)
 
-    emails = body.get("emails") or []
-    if isinstance(emails, str):          # tolerate a single address
-        emails = [emails]
-    # Normalize before de-duping so "A@x.com" and "a@x.com " don't both get a seat.
-    emails = [e.strip().lower() for e in emails if isinstance(e, str) and e.strip()]
-    emails = list(dict.fromkeys(emails))  # de-dupe, preserve order
+    raw_emails = body.get("emails") or []
+    if isinstance(raw_emails, list) and len(raw_emails) > MAX_INVITE_BATCH:
+        return func.HttpResponse(
+            json.dumps({"error": "BATCH_TOO_LARGE", "max": MAX_INVITE_BATCH,
+                        "received": len(raw_emails)}),
+            mimetype="application/json", status_code=400)
+
+    # Same normalizer the preview endpoint uses, so a roster that previewed
+    # cleanly cannot behave differently when it is actually submitted.
+    emails, invalid_emails, dup_in_request = _normalize_email_list(raw_emails)
     if not emails:
         return func.HttpResponse(
-            json.dumps({"error": "NO_EMAILS"}),
+            json.dumps({"error": "NO_EMAILS", "invalid_email": invalid_emails}),
             mimetype="application/json", status_code=400)
 
     conn = new_connection()
@@ -7589,6 +7593,14 @@ def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
     sent = sum(1 for i in created if i["email_sent"])
     logging.info(f"invitations created: org={org_id} count={len(created)} "
                  f"emailed={sent} skipped={len(skipped)}")
+
+    # Invalid and in-file duplicate addresses never reached the seat check, so
+    # they are not in `skipped` — surface them here rather than silently dropping
+    # rows the admin thought they were inviting.
+    for addr in invalid_emails:
+        skipped.append({"email": addr, "reason": "INVALID_EMAIL"})
+    for addr in dup_in_request:
+        skipped.append({"email": addr, "reason": "DUPLICATE_IN_REQUEST"})
 
     return func.HttpResponse(
         json.dumps({"created": created, "skipped": skipped,
@@ -8275,3 +8287,175 @@ def _export_filename(email, job_id, index, blob_name):
     if "." in blob_name.rsplit("/", 1)[-1]:
         ext = "." + blob_name.rsplit(".", 1)[-1]
     return f"{base}_{str(job_id)[:8]}_{index}{ext}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Teams — CSV roster import support (audit T-014)
+#
+# Append to the END of function_app.py, after the export block.
+#
+# ── SCOPE: WHY THE BACKEND DOESN'T PARSE THE CSV ──────────────────────────
+# The frontend parses the file (papaparse is already a dependency) and sends a
+# JSON array of addresses. That keeps this API uniform with the existing
+# invitations endpoint, avoids multipart handling in Functions, and means a
+# malformed file is reported to the admin in the browser rather than as a 400.
+#
+# What the backend genuinely owes T-014 is the part the frontend CANNOT do:
+# PREVIEW. "Validated CSV import with preview, duplicate detection, seat-limit
+# handling and per-row errors" needs seat counts and existing members, which
+# only the server knows. An admin uploading 200 rows must be able to see what
+# WOULD happen before committing — today the only way to find out is to send
+# the invites for real.
+#
+# This adds a dry-run that returns the same created/skipped shape the real
+# endpoint returns, without writing anything or sending any email.
+# ══════════════════════════════════════════════════════════════════════════
+ 
+# Cap on addresses per request. A 5,000-row paste should be rejected cleanly
+# rather than becoming one enormous transaction. Well above any realistic org.
+MAX_INVITE_BATCH = int(os.environ.get("MAX_INVITE_BATCH", "500"))
+ 
+ 
+def _valid_email(addr: str) -> bool:
+    """Deliberately permissive: one @, something either side, a dot in the domain,
+    no whitespace. Full RFC 5322 validation rejects addresses that work in
+    practice, and the invite email itself is the real deliverability test."""
+    if not addr or len(addr) > 320 or any(c.isspace() for c in addr):
+        return False
+    parts = addr.split("@")
+    if len(parts) != 2:
+        return False
+    local, domain = parts
+    return bool(local) and "." in domain and not domain.startswith(".") \
+        and not domain.endswith(".") and len(domain) > 2
+ 
+ 
+def _normalize_email_list(raw):
+    """Shared by preview and create so the two can never disagree about what a
+    given input would do. Returns (clean, invalid, duplicates)."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return [], [], []
+ 
+    seen, clean, invalid, duplicates = set(), [], [], []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        addr = item.strip().lower()
+        if not addr:
+            continue
+        if not _valid_email(addr):
+            invalid.append(addr)
+            continue
+        if addr in seen:
+            # Duplicates WITHIN the file — distinct from "already invited",
+            # which is a duplicate against the database.
+            duplicates.append(addr)
+            continue
+        seen.add(addr)
+        clean.append(addr)
+    return clean, invalid, duplicates
+ 
+ 
+@app.route(route="orgs/{org_id}/invitations/preview", methods=["POST"])
+def preview_invitations(req: func.HttpRequest) -> func.HttpResponse:
+    """Dry run for a roster upload. Writes NOTHING and sends NO email.
+ 
+    Body: {"emails": ["a@x.com", ...]}  — same shape as the real endpoint.
+ 
+    Returns each address sorted into what would happen to it, so the admin can
+    fix the file before committing:
+      will_invite      — a seat is available and the address is new
+      already_member   — already on the plan
+      already_invited  — holds a live pending invite
+      invalid_email    — failed format validation
+      duplicate_in_file— appeared more than once in the upload
+      no_seats         — valid and new, but the plan is full
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+ 
+    org_id = req.route_params.get("org_id")
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+ 
+    raw = body.get("emails") or []
+    if isinstance(raw, list) and len(raw) > MAX_INVITE_BATCH:
+        return func.HttpResponse(
+            json.dumps({"error": "BATCH_TOO_LARGE", "max": MAX_INVITE_BATCH,
+                        "received": len(raw)}),
+            mimetype="application/json", status_code=400)
+ 
+    clean, invalid, duplicates = _normalize_email_list(raw)
+ 
+    conn = get_db()
+    cur = conn.cursor()
+ 
+    org, err = _require_org_admin(cur, user_id, org_id)
+    if err:
+        return err
+    seats_purchased = org[1]
+ 
+    cur.execute(
+        "SELECT COUNT(*) FROM organization_members "
+        "WHERE organization_id = ? AND status = 'active'", org_id)
+    active_members = cur.fetchone()[0]
+    cur.execute(
+        "SELECT COUNT(*) FROM invitations WHERE organization_id = ? "
+        "AND status = 'pending' AND expires_at > SYSUTCDATETIME()", org_id)
+    pending_invites = cur.fetchone()[0]
+    seats_left = max(0, seats_purchased - active_members - pending_invites)
+ 
+    # Existing members of THIS org, by email. LEFT-side lookup is on users
+    # because organization_members holds no address of its own.
+    cur.execute("""
+        SELECT LOWER(u.email)
+        FROM organization_members m
+        JOIN users u ON u.user_id = m.user_id
+        WHERE m.organization_id = ? AND m.status = 'active' AND u.email IS NOT NULL
+    """, org_id)
+    member_emails = {r[0] for r in cur.fetchall()}
+ 
+    cur.execute(
+        "SELECT LOWER(email) FROM invitations WHERE organization_id = ? "
+        "AND status = 'pending' AND expires_at > SYSUTCDATETIME()", org_id)
+    invited_emails = {r[0] for r in cur.fetchall()}
+ 
+    will_invite, already_member, already_invited, no_seats = [], [], [], []
+    for addr in clean:
+        if addr in member_emails:
+            already_member.append(addr)
+        elif addr in invited_emails:
+            already_invited.append(addr)
+        elif len(will_invite) < seats_left:
+            will_invite.append(addr)
+        else:
+            no_seats.append(addr)
+ 
+    return func.HttpResponse(
+        json.dumps({
+            "organization_id": str(org_id),
+            "seats_purchased": seats_purchased,
+            "seats_available": seats_left,
+            "summary": {
+                "will_invite": len(will_invite),
+                "already_member": len(already_member),
+                "already_invited": len(already_invited),
+                "invalid_email": len(invalid),
+                "duplicate_in_file": len(duplicates),
+                "no_seats": len(no_seats),
+            },
+            "will_invite": will_invite,
+            "already_member": already_member,
+            "already_invited": already_invited,
+            "invalid_email": invalid,
+            "duplicate_in_file": duplicates,
+            "no_seats": no_seats,
+        }),
+        mimetype="application/json", status_code=200)
