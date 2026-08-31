@@ -568,6 +568,124 @@ def load_identity_lora(user_id: str) -> bool:
 # SQL update
 # ─────────────────────────────────────────────────────────
 
+def refund_failed_job(cursor, job_id: str):
+    """Return a failed job's credits to the SAME balance(s) that paid for it.
+
+    reserve_job_slot (shared/job_reservation.py) debits down one of four branches, and
+    records everything a refund needs on the job row itself: organization_id (kept
+    deliberately so refunds stay correct even if the member later leaves the org),
+    source_type, and — for bucket-funded jobs — the exact per-bucket split as
+    monthly_credit_cost / one_time_credit_cost inside job_params.
+
+    This is the inverse of those four branches. It used to be the inverse of ONE:
+
+        UPDATE users SET credits_remaining = credits_remaining + ?
+
+    which is the legacy mirror column. Spendable balance lives in the BUCKET columns --
+    reserve_job_slot gates a one-time submit on one_time_credits_remaining, and
+    /users/credits reports the bucket total -- so a one-time user whose job failed got
+    credits back somewhere they could neither spend nor see corrected: the dashboard read
+    30 (falling back to the mirror because both buckets sat at 0) while the very next
+    submit was refused 402 for no credits. It also left credits_remaining above the bucket
+    total, recreating exactly the drift migration 037 was written to repair.
+
+    The org case was worse: the seat pool paid, but the refund landed in
+    users.credits_remaining -- the wrong table, and a balance that member never spent
+    from -- so the seat was never made whole.
+
+    The caller has already performed the guarded transition (WHERE status NOT IN
+    ('failed','completed') + rowcount == 1), so this runs at most once per job and cannot
+    double-refund alongside the backend's _mark_failed.
+
+    Returns (total_refunded, target) for the caller's log line.
+    """
+    cursor.execute(
+        "SELECT user_id, organization_id, source_type, job_params FROM jobs WHERE job_id = ?",
+        job_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        log.error(f"refund_failed_job: job {job_id} vanished mid-write; nothing refunded")
+        return 0, "missing"
+    user_id, org_id, source_type, raw_params = row[0], row[1], (row[2] or "").strip(), row[3]
+
+    params = {}
+    if raw_params:
+        try:
+            params = json.loads(raw_params) or {}
+        except (TypeError, ValueError):
+            params = {}
+
+    def _amount(key, default=None):
+        if key not in params:
+            return default
+        try:
+            return max(0, int(params[key]))
+        except (TypeError, ValueError):
+            return default
+
+    # Total charged. Falls back to 1 for rows written before per-image charging.
+    total = _amount("credit_cost")
+    if total is None:
+        total = 1
+
+    # The per-bucket split is written by the SAME branch of reserve_job_slot that performs
+    # the bucket debit, so "split recorded" and "buckets were debited" are one condition.
+    # Its ABSENCE therefore proves the debit came from the mirror alone (an older row), and
+    # a mirror-only refund is the correct inverse rather than a guess. Never invent a split.
+    monthly_part = _amount("monthly_credit_cost")
+    one_time_part = _amount("one_time_credit_cost")
+    split_recorded = monthly_part is not None or one_time_part is not None
+    monthly_part = monthly_part or 0
+    one_time_part = one_time_part or 0
+    if split_recorded and (monthly_part + one_time_part) != total:
+        # Trust the recorded split: it is what was actually taken out of the balances.
+        log.warning(
+            f"refund_failed_job: job {job_id} split {monthly_part}+{one_time_part} != "
+            f"credit_cost {total}; refunding the recorded split")
+
+    if org_id:
+        # Org-funded: the seat pool paid, so the seat pool is repaid.
+        cursor.execute(
+            "UPDATE organization_members SET credits_remaining = credits_remaining + ? "
+            "WHERE user_id = ? AND organization_id = ?",
+            total, user_id, org_id,
+        )
+        if cursor.rowcount != 1:
+            log.error(
+                f"refund_failed_job: job {job_id} owes {total} to org membership "
+                f"(user={user_id}, org={org_id}) but no such row exists; NOT refunded")
+            return 0, "org_missing"
+        return total, "organization_members"
+
+    if source_type == "monthly" and split_recorded:
+        cursor.execute(
+            "UPDATE users SET "
+            "monthly_credits_remaining = monthly_credits_remaining + ?, "
+            "one_time_credits_remaining = one_time_credits_remaining + ?, "
+            "credits_remaining = credits_remaining + ? + ? "
+            "WHERE user_id = ?",
+            monthly_part, one_time_part, monthly_part, one_time_part, user_id,
+        )
+        return monthly_part + one_time_part, "monthly+one_time+mirror"
+
+    if source_type == "one_time" and split_recorded:
+        cursor.execute(
+            "UPDATE users SET "
+            "one_time_credits_remaining = one_time_credits_remaining + ?, "
+            "credits_remaining = credits_remaining + ? WHERE user_id = ?",
+            one_time_part, one_time_part, user_id,
+        )
+        return one_time_part, "one_time+mirror"
+
+    # Legacy row: no bucket debit happened, so only the mirror is owed.
+    cursor.execute(
+        "UPDATE users SET credits_remaining = credits_remaining + ? WHERE user_id = ?",
+        total, user_id,
+    )
+    return total, "mirror"
+
+
 def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
                       max_attempts: int = 3):
     """Write a job's status, retrying on transient DB errors and RAISING if it
@@ -594,31 +712,14 @@ def update_job_status(job_id: str, status: str, output_blob_paths: list = None,
                     WHERE job_id = ? AND status NOT IN ('failed', 'completed')
                 """, status, output_json, job_id)
                 transitioned = cursor.rowcount == 1
-                refund = 0
+                refund, target = 0, "none"
                 if transitioned:
-                    # Refund what was actually SPENT at submit: image_count *
-                    # credits_per_image, stored as credit_cost in job_params. This used
-                    # to be hardcoded +1, so a failed 30-image job refunded 1 credit and
-                    # silently ate the other 29 — the backend's _mark_failed already
-                    # refunds the full amount, and these two paths must agree. Falls back
-                    # to 1 for legacy rows written before per-image charging.
-                    cursor.execute("SELECT job_params FROM jobs WHERE job_id = ?", job_id)
-                    r = cursor.fetchone()
-                    refund = 1
-                    if r and r[0]:
-                        try:
-                            refund = max(1, int(json.loads(r[0]).get("credit_cost", 1)))
-                        except (TypeError, ValueError):
-                            refund = 1
-                    cursor.execute("""
-                        UPDATE users
-                        SET credits_remaining = credits_remaining + ?
-                        WHERE user_id = (SELECT user_id FROM jobs WHERE job_id = ?)
-                    """, refund, job_id)
+                    refund, target = refund_failed_job(cursor, job_id)
                 conn.commit()
                 log.info(
                     f"✅ Job {job_id} -> 'failed' "
-                    f"(transitioned={transitioned}, credits_refunded={refund if transitioned else 0})"
+                    f"(transitioned={transitioned}, credits_refunded={refund if transitioned else 0}"
+                    f", target={target})"
                 )
             elif status == "completed":
                 # GUARDED like the 'failed' path above: only complete a job that is still
