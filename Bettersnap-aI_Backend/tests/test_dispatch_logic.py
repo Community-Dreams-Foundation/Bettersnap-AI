@@ -2503,5 +2503,169 @@ class JobStatusReconcileTests(unittest.TestCase):
             function_app._DEAD_EXEC_STATES,
             {"stopped", "failed", "degraded", "cancelled"})
 
+class OrgMemberCreditVisibilityTests(unittest.TestCase):
+    """A paid team member must see the SEAT they can spend, not their personal row.
+
+    Teams credits are per member and live in organization_members -- that is what
+    reserve_job_slot debits. Both read paths looked only at dbo.users, so a member saw no
+    subscription and the 4 free registration credits: the UI said "free tier, 4 credits"
+    while their seat held 30 and generation worked. Seen on a real account that had
+    already spent 4 of 30 while being told it had none.
+    """
+
+    #: personal row: (credits_remaining, one_time, monthly) -- the free registration grant
+    PERSONAL = (4, 4, 0)
+    #: seat row: (org_id, name, granted, remaining, org_status, credits_per_seat)
+    SEAT = ("org-1", "e2e aug 30", 30, 26, "active", 30)
+
+    def _cursor(self, seat):
+        outer = self
+
+        class _Cur:
+            def __init__(self):
+                self._fetch = None
+                self.rowcount = 0
+
+            def execute(self, sql, *params):
+                q = " ".join(sql.lower().split())
+                if "from organization_members m" in q:
+                    self._fetch = seat
+                elif "from pending_purchases" in q:
+                    self._fetch = None
+                elif "credits_remaining, one_time_credits_remaining" in q:
+                    self._fetch = outer.PERSONAL
+                elif "subscription_plan, subscription_type" in q:
+                    self._fetch = (None, None, 4, None, None, None, None, 4, 0)
+                return self
+
+            def fetchone(self):
+                return self._fetch
+
+        return _Cur()
+
+    def _call(self, handler, seat):
+        conn = mock.Mock()
+        conn.cursor.return_value = self._cursor(seat)
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {}
+        patches = [
+            mock.patch.object(function_app, "get_db", return_value=conn),
+            mock.patch.object(function_app, "get_user_id", return_value="user-1"),
+            mock.patch.object(function_app, "validate_token",
+                              return_value={"oid": "user-1"}),
+        ]
+        for pt in patches:
+            pt.start()
+        try:
+            res = handler(req)
+        finally:
+            for pt in patches:
+                pt.stop()
+        return res.status_code, json.loads(res.body)
+
+    def test_member_credits_report_the_seat_not_the_personal_row(self):
+        code, body = self._call(function_app.user_credits, self.SEAT)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["credits_remaining"], 26)
+        self.assertNotEqual(body["credits_remaining"], 4)
+        self.assertEqual(body["organization"]["organization_name"], "e2e aug 30")
+
+    def test_member_subscription_is_not_reported_as_free(self):
+        code, body = self._call(function_app.subscription_status, self.SEAT)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["subscription_type"], "organization")
+        self.assertEqual(body["subscription_plan"], "teams_basic")
+        self.assertEqual(body["credits_remaining"], 26)
+        self.assertEqual(body["organization"]["credits_granted"], 30)
+
+    def test_a_seat_with_no_credits_left_reports_zero_not_the_free_grant(self):
+        """0 must not fall back to the personal 4 -- that would tell a spent-out member
+        they still had credits."""
+        spent = ("org-1", "e2e aug 30", 30, 0, "active", 30)
+        for handler in (function_app.user_credits, function_app.subscription_status):
+            with self.subTest(handler=handler.__name__):
+                _, body = self._call(handler, spent)
+                self.assertEqual(body["credits_remaining"], 0)
+
+    def test_an_individual_is_completely_unaffected(self):
+        code, body = self._call(function_app.user_credits, None)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["credits_remaining"], 4)
+        self.assertNotIn("organization", body)
+
+        code, body = self._call(function_app.subscription_status, None)
+        self.assertEqual(code, 200)
+        self.assertIsNone(body["subscription_type"])
+        self.assertNotIn("organization", body)
+
+class OrgPaymentReceiptTests(unittest.TestCase):
+    """The admin must be able to SEE what the team paid.
+
+    organization_payments recorded the charge the moment fulfilment landed, but nothing
+    ever read it back -- the table had inserts and no SELECT anywhere in the app. An admin
+    who had just paid $347 could find no confirmation of it in the product: no amount, no
+    date, no seats, no per-seat credits.
+    """
+
+    PAYMENT = (34700, "usd", "succeeded", None, 10, 30, "pi_3UAIoo9")
+
+    def _call(self, payment):
+        class _Cur:
+            def __init__(self):
+                self._fetch = None
+
+            def execute(self, sql, *params):
+                q = " ".join(sql.lower().split())
+                if "from organizations where" in q:
+                    self._fetch = ("admin-1", "e2e aug 30", 10, "active")
+                elif "count(*) from organization_members" in q:
+                    self._fetch = (2,)
+                elif "sum(credits_remaining)" in q:
+                    self._fetch = (56,)
+                elif "from organization_payments" in q:
+                    self._fetch = payment
+                return self
+
+            def fetchone(self):
+                return self._fetch
+
+            def fetchall(self):
+                return [("completed", 1)]
+
+        conn = mock.Mock()
+        conn.cursor.return_value = _Cur()
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {"organization_id": "org-1"}
+        patches = [
+            mock.patch.object(function_app, "get_db", return_value=conn),
+            mock.patch.object(function_app, "validate_token",
+                              return_value={"oid": "admin-1"}),
+        ]
+        for pt in patches:
+            pt.start()
+        try:
+            res = function_app.org_dashboard_summary(req)
+        finally:
+            for pt in patches:
+                pt.stop()
+        return res.status_code, json.loads(res.body)
+
+    def test_the_receipt_is_returned(self):
+        code, body = self._call(self.PAYMENT)
+        self.assertEqual(code, 200)
+        pay = body["latest_payment"]
+        self.assertIsNotNone(pay, "the admin could not see the payment at all")
+        self.assertEqual(pay["amount_cents"], 34700)
+        self.assertEqual(pay["seats_paid"], 10)
+        self.assertEqual(pay["credits_per_seat"], 30)
+        self.assertEqual(pay["currency"], "usd")
+
+    def test_an_unpaid_workspace_reports_null_rather_than_inventing_one(self):
+        code, body = self._call(None)
+        self.assertEqual(code, 200)
+        self.assertIsNone(body["latest_payment"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
