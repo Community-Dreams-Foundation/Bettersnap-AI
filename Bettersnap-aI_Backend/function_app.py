@@ -7496,13 +7496,14 @@ def retention_cleanup(timer: func.TimerRequest) -> None:
 INVITE_EXPIRY_DAYS = int(os.environ.get("INVITE_EXPIRY_DAYS", "14"))
 
 
-def _require_org_admin(cursor, user_id, org_id):
+def _require_org_admin(cursor, user_id, org_id, require_active=True):
     """Returns (org_row, None) if user_id is the admin of org_id, else (None, error_response).
 
     Every Teams endpoint below resolves authority through this: the org is looked up
     by BOTH id and admin_user_id, so a caller cannot act on an org they don't own by
     guessing an organization_id. 404 (not 403) on someone else's org — a wrong-owner
-    request should not confirm the org exists.
+    request should not confirm the org exists. Pre-payment configuration endpoints may
+    set require_active=False; seat-consuming and export endpoints keep the active gate.
     """
     cursor.execute(
         "SELECT organization_id, seats_purchased, credits_per_seat, status, name "
@@ -7512,7 +7513,7 @@ def _require_org_admin(cursor, user_id, org_id):
     row = cursor.fetchone()
     if not row:
         return None, func.HttpResponse("Organization not found", status_code=404)
-    if row[3] != "active":
+    if require_active and row[3] != "active":
         return None, func.HttpResponse(
             json.dumps({"error": "ORG_NOT_ACTIVE", "status": row[3]}),
             mimetype="application/json", status_code=403)
@@ -8049,7 +8050,7 @@ def set_org_branding(req: func.HttpRequest) -> func.HttpResponse:
         conn.autocommit = False
         cur = conn.cursor()
  
-        org, err = _require_org_admin(cur, user_id, org_id)
+        org, err = _require_org_admin(cur, user_id, org_id, require_active=False)
         if err:
             return err
  
@@ -8103,7 +8104,7 @@ def get_org_branding(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cur = conn.cursor()
  
-    org, err = _require_org_admin(cur, user_id, org_id)
+    org, err = _require_org_admin(cur, user_id, org_id, require_active=False)
     if err:
         return err
  

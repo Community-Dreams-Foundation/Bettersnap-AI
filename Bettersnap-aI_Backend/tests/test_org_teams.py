@@ -269,6 +269,10 @@ class FakeCursor:
         elif "from organizations where organization_id = ? and admin_user_id" in s:
             self._fetch = self.cfg.get("org_admin_row")
 
+        # ── organization branding ──
+        elif "from organization_branding where organization_id" in s:
+            self._fetch = self.cfg.get("branding_row")
+
         # ── create_invitations: seat accounting ──
         elif "count(*) from organization_members where organization_id" in s:
             self._fetch = (self.cfg.get("active_members", 0),)
@@ -899,6 +903,53 @@ class CreateInvitationsTests(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # POST /invitations/{token}/accept — accept_invitation
 # ═══════════════════════════════════════════════════════════════════════════
+class OrganizationBrandingTests(unittest.TestCase):
+    def setUp(self):
+        self.branding_row = (
+            None, None, "Studio Neutral", "Business / Corporate", 20,
+            "default", datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+
+    def test_pending_payment_admin_can_read_branding(self):
+        cfg = {
+            "org_admin_row": ("org-1", 10, 30, "pending_payment", "Acme"),
+            "branding_row": self.branding_row,
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            response = function_app.get_org_branding(
+                FakeRequest(route_params={"org_id": "org-1"}))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["branding"]["style_key"], "Studio Neutral")
+
+    def test_pending_payment_admin_can_save_branding(self):
+        cfg = {
+            "org_admin_row": ("org-1", 10, 30, "pending_payment", "Acme"),
+            "branding_row": self.branding_row,
+        }
+        conn, p1, p2 = _patched(cfg)
+        auth1, auth2 = _auth_as("admin-1")
+        p1.start(); p2.start(); auth1.start(); auth2.start()
+        try:
+            response = function_app.set_org_branding(FakeRequest(
+                route_params={"org_id": "org-1"},
+                body={
+                    "style_key": "Studio Neutral",
+                    "use_case_key": "Business / Corporate",
+                    "max_images_per_member": 20,
+                    "enforcement_mode": "default",
+                },
+            ))
+        finally:
+            p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(conn.committed)
+
+
 class AcceptInvitationTests(unittest.TestCase):
     def _accept(self, cfg, token="tok-abc", accepting_user="user-2"):
         conn, p1, p2 = _patched(cfg)
