@@ -1258,6 +1258,32 @@ def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     )
     job_status_counts = {r[0]: r[1] for r in cur.fetchall()}
 
+    # WHAT THE TEAM PAID. organization_payments recorded the charge from the moment
+    # fulfilment landed, but nothing ever read it back -- the table had inserts and no
+    # SELECT anywhere in the app. So an admin who had just paid $347 could find no
+    # confirmation of it in the product: no amount, no date, no seats, no per-seat credits.
+    # The most recent succeeded payment is what the dashboard needs to show a receipt.
+    cur.execute(
+        "SELECT TOP 1 amount_cents, currency, status, created_at, seats_paid, "
+        "       credits_per_seat, stripe_payment_intent_id "
+        "FROM organization_payments "
+        "WHERE organization_id = ? AND status = 'succeeded' "
+        "ORDER BY created_at DESC",
+        organization_id,
+    )
+    prow = cur.fetchone()
+    latest_payment = None
+    if prow:
+        latest_payment = {
+            "amount_cents": int(prow[0] or 0),
+            "currency": prow[1],
+            "status": prow[2],
+            "paid_at": _utc_iso(prow[3]),
+            "seats_paid": int(prow[4] or 0),
+            "credits_per_seat": int(prow[5] or 0),
+            "stripe_payment_intent_id": prow[6],
+        }
+
     return func.HttpResponse(
         json.dumps({
             "organization_id": organization_id,
@@ -1267,6 +1293,8 @@ def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
             "members_joined": members_joined,
             "credits_remaining_total": credits_remaining_total,
             "job_status_counts": job_status_counts,
+            # Receipt for the purchase that activated this workspace. null before payment.
+            "latest_payment": latest_payment,
         }),
         mimetype="application/json", status_code=200)
 
@@ -1303,6 +1331,38 @@ def user_profile_alias(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 # ── User Credits ──────────────────────────────────────────
+def _active_org_seat(cursor, user_id):
+    """The caller's ACTIVE organization seat, or None.
+
+    Teams credits are PER MEMBER and live in organization_members -- that is what
+    reserve_job_slot debits for an org-funded job. Every read path here used to look only
+    at dbo.users, so a paid team member saw their personal row: no subscription and the 4
+    free registration credits. The app told them "free tier, 4 credits" while their seat
+    actually held 30 and generation worked fine. Observed on radhesvatluri+emp3@gmail.com,
+    who had spent 4 of 30 seat credits while the UI insisted they had none.
+
+    Returns the seat AND the organization's status, so a caller can distinguish "your team
+    has not paid yet" from "you have no credits left".
+    """
+    cursor.execute(
+        "SELECT m.organization_id, o.name, m.credits_granted, m.credits_remaining, "
+        "       o.status, o.credits_per_seat "
+        "FROM organization_members m "
+        "JOIN organizations o ON o.organization_id = m.organization_id "
+        "WHERE m.user_id = ? AND m.status = 'active'",
+        user_id)
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "organization_id": str(row[0]),
+        "organization_name": row[1],
+        "credits_granted": int(row[2] or 0),
+        "credits_remaining": int(row[3] or 0),
+        "organization_status": (row[4] or "").strip(),
+        "credits_per_seat": int(row[5] or 0),
+    }
+
 @app.route(route="users/credits", methods=["GET"])
 def user_credits(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -1333,6 +1393,21 @@ def user_credits(req: func.HttpRequest) -> func.HttpResponse:
     monthly = int(row[2] or 0)
     bucket_total = one_time + monthly
     effective = bucket_total if bucket_total > 0 else legacy
+
+    # A team member spends their SEAT, not their personal row. Report the balance they can
+    # actually spend -- see _active_org_seat for what reporting the personal row did to them.
+    seat = _active_org_seat(cursor, user_id)
+    if seat is not None:
+        return func.HttpResponse(
+            json.dumps({
+                "credits_remaining": seat["credits_remaining"],
+                "one_time_credits_remaining": one_time,
+                "monthly_credits_remaining": monthly,
+                "organization": seat,
+            }),
+            mimetype="application/json",
+            status_code=200
+        )
 
     return func.HttpResponse(
         json.dumps({
@@ -5046,6 +5121,42 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
         user_id)
     prow = cursor.fetchone()
     queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
+
+    # ── Team members report their SEAT, not their personal row ───────────────
+    # Teams credits are per member and live in organization_members. Reading dbo.users
+    # here told a paid member they were on the free tier with 4 credits while their seat
+    # held 30 and generation worked -- the UI was simply reading the wrong table. Returned
+    # early so the individual path below is untouched.
+    seat = _active_org_seat(cursor, user_id)
+    if seat is not None:
+        return func.HttpResponse(
+            json.dumps({
+                "subscription_plan": "teams_basic",
+                "subscription_type": "organization",
+                "plan": "teams_basic",
+                "type": "organization",
+                # The number they can actually spend.
+                "credits_remaining": seat["credits_remaining"],
+                "one_time_credits_remaining": seat["credits_remaining"],
+                "monthly_credits_remaining": 0,
+                # A seat is a one-time grant, not a monthly quota: nothing renews, and
+                # nothing can lapse or be cancelled, so these stay null/false rather than
+                # inventing a billing cycle the member does not have.
+                "credits_monthly_limit": None,
+                "monthly_quota": None,
+                "subscription_renewed_at": None,
+                "next_renewal": None,
+                "renewal_date": None,
+                "payment_failed": False,
+                "payment_failed_at": None,
+                "cancel_pending": False,
+                "cancel_at": None,
+                "queued_purchase": queued_purchase,
+                "organization": seat,
+            }),
+            mimetype="application/json",
+            status_code=200,
+        )
 
     # Compute the NEXT renewal so the frontend can show "renews {date}". Stripe bills on a
     # MONTHLY cadence (same day-of-month each cycle), so add one calendar month — NOT 30 days,
