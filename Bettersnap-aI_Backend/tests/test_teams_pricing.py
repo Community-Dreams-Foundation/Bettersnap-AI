@@ -49,6 +49,8 @@ def reference_total_cents(seats):
     rate_at_10, rate_at_20 = 3200, 2900
     step = (rate_at_10 - rate_at_20) // 10
     unit = rate_at_10 - step * (seats - 10)
+    # "...and the per-seat price never goes below $25.00."
+    unit = max(unit, 2500)
     return seats * unit
 
 
@@ -75,11 +77,64 @@ class TestContractExamples(unittest.TestCase):
                                  "total must divide evenly: one rate for every seat")
                 self.assertEqual(q.total_cents, seats * q.effective_price_per_seat_cents)
 
-    def test_a_bigger_team_always_gets_a_better_rate(self):
-        rates = [quote(n).effective_price_per_seat_cents
-                 for n in range(MIN_SEATS, MAX_SEATS + 1)]
+    def test_a_bigger_team_gets_a_strictly_better_rate_until_the_floor(self):
+        """Strictly better right up to the floor, then held. Asserting "strictly better"
+        all the way to 49 would be asserting the absence of the floor."""
+        rates = [quote(n).effective_price_per_seat_cents for n in range(MIN_SEATS, 34)]
         for smaller, larger in zip(rates, rates[1:]):
-            self.assertLess(larger, smaller, "the rate must improve as the team grows")
+            self.assertLess(larger, smaller)
+        # and from there it holds rather than continuing to fall
+        held = {quote(n).effective_price_per_seat_cents for n in range(34, MAX_SEATS + 1)}
+        self.assertEqual(held, {2500})
+
+class TestTheDiscountFloor(unittest.TestCase):
+    """The floor caps how deep the volume discount can go, without moving the anchors."""
+
+    def test_the_floor_does_not_disturb_either_anchor(self):
+        self.assertEqual(quote(10).effective_price_per_seat_cents, 3200)
+        self.assertEqual(quote(20).effective_price_per_seat_cents, 2900)
+
+    def test_orders_below_the_floor_price_exactly_as_the_linear_rule_says(self):
+        for seats in range(MIN_SEATS, 34):
+            with self.subTest(seats=seats):
+                self.assertEqual(quote(seats).effective_price_per_seat_cents,
+                                 3200 - 30 * (seats - 10))
+
+    def test_the_rate_never_falls_below_the_floor(self):
+        for seats in range(34, MAX_SEATS + 1):
+            with self.subTest(seats=seats):
+                self.assertEqual(quote(seats).effective_price_per_seat_cents, 2500)
+
+    def test_the_total_still_only_ever_increases(self):
+        """A floor must not create the cliff it exists to prevent."""
+        totals = [quote(n).total_cents for n in range(MIN_SEATS, MAX_SEATS + 1)]
+        for smaller, larger in zip(totals, totals[1:]):
+            self.assertGreater(larger, smaller)
+
+    def test_the_frozen_spec_agrees_with_the_live_constant(self):
+        """THE ONE THAT MATTERS. quote() prices from V2_UNIT_FLOOR_CENTS; the fulfilment
+        validator prices from _V2_SPEC, frozen by value so a future v3 cannot invalidate a
+        v2 order. If the two ever disagree, checkout charges one amount and fulfilment
+        REFUSES it -- money taken, workspace never activated. That is exactly how Teams
+        checkout broke once already, and it is silent until someone pays."""
+        import shared.teams_pricing as tp
+        self.assertEqual(tp.V2_UNIT_FLOOR_CENTS, tp._V2_SPEC["unit_floor_cents"])
+        self.assertEqual(tp.V2_BASE_UNIT_CENTS, tp._V2_SPEC["base_unit_cents"])
+        self.assertEqual(tp.V2_STEP_CENTS, tp._V2_SPEC["step_cents"])
+        # And prove it end to end at a size where the floor actually binds.
+        q = quote(49)
+        snapshot = {
+            "plan_id": q.plan_id, "pricing_version": q.pricing_version,
+            "currency": q.currency, "seats": q.seats,
+            "credits_per_seat": q.credits_per_seat,
+            "expected_total_cents": q.total_cents,
+            "breakdown": [b.to_dict() for b in q.breakdown],
+        }
+        session = {"amount_total": q.total_cents, "currency": q.currency}
+        self.assertEqual(
+            tp.snapshot_validator(q.pricing_version)(snapshot, session), [],
+            "what checkout would charge was rejected by fulfilment")
+
 
 class TestAgainstIndependentReference(unittest.TestCase):
     def test_every_legal_seat_count_matches_reference(self):
@@ -144,16 +199,27 @@ class TestMonotonicity(unittest.TestCase):
                 self.assertGreater(total, previous)
             previous = total
 
-    def test_marginal_seat_never_costs_more_than_the_previous_one(self):
-        """Marginal price is non-increasing — the discount only ever improves."""
-        deltas = [
-            quote(n).total_cents - quote(n - 1).total_cents
-            for n in range(MIN_SEATS + 1, MAX_SEATS + 1)
-        ]
-        for i in range(1, len(deltas)):
-            with self.subTest(seat=MIN_SEATS + 1 + i):
-                self.assertLessEqual(deltas[i], deltas[i - 1])
+    def test_the_marginal_seat_is_never_free_or_negative(self):
+        """A FLOOR necessarily breaks marginal-cost monotonicity, so this asserts the
+        property that actually matters instead of one the design cannot have.
 
+        Below the floor, adding a seat also lowers the rate on every seat already in the
+        order, so the marginal cost is small (~$15.50 at seat 33). Once the floor binds,
+        each further seat simply costs the floor ($25.00). The marginal therefore STEPS UP
+        at the boundary. That is fine and it is not a cliff: the TOTAL still only ever
+        increases (see test_total_strictly_increases) and the per-seat RATE still only ever
+        improves, so nobody can pay more by buying fewer seats. What must never happen is a
+        seat that costs nothing or pays the customer."""
+        for seats in range(MIN_SEATS + 1, MAX_SEATS + 1):
+            with self.subTest(seat=seats):
+                marginal = quote(seats).total_cents - quote(seats - 1).total_cents
+                self.assertGreater(marginal, 0)
+
+    def test_the_per_seat_rate_never_worsens(self):
+        rates = [quote(n).effective_price_per_seat_cents
+                 for n in range(MIN_SEATS, MAX_SEATS + 1)]
+        for smaller, larger in zip(rates, rates[1:]):
+            self.assertLessEqual(larger, smaller)
     def test_crossing_into_a_cheaper_band_still_costs_more(self):
         """The exact inversion a flat table would produce."""
         self.assertGreater(quote(25).total_cents, quote(24).total_cents)

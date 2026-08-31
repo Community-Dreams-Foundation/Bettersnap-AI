@@ -114,12 +114,18 @@ _assert_bands_wellformed()
 V2_BASE_UNIT_CENTS = 3200      # the rate at exactly MIN_SEATS
 V2_STEP_CENTS = 30             # the rate improves by this much per additional seat
 
-# A floor on the per-seat price, in cents. 0 disables it. With no floor the rate reaches
-# $20.30 at the 49-seat maximum -- a 42% discount off the v1 list price of $35. That is a
-# direct consequence of the two anchor points and the linear rule they imply, not a bug;
-# raising this to e.g. 2500 caps the discount without disturbing the anchors, because the
-# floor only engages above 33 seats.
-V2_UNIT_FLOOR_CENTS = 0
+# A floor on the per-seat price, in cents. 0 disables it.
+#
+# Set to $25.00. It binds only from 34 seats up, so BOTH anchor points are untouched --
+# 10 seats is still $32.00/seat and 20 is still $29.00 -- and every order below 34 prices
+# exactly as the linear rule says. Above that it caps the discount at 29% off the v1 list
+# price of $35, which still comfortably beats v1's deepest band ($29).
+#
+# Without it the rate keeps falling unbounded: $20.30/seat (42% off) at the current 49-seat
+# maximum, and OUTRIGHT NEGATIVE if CONTACT_SALES_MIN is ever raised. _assert_v2_monotonic
+# would catch that at import, but only after someone had already changed the limit and
+# restarted; the floor makes the rule safe by construction instead.
+V2_UNIT_FLOOR_CENTS = 2500
 
 
 def v2_unit_cents(seats: int) -> int:
@@ -538,7 +544,7 @@ _V2_SPEC = {
     "credits_per_seat": 30,
     "base_unit_cents": 3200,
     "step_cents": 30,
-    "unit_floor_cents": 0,
+    "unit_floor_cents": 2500,
 }
 
 
