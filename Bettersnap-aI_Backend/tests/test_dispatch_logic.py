@@ -16,6 +16,7 @@ parallel callers) need a real SQL Server — see test_concurrency_integration.py
 
 Run:  python -m unittest tests.test_dispatch_logic   (from the backend dir)
 """
+import io
 import os
 import sys
 import json
@@ -2400,6 +2401,107 @@ class RetentionCleanupTests(unittest.TestCase):
         self.assertFalse(eligibility_conn.committed)
         delete_blobs.assert_not_called()
 
+
+class JobStatusReconcileTests(unittest.TestCase):
+    """job_status must reconcile a DEAD execution on read, not wait for the reaper.
+
+    A hard-killed container -- OOM SIGKILL, node eviction, a pre-container provisioning
+    failure -- never writes its own status, so the row sat at processing/dispatching until
+    the 2-minute reaper timer next fired. The customer watched a spinner for up to two
+    minutes after their job was already dead, and their refund waited exactly as long.
+    """
+
+    def setUp(self):
+        self._db = mock.patch.object(function_app, "get_db").start()
+        self._uid = mock.patch.object(
+            function_app, "get_user_id", return_value="user-1").start()
+        self._mark = mock.patch.object(
+            function_app, "_mark_failed", return_value="terminalized").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _row(self, status, exec_id="exec-1", output=None):
+        self._db.return_value.cursor.return_value.fetchone.return_value = (
+            status, output, exec_id)
+
+    def _call(self):
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {"job_id": "11111111-1111-1111-1111-111111111111"}
+        res = function_app.job_status(req)
+        return res.status_code, json.loads(res.body)
+
+    def test_dead_execution_is_failed_and_refunded_on_read(self):
+        self._row("processing")
+        with mock.patch("shared.queue_trigger.execution_status", return_value="Failed"):
+            code, body = self._call()
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "failed")
+        self._mark.assert_called_once()
+
+    def test_every_dead_state_counts(self):
+        for state in ("Stopped", "Failed", "Degraded", "Cancelled"):
+            with self.subTest(state=state):
+                self._mark.reset_mock()
+                self._row("dispatching")
+                with mock.patch("shared.queue_trigger.execution_status",
+                                return_value=state):
+                    _, body = self._call()
+                self.assertEqual(body["status"], "failed")
+                self._mark.assert_called_once()
+
+    def test_succeeded_execution_is_never_refunded(self):
+        """The container writes 'completed' itself, so a Succeeded execution whose row still
+        reads 'processing' is a WRITE RACE. Refunding it would hand the user both a refund
+        and the delivered images."""
+        self._row("processing")
+        with mock.patch("shared.queue_trigger.execution_status", return_value="Succeeded"):
+            _, body = self._call()
+        self.assertEqual(body["status"], "processing")
+        self._mark.assert_not_called()
+
+    def test_running_execution_is_left_alone(self):
+        self._row("processing")
+        with mock.patch("shared.queue_trigger.execution_status", return_value="Running"):
+            _, body = self._call()
+        self.assertEqual(body["status"], "processing")
+        self._mark.assert_not_called()
+
+    def test_control_plane_error_fails_open(self):
+        """A status read must never 500 because an ACA call did. Return the stored status
+        and leave the job to the reaper, exactly as before."""
+        self._row("processing")
+        with mock.patch("shared.queue_trigger.execution_status",
+                        side_effect=RuntimeError("ARM throttled")):
+            code, body = self._call()
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "processing")
+        self._mark.assert_not_called()
+
+    def test_terminal_job_never_calls_the_control_plane(self):
+        for status in ("completed", "failed"):
+            with self.subTest(status=status):
+                self._row(status)
+                with mock.patch("shared.queue_trigger.execution_status") as ex:
+                    _, body = self._call()
+                self.assertEqual(body["status"], status)
+                ex.assert_not_called()
+
+    def test_job_without_an_execution_id_never_calls_the_control_plane(self):
+        self._row("dispatching", exec_id=None)
+        with mock.patch("shared.queue_trigger.execution_status") as ex:
+            _, body = self._call()
+        self.assertEqual(body["status"], "dispatching")
+        ex.assert_not_called()
+
+    def test_reaper_and_job_status_share_one_definition_of_dead(self):
+        """Two copies of this set would silently drift, and the drift would be invisible
+        until a job class stopped being refunded."""
+        source = io.open(
+            os.path.join(BACKEND_DIR, "function_app.py"), encoding="utf-8").read()
+        self.assertEqual(source.count("_DEAD_EXEC_STATES = {"), 1)
+        self.assertEqual(
+            function_app._DEAD_EXEC_STATES,
+            {"stopped", "failed", "degraded", "cancelled"})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

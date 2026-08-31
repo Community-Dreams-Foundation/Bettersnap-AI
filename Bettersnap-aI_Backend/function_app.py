@@ -121,6 +121,14 @@ REAPER_STUCK_MINUTES       = int(os.environ.get("REAPER_STUCK_MINUTES", "130"))
 CANCEL_WINDOW_MINUTES      = int(os.environ.get("CANCEL_WINDOW_MINUTES", "5"))
 REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "15"))
 
+# An ACA execution in one of these states is definitively gone without delivering, so the
+# job it was running can be failed and refunded immediately. 'Succeeded' is deliberately
+# ABSENT: the container writes 'completed' itself, so a Succeeded execution whose row still
+# reads 'processing' is a write race, not a refund case -- refunding it would hand the user
+# both a refund AND the delivered images. Shared by the reaper and job_status so the two
+# can never drift apart on what counts as dead.
+_DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
+
 # ── Identity-LoRA training ────────────────────────────────────────────────
 # DreamBooth needs enough angles/expressions to generalize, but the run is a fixed
 # 1400 steps regardless of count — so more photos cost quality-nothing and time-nothing.
@@ -2404,15 +2412,47 @@ def job_status(req: func.HttpRequest) -> func.HttpResponse:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT status, output_blob_path FROM jobs WHERE job_id = ? AND user_id = ?",
+        "SELECT status, output_blob_path, external_execution_id FROM jobs "
+        "WHERE job_id = ? AND user_id = ?",
         job_id, user_id
     )
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("Not found", status_code=404)
+    status, output_path, exec_id = (row[0] or "").strip(), row[1], row[2]
+
+    # RECONCILE ON READ. A container that is hard-killed -- OOM SIGKILL, node eviction, a
+    # pre-container provisioning failure -- never gets to write its own status, so the row
+    # sits at processing/dispatching until the reaper next runs. The reaper is on a 2-minute
+    # timer, which meant a customer watched a spinner for up to two minutes after their job
+    # was already dead, and their refund waited just as long.
+    #
+    # Checking here makes detection latency the POLL interval instead of the timer interval.
+    # It reuses the reaper's exact logic -- same _DEAD_EXEC_STATES, same guarded
+    # _mark_failed -- so the refund stays exactly-once no matter which of the two gets there
+    # first, and a Succeeded-but-still-processing row is left alone rather than refunded.
+    #
+    # Fails OPEN: if the ACA read errors or is slow, the caller gets the stored status and
+    # the reaper picks it up as before. A status read must never 500 because a control-plane
+    # call did.
+    if status in ("processing", "dispatching") and exec_id:
+        try:
+            from shared.queue_trigger import execution_status
+            state = (execution_status(exec_id) or "").lower()
+        except Exception:
+            logging.exception(
+                f"job_status: could not read execution {exec_id} for job_id={job_id}; "
+                f"returning stored status and leaving it to the reaper")
+            state = ""
+        if state in _DEAD_EXEC_STATES:
+            logging.warning(
+                f"job_status: {status} job_id={job_id} has terminal execution state="
+                f"'{state}' -- failing + refunding on read rather than waiting for the reaper")
+            _mark_failed(job_id)   # guarded transition + one-time refund
+            status = "failed"
 
     return func.HttpResponse(
-        json.dumps({"status": row[0], "output_blob_path": row[1]}),
+        json.dumps({"status": status, "output_blob_path": output_path}),
         mimetype="application/json",
         status_code=200
     )
@@ -4569,7 +4609,6 @@ def reaper(timer: func.TimerRequest):
     # fail+refund now. 'Succeeded' is deliberately excluded: the container writes 'completed'
     # itself, so a Succeeded execution whose row still reads 'processing' is a write race, NOT a
     # refund case (refunding it would hand the user both a refund AND the delivered images).
-    _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
     _stuck_seen = set(stuck)
     for job_id, exec_id, row_status in processing_with_exec:
         if job_id in _stuck_seen:
