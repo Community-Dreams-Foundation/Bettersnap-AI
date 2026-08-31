@@ -280,8 +280,12 @@ class FakeCursor:
             self._fetch = (self.cfg.get("new_invitation_id", "inv-new"),)
 
         # ── accept_invitation ──
+        elif "select email from users where user_id" in s:
+            # The caller address the invite guard compares against. Defaults to a match
+            # so existing cases keep testing what they were written to test.
+            self._fetch = (self.cfg.get("caller_email", "invitee@example.com"),)
         elif "from invitations with (updlock, holdlock)" in s:
-            self._fetch = self.cfg.get("invite_row")  # (id, org_id, status, expires_at) or None
+            self._fetch = self.cfg.get("invite_row")  # (id, org_id, status, expires_at, email) or None
         elif "update invitations set status = 'expired'" in s:
             pass
         elif "select organization_id from organization_members where user_id" in s:
@@ -911,20 +915,57 @@ class AcceptInvitationTests(unittest.TestCase):
             p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
         return resp, conn
 
+    # ── The invite belongs to the address it was sent to ──────────────────
+    def test_a_different_signed_in_account_cannot_consume_the_invite(self):
+        """The invitation was looked up by TOKEN ALONE, with the invited address never
+        compared to the caller. So whoever happened to be signed in when they pressed
+        Accept consumed it: forwarding the mail, or an admin opening a member's link to
+        see what it looked like, burned a paid seat on the wrong person."""
+        from datetime import datetime, timedelta
+        future = datetime.utcnow() + timedelta(days=5)
+        cfg = {
+            "invite_row": ("inv-1", "org-1", "pending", future, "invitee@example.com"),
+            "caller_email": "someone.else@example.com",
+        }
+        resp, conn = self._accept(cfg)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(json.loads(resp.body)["error"], "INVITE_WRONG_ACCOUNT")
+        # And nothing was consumed: no membership, no invite state change.
+        sql = [q.lower() for q, _ in cfg.get("executed", [])]
+        self.assertFalse([q for q in sql if "insert into organization_members" in q])
+        self.assertFalse([q for q in sql if "set status = 'accepted'" in q])
+
+    def test_the_match_is_case_and_whitespace_insensitive(self):
+        """Mail addresses are not case-sensitive in practice, and a stored address can
+        carry stray whitespace. Neither should lock the right person out."""
+        from datetime import datetime, timedelta
+        future = datetime.utcnow() + timedelta(days=5)
+        for caller in ("Invitee@Example.com", " invitee@example.com ", "INVITEE@EXAMPLE.COM"):
+            with self.subTest(caller=caller):
+                cfg = {
+                    "invite_row": ("inv-1", "org-1", "pending", future,
+                                   "invitee@example.com"),
+                    "caller_email": caller,
+                    "org_row": (10, 30, "active"),
+                }
+                resp, _ = self._accept(cfg)
+                self.assertNotEqual(resp.status_code, 403,
+                                    f"{caller} was locked out of their own invite")
+
     def test_unknown_token_returns_404(self):
         resp, conn = self._accept({"invite_row": None})
         self.assertEqual(resp.status_code, 404)
 
     def test_already_accepted_token_returns_409(self):
         resp, conn = self._accept({
-            "invite_row": ("inv-1", "org-1", "accepted", None),
+            "invite_row": ("inv-1", "org-1", "accepted", None, "invitee@example.com"),
         })
         self.assertEqual(resp.status_code, 409)
 
     def test_expired_token_marks_expired_and_returns_410(self):
         from datetime import datetime, timedelta
         past = datetime.utcnow() - timedelta(days=1)
-        cfg = {"invite_row": ("inv-1", "org-1", "pending", past)}
+        cfg = {"invite_row": ("inv-1", "org-1", "pending", past, "invitee@example.com")}
         resp, conn = self._accept(cfg)
         self.assertEqual(resp.status_code, 410)
         executed_sql = [sql.lower() for sql, _ in cfg["executed"]]
@@ -935,7 +976,7 @@ class AcceptInvitationTests(unittest.TestCase):
         from datetime import datetime, timedelta
         future = datetime.utcnow() + timedelta(days=5)
         cfg = {
-            "invite_row": ("inv-1", "org-1", "pending", future),
+            "invite_row": ("inv-1", "org-1", "pending", future, "invitee@example.com"),
             "existing_membership": ("org-OTHER",),
         }
         resp, conn = self._accept(cfg)
@@ -946,7 +987,7 @@ class AcceptInvitationTests(unittest.TestCase):
         from datetime import datetime, timedelta
         future = datetime.utcnow() + timedelta(days=5)
         cfg = {
-            "invite_row": ("inv-1", "org-1", "pending", future),
+            "invite_row": ("inv-1", "org-1", "pending", future, "invitee@example.com"),
             "existing_membership": ("org-1",),  # already in THIS org
         }
         resp, conn = self._accept(cfg)
@@ -957,7 +998,7 @@ class AcceptInvitationTests(unittest.TestCase):
         from datetime import datetime, timedelta
         future = datetime.utcnow() + timedelta(days=5)
         cfg = {
-            "invite_row": ("inv-1", "org-1", "pending", future),
+            "invite_row": ("inv-1", "org-1", "pending", future, "invitee@example.com"),
             "existing_membership": None,
             "org_row": (5, 10, "active"),  # 5 seats purchased
             "active_members": 5,           # all 5 already filled
@@ -970,7 +1011,7 @@ class AcceptInvitationTests(unittest.TestCase):
         from datetime import datetime, timedelta
         future = datetime.utcnow() + timedelta(days=5)
         cfg = {
-            "invite_row": ("inv-1", "org-1", "pending", future),
+            "invite_row": ("inv-1", "org-1", "pending", future, "invitee@example.com"),
             "existing_membership": None,
             "org_row": (10, 10, "active"),  # 10 seats, 10 credits/seat
             "active_members": 3,            # room available
@@ -1171,7 +1212,8 @@ class AcceptInvitationOrgIdCaseTests(unittest.TestCase):
         from datetime import datetime, timedelta
         cfg = {
             "invite_row": ("inv-1", invite_org, "pending",
-                           datetime.utcnow() + timedelta(days=5)),
+                           datetime.utcnow() + timedelta(days=5),
+                           "invitee@example.com"),
             "existing_membership": (existing_org,),
         }
         conn, p1, p2 = _patched(cfg)
