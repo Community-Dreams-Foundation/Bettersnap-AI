@@ -129,6 +129,42 @@ REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "1
 # can never drift apart on what counts as dead.
 _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
 
+
+def _execution_id_for_job(cur, job_id, recorded_execution_id=None):
+    """The ACA execution actually running this job.
+
+    A FUSED train_infer run trains and generates in ONE container, dispatched through the
+    TRAINING path -- so its execution id is recorded on lora_trainings, not on jobs.
+    jobs.external_execution_id stays NULL for the entire run.
+
+    Everything that gated on jobs.external_execution_id was therefore inert for exactly the
+    jobs customers run most (anyone training a new model):
+      * cancel_job skipped stop_execution, so the container kept running and kept burning
+        the A100 while the row already read 'failed' -- cancel looked broken because the
+        database and the GPU disagreed;
+      * job_status could not read the execution state, so a dead job waited out the
+        reaper's 2-minute timer instead of surfacing on the next 3-second poll;
+      * the refund rides on that same transition, so it inherited the delay exactly.
+
+    Migration 034 added lora_trainings.fused_job_id precisely to bind a training to the
+    exact job it will produce, so the id is always reachable -- it was simply never looked
+    up from here. Returns None when the job is not fused and has no execution of its own.
+    """
+    if recorded_execution_id:
+        return recorded_execution_id
+    try:
+        cur.execute(
+            "SELECT TOP 1 external_execution_id FROM lora_trainings "
+            "WHERE fused_job_id = ? AND external_execution_id IS NOT NULL "
+            "ORDER BY created_at DESC",
+            job_id)
+        row = cur.fetchone()
+    except Exception:
+        # Never let this lookup break a status read or a cancel: the caller degrades to the
+        # previous behaviour (the reaper) rather than failing.
+        logging.exception(f"fused execution lookup failed for job_id={job_id}")
+        return None
+    return row[0] if row and row[0] else None
 # ── Identity-LoRA training ────────────────────────────────────────────────
 # DreamBooth needs enough angles/expressions to generalize, but the run is a fixed
 # 1400 steps regardless of count — so more photos cost quality-nothing and time-nothing.
@@ -2519,7 +2555,13 @@ def job_status(req: func.HttpRequest) -> func.HttpResponse:
     # Fails OPEN: if the ACA read errors or is slow, the caller gets the stored status and
     # the reaper picks it up as before. A status read must never 500 because a control-plane
     # call did.
-    if status in ("processing", "dispatching") and exec_id:
+    # waiting_lora is included deliberately: a FUSED run sits in that state while its one
+    # container trains, and if that container dies the job is just as dead as one that had
+    # reached 'processing'. A non-fused job waiting on somebody else's training resolves to
+    # no execution and is left alone.
+    if status in ("processing", "dispatching", "waiting_lora"):
+        exec_id = _execution_id_for_job(cursor, job_id, exec_id)
+    if status in ("processing", "dispatching", "waiting_lora") and exec_id:
         try:
             from shared.queue_trigger import execution_status
             state = (execution_status(exec_id) or "").lower()
@@ -2667,7 +2709,27 @@ def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
                         "window_minutes": CANCEL_WINDOW_MINUTES, "age_seconds": age_sec}),
             mimetype="application/json", status_code=409)
 
-    # 1) Free the GPU immediately: best-effort stop the live container (if its execution is known).
+    # Resolve the execution BEFORE the transition, while the row is still readable. A fused
+    # train_infer run records its execution on lora_trainings, so looking only at
+    # jobs.external_execution_id found nothing and left the A100 running while telling the
+    # customer their job was cancelled.
+    exec_id = _execution_id_for_job(cursor, job_id, exec_id)
+
+    # 1) SETTLE THE MONEY FIRST. This used to stop the container first and settle after,
+    #    which put an Azure long-running operation in front of the customer's answer: the
+    #    cancel could not be confirmed until ACA finished, and the browser gave up at its own
+    #    30s timeout showing "Couldn't cancel" for a cancel that did complete. The refund is
+    #    the part the customer is waiting on and it takes milliseconds, so it goes first.
+    #    The outcome is explicit: the job is terminal in every case, but the refund may be
+    #    OWED rather than paid, and we must not tell the customer otherwise.
+    outcome = _mark_failed(job_id)
+    if outcome == MARK_REFUND_PENDING:
+        logging.error(f"cancel_job: job_id={job_id} cancelled but the refund is PENDING "
+                      f"(target row missing); the compensator will settle it")
+
+    # 2) Free the GPU. Best-effort and deliberately AFTER the refund: stop_execution only
+    #    issues the request (it no longer waits for the operation to finish), but even a
+    #    failure here must not change what the customer is told about their money.
     if exec_id:
         try:
             from shared.queue_trigger import stop_execution
@@ -2675,15 +2737,8 @@ def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as e:
             logging.warning(f"cancel_job: stop_execution failed for job_id={job_id}: {e}")
 
-    # 2) Mark failed + refund SYNCHRONOUSLY (guarded transition, one-time refund).
-    #    The outcome is explicit: the job is terminal in every case, but the refund may be
-    #    OWED rather than paid, and we must not tell the customer otherwise.
-    outcome = _mark_failed(job_id)
-    if outcome == MARK_REFUND_PENDING:
-        logging.error(f"cancel_job: job_id={job_id} cancelled but the refund is PENDING "
-                      f"(target row missing); the compensator will settle it")
     logging.info(f"cancel_job: user={user_id} cancelled job_id={job_id} (was '{status}') "
-                 f"outcome={outcome}")
+                 f"outcome={outcome} execution={exec_id}")
     return func.HttpResponse(
         json.dumps({"job_id": str(job_id), "status": "failed", "cancelled": True,
                     # Honest about the money: the cancellation always succeeds, but the
@@ -4681,9 +4736,22 @@ def reaper(timer: func.TimerRequest):
         # scoping the early reconcile to 'processing' left exactly the retryable class waiting
         # out the full REAPER_DISPATCHING_MINUTES window before anyone looked at it.
         cur.execute(
-            "SELECT job_id, external_execution_id, status FROM jobs "
-            "WHERE status IN ('processing', 'dispatching') "
-            "AND external_execution_id IS NOT NULL"
+            # OUTER APPLY, not a JOIN: a job can accumulate SEVERAL fused trainings across
+            # retries, and a plain join would return the same job once per attempt and
+            # reconcile it repeatedly. TOP 1 by created_at takes the live one.
+            #
+            # waiting_lora is in scope because a FUSED run sits there while its single
+            # container trains; without this the reaper never looked at a training that had
+            # already died, and the job waited out the full dispatching/stuck window.
+            "SELECT j.job_id, COALESCE(j.external_execution_id, t.external_execution_id), "
+            "       j.status "
+            "FROM jobs j "
+            "OUTER APPLY (SELECT TOP 1 lt.external_execution_id FROM lora_trainings lt "
+            "             WHERE lt.fused_job_id = j.job_id "
+            "               AND lt.external_execution_id IS NOT NULL "
+            "             ORDER BY lt.created_at DESC) t "
+            "WHERE j.status IN ('processing', 'dispatching', 'waiting_lora') "
+            "AND COALESCE(j.external_execution_id, t.external_execution_id) IS NOT NULL"
         )
         processing_with_exec = [(str(r[0]), r[1], r[2]) for r in cur.fetchall()]
     finally:

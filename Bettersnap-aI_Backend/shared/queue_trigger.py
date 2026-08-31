@@ -437,8 +437,17 @@ def stop_execution(execution_name: str, job_name: str = JOB_NAME) -> bool:
     credential = DefaultAzureCredential()
     client = ContainerAppsAPIClient(credential, SUBSCRIPTION_ID)
     try:
-        client.jobs.begin_stop_execution(RESOURCE_GROUP, job_name, execution_name).result()
-        logging.info(f"stopped ACA execution={execution_name} (job={job_name})")
+        # DO NOT block on .result(). begin_stop_execution issues the stop request and returns
+        # a poller; .result() then waited for the whole long-running operation to finish,
+        # unbounded, INSIDE the caller's HTTP request. cancel_job therefore hung on Azure
+        # while the browser gave up at its own 30s timeout, showing "Couldn't cancel" for a
+        # cancel the server went on to complete — the row said cancelled, the customer was
+        # told it failed.
+        #
+        # The stop is ACCEPTED once this call returns without raising; waiting for the
+        # container to actually exit buys the caller nothing.
+        client.jobs.begin_stop_execution(RESOURCE_GROUP, job_name, execution_name)
+        logging.info(f"stop requested for ACA execution={execution_name} (job={job_name})")
         return True
     except Exception as e:
         logging.warning(f"stop_execution: could not stop {execution_name}: {e}")

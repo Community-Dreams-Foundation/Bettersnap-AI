@@ -539,7 +539,58 @@ class P1_4_PerItemIsolation(unittest.TestCase):
         """A pre-container failure can never reach 'processing', so scoping the early
         reconcile to 'processing' left exactly the retryable class waiting the full window."""
         body = self.body("reaper")
-        self.assertIn("status IN ('processing', 'dispatching')", body)
+        # waiting_lora joined the list when fused train_infer runs were brought into scope:
+        # such a run sits there while its single container trains, and a container that dies
+        # in that phase is just as dead as one that reached 'processing'.
+        self.assertIn("'processing', 'dispatching', 'waiting_lora'", body)
+
+    def test_cancel_settles_the_refund_before_touching_the_container(self):
+        """The customer is waiting on their MONEY, not on Azure.
+
+        cancel_job used to stop the container first and settle after, putting an Azure
+        long-running operation in front of the answer. The browser gives up at 30s, so a slow
+        stop showed "Couldn't cancel" for a cancel the server went on to complete — the row
+        said cancelled, the customer was told it failed."""
+        body = self.body("cancel_job")
+        refund_at = body.index("_mark_failed(job_id)")
+        stop_at = body.index("stop_execution(exec_id)")
+        self.assertLess(refund_at, stop_at,
+                        "the refund must be settled before the container stop")
+
+    def test_cancel_resolves_a_fused_execution(self):
+        """Without this the A100 kept running while the row read 'failed'."""
+        self.assertIn("_execution_id_for_job(cursor, job_id, exec_id)",
+                      self.body("cancel_job"))
+
+    def test_stop_execution_does_not_block_on_the_long_running_operation(self):
+        """begin_stop_execution issues the request; .result() then waited for the whole
+        Azure operation to finish INSIDE the caller's HTTP request."""
+        import os
+        backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(backend, "shared", "queue_trigger.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        start = src.index("def stop_execution(")
+        nxt = src.find(chr(10) + "def ", start + 1)
+        body = src[start:nxt] if nxt != -1 else src[start:]
+        # Strip comments: this file EXPLAINS why .result() was removed, and the
+        # explanation must not be mistaken for the call itself.
+        code = chr(10).join(line for line in body.splitlines()
+                            if not line.lstrip().startswith("#"))
+        self.assertIn("begin_stop_execution(", code)
+        self.assertNotIn(".result()", code,
+                         "waiting for the stop to finish blocks the caller's HTTP request")
+
+    def test_reaper_early_reconcile_sees_fused_executions(self):
+        """A FUSED train_infer run records its execution on lora_trainings, not on jobs, so
+        a query keyed only on jobs.external_execution_id skipped exactly the jobs customers
+        run most and left them to time out instead of reconciling."""
+        body = self.body("reaper")
+        self.assertIn("lora_trainings", body)
+        self.assertIn("fused_job_id", body)
+        self.assertIn("COALESCE(j.external_execution_id, t.external_execution_id)", body)
+        # OUTER APPLY, not JOIN: retries can leave several trainings pointing at one job and
+        # a join would reconcile it once per attempt.
+        self.assertIn("OUTER APPLY", body)
 
     def test_reaper_recovery_excludes_handled_executions(self):
         body = self.body("reaper")

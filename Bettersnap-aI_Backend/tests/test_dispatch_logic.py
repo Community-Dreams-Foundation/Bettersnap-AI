@@ -2419,9 +2419,29 @@ class JobStatusReconcileTests(unittest.TestCase):
             function_app, "_mark_failed", return_value="terminalized").start()
         self.addCleanup(mock.patch.stopall)
 
-    def _row(self, status, exec_id="exec-1", output=None):
-        self._db.return_value.cursor.return_value.fetchone.return_value = (
-            status, output, exec_id)
+    def _row(self, status, exec_id="exec-1", output=None, fused_exec=None):
+        """Script the two DIFFERENT reads job_status makes.
+
+        A single fetchone value for both is not good enough any more: the fused lookup
+        would read the job row's first column as an execution id and the test would pass
+        for the wrong reason."""
+        class _Cur:
+            def __init__(self):
+                self._fetch = None
+                self.rowcount = 0
+
+            def execute(self, sql, *params):
+                q = " ".join(sql.lower().split())
+                if "from lora_trainings" in q:
+                    self._fetch = (fused_exec,) if fused_exec else None
+                else:
+                    self._fetch = (status, output, exec_id)
+                return self
+
+            def fetchone(self):
+                return self._fetch
+
+        self._db.return_value.cursor.return_value = _Cur()
 
     def _call(self):
         req = _HttpRequest()
@@ -2492,6 +2512,32 @@ class JobStatusReconcileTests(unittest.TestCase):
             _, body = self._call()
         self.assertEqual(body["status"], "dispatching")
         ex.assert_not_called()
+
+    def test_a_FUSED_run_is_reconciled_through_its_training(self):
+        """A fused train_infer run records its execution on lora_trainings, not on jobs.
+
+        jobs.external_execution_id stays NULL for the whole run, so every gate keyed on it
+        was inert for exactly the jobs customers run most: cancel could not stop the
+        container, and a dead job waited out the reaper instead of surfacing on the next
+        poll. Observed in production -- four consecutive jobs, all NULL, all fused."""
+        for status in ("processing", "dispatching", "waiting_lora"):
+            with self.subTest(status=status):
+                self._mark.reset_mock()
+                self._row(status, exec_id=None, fused_exec="bettersnapai-if-fused")
+                with mock.patch("shared.queue_trigger.execution_status",
+                                return_value="Failed") as ex:
+                    _, body = self._call()
+                ex.assert_called_once_with("bettersnapai-if-fused")
+                self.assertEqual(body["status"], "failed")
+                self._mark.assert_called_once()
+
+    def test_a_job_with_neither_execution_is_still_left_alone(self):
+        self._row("processing", exec_id=None, fused_exec=None)
+        with mock.patch("shared.queue_trigger.execution_status") as ex:
+            _, body = self._call()
+        self.assertEqual(body["status"], "processing")
+        ex.assert_not_called()
+        self._mark.assert_not_called()
 
     def test_reaper_and_job_status_share_one_definition_of_dead(self):
         """Two copies of this set would silently drift, and the drift would be invisible
