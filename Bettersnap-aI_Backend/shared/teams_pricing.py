@@ -39,7 +39,7 @@ from typing import Any, Dict, Tuple
 # version it stored no longer matches. Bump it whenever any number below changes, so
 # in-flight checkouts priced under the old contract fail closed instead of silently
 # fulfilling at a stale price.
-PRICING_VERSION = "teams_basic_v1"
+PRICING_VERSION = "teams_basic_v2"
 PLAN_ID = "teams_basic"
 PLAN_NAME = "BetterSnap Teams - Basic"
 CURRENCY = "usd"
@@ -99,6 +99,64 @@ def _assert_bands_wellformed() -> None:
 
 _assert_bands_wellformed()
 
+
+# ── v2: one rate for the whole order, and the rate improves with size ────────
+# v1 was GRADUATED: the first 9 seats cost $35 each even on a 40-seat order, so a big
+# team never saw its own discount applied to the seats it had already bought. v2 gives
+# EVERY seat the same price, and that price falls as the order grows:
+#
+#     unit(n) = V2_BASE_UNIT_CENTS - V2_STEP_CENTS * (n - MIN_SEATS)
+#     total(n) = n * unit(n)
+#
+# Anchored on the two prices that were specified: 10 seats -> $32.00/seat,
+# 20 seats -> $29.00/seat. The step follows from those two points, it is not a
+# free parameter: (3200 - 2900) / (20 - 10) = 30 cents per additional seat.
+V2_BASE_UNIT_CENTS = 3200      # the rate at exactly MIN_SEATS
+V2_STEP_CENTS = 30             # the rate improves by this much per additional seat
+
+# A floor on the per-seat price, in cents. 0 disables it. With no floor the rate reaches
+# $20.30 at the 49-seat maximum -- a 42% discount off the v1 list price of $35. That is a
+# direct consequence of the two anchor points and the linear rule they imply, not a bug;
+# raising this to e.g. 2500 caps the discount without disturbing the anchors, because the
+# floor only engages above 33 seats.
+V2_UNIT_FLOOR_CENTS = 0
+
+
+def v2_unit_cents(seats: int) -> int:
+    """The per-seat price every seat in an order of this size pays."""
+    unit = V2_BASE_UNIT_CENTS - V2_STEP_CENTS * (seats - MIN_SEATS)
+    return max(unit, V2_UNIT_FLOOR_CENTS) if V2_UNIT_FLOOR_CENTS else unit
+
+
+def _assert_v2_monotonic() -> None:
+    """Fail at IMPORT time if a bigger order could ever cost LESS than a smaller one.
+
+    This is the failure mode that flat per-seat pricing invites and graduated pricing
+    cannot have. With tiered flat rates, 24 seats at $32 ($768) costs more than 25 seats
+    at $29 ($725) -- so the rational customer buys a seat they do not need, and support
+    fields the difference. The smooth rule here avoids it, but only for a range of step
+    values, so the property is ASSERTED rather than assumed: change the constants above
+    and the process refuses to start rather than shipping a price list with a hole in it.
+
+    Also refuses a non-positive unit price at any legal size.
+    """
+    previous_total = -1
+    for n in range(MIN_SEATS, MAX_SEATS + 1):
+        unit = v2_unit_cents(n)
+        if unit <= 0:
+            raise ValueError(
+                f"teams_pricing: v2 unit price is {unit} at {n} seats; "
+                f"lower V2_STEP_CENTS or set V2_UNIT_FLOOR_CENTS")
+        total = n * unit
+        if total <= previous_total:
+            raise ValueError(
+                f"teams_pricing: v2 total is not increasing at {n} seats "
+                f"({total} <= {previous_total}); a customer would pay MORE for fewer "
+                f"seats. Lower V2_STEP_CENTS or raise V2_UNIT_FLOOR_CENTS.")
+        previous_total = total
+
+
+_assert_v2_monotonic()
 
 # ── Errors ───────────────────────────────────────────────────────────────────
 # Distinct types, because the HTTP layer maps them to DIFFERENT responses: an invalid
@@ -239,20 +297,15 @@ def quote(seats: Any) -> TeamsQuote:
     if count < MIN_SEATS:
         raise BelowMinimumSeats(count)
 
-    charges = []
-    total = 0
-    for band in BANDS:
-        # Seats of THIS order falling inside this band. Bands entirely above the order
-        # yield <= 0 and contribute nothing.
-        in_band = min(count, band.upper) - band.lower + 1
-        if in_band <= 0:
-            continue
-        subtotal = in_band * band.unit_cents
-        total += subtotal
-        charges.append(BandCharge(
-            lower=band.lower, upper=band.upper, unit_cents=band.unit_cents,
-            seats=in_band, subtotal_cents=subtotal,
-        ))
+    # v2: EVERY seat pays the same rate, and the rate improves with order size. The
+    # breakdown keeps the band shape so one validator, one snapshot format and one UI
+    # render both versions -- a v2 order is simply a single band spanning the whole order.
+    unit = v2_unit_cents(count)
+    total = count * unit
+    charges = [BandCharge(
+        lower=1, upper=count, unit_cents=unit,
+        seats=count, subtotal_cents=total,
+    )]
 
     # Round half up in integer arithmetic — no float, so no representation drift.
     effective = (total + count // 2) // count
@@ -472,8 +525,126 @@ def validate_teams_basic_v1_snapshot(snapshot: Dict[str, Any],
 #: The ONLY versions that may be recovered and fulfilled. Anything not listed here —
 #: unknown, or deliberately retired — fails closed. Add a v2 entry alongside v1 when v2
 #: ships; do NOT replace v1 while v1 orders may still be in flight.
+# ── v2 fulfilment contract ───────────────────────────────────────────────────
+# FROZEN BY VALUE, exactly like _V1_SPEC and for the same reason: a v2 order must keep
+# validating unchanged after a v3 ships. Nothing here reads the live V2_* constants, so
+# editing those to launch a new price list cannot retroactively invalidate money already
+# taken under this one.
+_V2_SPEC = {
+    "plan_id": "teams_basic",
+    "currencies": frozenset({"usd"}),
+    "min_seats": 10,
+    "max_seats": 49,
+    "credits_per_seat": 30,
+    "base_unit_cents": 3200,
+    "step_cents": 30,
+    "unit_floor_cents": 0,
+}
+
+
+def _v2_expected_unit(seats: int) -> int:
+    """The per-seat price v2 authorised for an order of this size."""
+    unit = _V2_SPEC["base_unit_cents"] - _V2_SPEC["step_cents"] * (seats - _V2_SPEC["min_seats"])
+    floor = _V2_SPEC["unit_floor_cents"]
+    return max(unit, floor) if floor else unit
+
+
+def validate_teams_basic_v2_snapshot(snapshot: Dict[str, Any],
+                                     session: Dict[str, Any]) -> list:
+    """Prove a `teams_basic_v2` payment matches what was authorised. Returns problems.
+
+    v2 charges ONE rate for the whole order, so the breakdown is a single band spanning
+    every seat. That is checked structurally rather than trusted: a bare total would let a
+    tampered amount through as long as it looked plausible.
+    """
+    problems = []
+    spec = _V2_SPEC
+
+    if snapshot.get("plan_id") != spec["plan_id"]:
+        problems.append(f"plan_id {snapshot.get('plan_id')!r} is not the v2 Basic plan")
+
+    currency = (snapshot.get("currency") or "").lower()
+    if currency not in spec["currencies"]:
+        problems.append(f"currency {currency!r} is not supported under v2")
+
+    try:
+        seats = int(snapshot.get("seats"))
+    except (TypeError, ValueError):
+        problems.append(f"seats {snapshot.get('seats')!r} is not a whole number")
+        return problems
+    if not (spec["min_seats"] <= seats <= spec["max_seats"]):
+        problems.append(
+            f"seats {seats} is outside the v2 self-serve range "
+            f"{spec['min_seats']}..{spec['max_seats']}")
+        return problems
+
+    if snapshot.get("credits_per_seat") != spec["credits_per_seat"]:
+        problems.append(
+            f"credits_per_seat {snapshot.get('credits_per_seat')!r} is not "
+            f"{spec['credits_per_seat']} as v2 requires")
+
+    try:
+        total = int(snapshot.get("expected_total_cents"))
+    except (TypeError, ValueError):
+        problems.append("authorised total is not a whole number of cents")
+        return problems
+
+    expected_unit = _v2_expected_unit(seats)
+    expected_total = seats * expected_unit
+    if total != expected_total:
+        problems.append(
+            f"authorised total {total} is not {expected_total} "
+            f"({seats} seats x {expected_unit})")
+
+    bands = snapshot.get("breakdown")
+    if not isinstance(bands, list) or not bands:
+        problems.append("the stored band breakdown is missing or malformed")
+        return problems
+    if len(bands) != 1:
+        problems.append(
+            f"v2 charges one rate for the whole order, so it must have exactly one "
+            f"band; found {len(bands)}")
+        return problems
+
+    band = bands[0]
+    try:
+        lower = int(band["from_seat"])
+        upper = int(band["to_seat"])
+        count = int(band["seats"])
+        unit = int(band["unit_price_cents"])
+        subtotal = int(band["subtotal_cents"])
+    except (KeyError, TypeError, ValueError):
+        problems.append("the stored band is malformed")
+        return problems
+
+    if lower != 1 or upper != seats or count != seats:
+        problems.append(
+            f"the band must cover every seat 1..{seats}; got {lower}..{upper} "
+            f"covering {count}")
+    if unit != expected_unit:
+        problems.append(f"unit price {unit} is not the v2 price {expected_unit} at {seats} seats")
+    if subtotal != count * unit:
+        problems.append(f"band subtotal {subtotal} is not {count} x {unit}")
+    if subtotal != total:
+        problems.append(f"band subtotal {subtotal} does not equal the authorised total {total}")
+
+    # Finally: what Stripe actually collected must equal what was authorised.
+    amount = session.get("amount_total")
+    if amount is not None and int(amount) != total:
+        problems.append(f"Stripe collected {amount} but {total} was authorised")
+    session_currency = (session.get("currency") or currency or "").lower()
+    if session_currency and session_currency != currency:
+        problems.append(
+            f"Stripe currency {session_currency!r} is not the authorised {currency!r}")
+
+    return problems
+
+
 SUPPORTED_PRICING_VERSIONS = {
+    # v1 stays registered FOREVER. Orders paid under it must keep fulfilling and
+    # reconciling long after v2 became current -- that is the whole point of the registry.
     "teams_basic_v1": validate_teams_basic_v1_snapshot,
+    "teams_basic_v2": validate_teams_basic_v2_snapshot,
 }
 
 

@@ -37,39 +37,49 @@ from shared.teams_pricing import (
 
 
 def reference_total_cents(seats):
-    """Independent re-derivation of the contract, written from the prose, not the code.
+    """Independent re-derivation of the v2 contract, written from the prose, not the code.
 
-    Deliberately naive — one pass per seat, no band arithmetic — so it cannot share a
-    bug with the implementation's `min(count, band.upper) - band.lower + 1` clamp.
+    The prose: "every seat pays the same rate, and the rate improves as the team grows —
+    $32.00 per seat at 10 seats, $29.00 per seat at 20." Two points on a straight line fix
+    it completely: the rate drops (3200 - 2900) / (20 - 10) = 30 cents per extra seat.
+
+    Derived here from the ANCHORS rather than from V2_BASE_UNIT_CENTS / V2_STEP_CENTS, so
+    it cannot agree with the implementation by sharing its constants.
     """
-    total = 0
-    for seat_number in range(1, seats + 1):
-        if seat_number <= 9:
-            total += 3500
-        elif seat_number <= 24:
-            total += 3200
-        else:
-            total += 2900
-    return total
+    rate_at_10, rate_at_20 = 3200, 2900
+    step = (rate_at_10 - rate_at_20) // 10
+    unit = rate_at_10 - step * (seats - 10)
+    return seats * unit
 
 
 class TestContractExamples(unittest.TestCase):
-    """The three totals stated in the approved business contract."""
+    """The prices stated for v2: one rate for the whole order, improving with size."""
 
-    def test_ten_seats_is_347_dollars(self):
-        # 9 x $35 + 1 x $32. NOT 10 x $32 = $320 — the whole point of graduated pricing.
-        self.assertEqual(quote(10).total_cents, 34_700)
+    def test_ten_seats_is_thirty_two_dollars_per_seat(self):
+        q = quote(10)
+        self.assertEqual(q.total_cents, 32_000)
+        self.assertEqual(q.effective_price_per_seat_cents, 3200)
 
-    def test_twenty_four_seats_is_795_dollars(self):
-        self.assertEqual(quote(24).total_cents, 79_500)
+    def test_twenty_seats_is_twenty_nine_dollars_per_seat(self):
+        q = quote(20)
+        self.assertEqual(q.total_cents, 58_000)
+        self.assertEqual(q.effective_price_per_seat_cents, 2900)
 
-    def test_twenty_five_seats_is_824_dollars(self):
-        self.assertEqual(quote(25).total_cents, 82_400)
+    def test_every_seat_pays_the_same_rate(self):
+        """The v1 -> v2 change in one assertion. Under v1 a 10-seat order paid 9 seats at
+        $35 and one at $32 ($347); under v2 the discount applies to the WHOLE order."""
+        for seats in (10, 20, 33, 49):
+            with self.subTest(seats=seats):
+                q = quote(seats)
+                self.assertEqual(q.total_cents % seats, 0,
+                                 "total must divide evenly: one rate for every seat")
+                self.assertEqual(q.total_cents, seats * q.effective_price_per_seat_cents)
 
-    def test_ten_seats_is_not_the_flat_band_price(self):
-        """Guards the single most likely misreading of the table."""
-        self.assertNotEqual(quote(10).total_cents, 10 * 3200)
-
+    def test_a_bigger_team_always_gets_a_better_rate(self):
+        rates = [quote(n).effective_price_per_seat_cents
+                 for n in range(MIN_SEATS, MAX_SEATS + 1)]
+        for smaller, larger in zip(rates, rates[1:]):
+            self.assertLess(larger, smaller, "the rate must improve as the team grows")
 
 class TestAgainstIndependentReference(unittest.TestCase):
     def test_every_legal_seat_count_matches_reference(self):
@@ -192,15 +202,17 @@ class TestQuoteShape(unittest.TestCase):
             with self.subTest(seats=seats):
                 self.assertEqual(sum(b.seats for b in q.breakdown), seats)
 
-    def test_breakdown_reports_the_bands_actually_used(self):
-        ten = quote(10).breakdown
-        self.assertEqual(len(ten), 2)
-        self.assertEqual((ten[0].seats, ten[0].unit_cents), (9, 3500))
-        self.assertEqual((ten[1].seats, ten[1].unit_cents), (1, 3200))
-
-        twenty_five = quote(25).breakdown
-        self.assertEqual(len(twenty_five), 3)
-        self.assertEqual([b.seats for b in twenty_five], [9, 15, 1])
+    def test_breakdown_is_one_band_covering_the_whole_order(self):
+        """v2 charges one rate, so the breakdown is a single band spanning every seat.
+        The shape is kept from v1 deliberately: one snapshot format, one validator and one
+        UI render both versions."""
+        for seats in (10, 25, 49):
+            with self.subTest(seats=seats):
+                bands = quote(seats).breakdown
+                self.assertEqual(len(bands), 1)
+                b = bands[0]
+                self.assertEqual((b.lower, b.upper, b.seats), (1, seats, seats))
+                self.assertEqual(b.subtotal_cents, seats * b.unit_cents)
 
     def test_quote_is_immutable(self):
         """Frozen so a caller cannot edit the price between quoting and charging."""
@@ -218,8 +230,9 @@ class TestQuoteShape(unittest.TestCase):
             "total_credits", "total_cents", "effective_price_per_seat_cents", "breakdown",
         ):
             self.assertIn(key, payload)
-        self.assertEqual(len(payload["breakdown"]), 3)
-        self.assertEqual(payload["total_cents"], 82_400)
+        self.assertEqual(len(payload["breakdown"]), 1)
+        # 25 seats at 3200 - 30*(25-10) = 2750 each.
+        self.assertEqual(payload["total_cents"], 25 * 2750)
 
 
 class TestSeatValidation(unittest.TestCase):

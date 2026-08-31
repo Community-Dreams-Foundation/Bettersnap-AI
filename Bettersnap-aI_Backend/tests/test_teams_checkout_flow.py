@@ -48,7 +48,7 @@ ATT1 = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
 #: unknown-version subtests passed vacuously.
 _UNSET = object()
 
-def _quote_row(user=ADMIN, org=ORG, seats=10, total=34_700, credits=30,
+def _quote_row(user=ADMIN, org=ORG, seats=10, total=_UNSET, credits=30,
                version=None, status="issued", expires_in=1800, consumed_by=None,
                breakdown=_UNSET):
     """Row shape returned by teams_checkout.load_quote_for_update's SELECT.
@@ -60,7 +60,13 @@ def _quote_row(user=ADMIN, org=ORG, seats=10, total=34_700, credits=30,
     omit it entirely, which is precisely why they did not catch the loader dropping it.
     """
     expires = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=expires_in)
-    bands = _v1_bands(seats) if breakdown is _UNSET else breakdown
+    is_v1 = (version or teams_pricing.PRICING_VERSION) == "teams_basic_v1"
+    if breakdown is _UNSET:
+        bands = _v1_bands(seats) if is_v1 else _v2_band(seats)
+    else:
+        bands = breakdown
+    if total is _UNSET:
+        total = _v1_total(seats) if is_v1 else _v2_total(seats)
     return (QUOTE, user, org, seats, total, credits,
             version or teams_pricing.PRICING_VERSION, teams_pricing.PLAN_ID, "usd",
             expires, status, consumed_by,
@@ -71,25 +77,33 @@ def _quote_row(user=ADMIN, org=ORG, seats=10, total=34_700, credits=30,
 #: The band breakdown as it is persisted on an attempt — the authorised terms recovery
 #: must replay verbatim rather than recomputing.
 LIVE_BREAKDOWN = [
-    {"from_seat": 1, "to_seat": 9, "unit_price_cents": 3500, "seats": 9,
-     "subtotal_cents": 31_500},
-    {"from_seat": 10, "to_seat": 24, "unit_price_cents": 3200, "seats": 1,
-     "subtotal_cents": 3200},
+    {"from_seat": 1, "to_seat": 10, "unit_price_cents": 3200,
+     "seats": 10, "subtotal_cents": 32_000},
 ]
 
 
 def _live(attempt_id, quote_id=QUOTE, status="pending", url="https://checkout.stripe.com/c/1",
-          session_id="cs_live", seats=10, total=34_700, credits=30,
+          session_id="cs_live", seats=10, total=_UNSET, credits=30,
           version=None, breakdown=None, idem=None):
-    """Row shape returned by teams_checkout.find_live_attempt's SELECT."""
+    """Row shape returned by teams_checkout.find_live_attempt's SELECT.
+
+    Total and breakdown follow the attempt's OWN pricing version, so a fixture pinned to
+    a superseded version stays internally consistent when the current one moves on.
+    """
+    resolved = version or teams_pricing.PRICING_VERSION
+    is_v1 = resolved == "teams_basic_v1"
+    if total is _UNSET:
+        total = _v1_total(seats) if is_v1 else _v2_total(seats)
+    if breakdown is None:
+        breakdown = _v1_bands(seats) if is_v1 else _v2_band(seats)
     return (attempt_id, session_id, url, quote_id,
             idem if idem is not None else teams_checkout.idempotency_key(ORG, quote_id),
             status, seats, credits, total,
-            version or teams_pricing.PRICING_VERSION, "usd", teams_pricing.PLAN_ID,
-            json.dumps(LIVE_BREAKDOWN if breakdown is None else breakdown))
+            resolved, "usd", teams_pricing.PLAN_ID,
+            json.dumps(breakdown))
 
 
-def _paid_session(session_id="cs_1", org=ORG, amount=34_700, currency="usd",
+def _paid_session(session_id="cs_1", org=ORG, amount=32_000, currency="usd",
                   seats=10, credits=30, created=None):
     s = {
         "id": session_id, "amount_total": amount, "currency": currency,
@@ -100,6 +114,22 @@ def _paid_session(session_id="cs_1", org=ORG, amount=34_700, currency="usd",
     if created is not None:
         s["created"] = created
     return s
+
+
+def _v1_total(seats):
+    """The GRADUATED total v1 charged, for fixtures that still exercise v1."""
+    return sum(3500 if n <= 9 else 3200 if n <= 24 else 2900 for n in range(1, seats + 1))
+
+
+def _v2_band(seats):
+    """The v2 breakdown: ONE band covering the whole order at a single rate."""
+    unit = 3200 - 30 * (seats - 10)
+    return [{"from_seat": 1, "to_seat": seats, "unit_price_cents": unit,
+             "seats": seats, "subtotal_cents": seats * unit}]
+
+
+def _v2_total(seats):
+    return seats * (3200 - 30 * (seats - 10))
 
 
 def _v1_bands(seats):
@@ -116,7 +146,7 @@ def _v1_bands(seats):
 
 
 
-def _snapshot(org=ORG, seats=10, credits=30, total=34_700, currency="usd",
+def _snapshot(org=ORG, seats=10, credits=30, total=_UNSET, currency="usd",
               version=_UNSET, status="pending", attempt=ATT1, breakdown=_UNSET,
               plan=_UNSET):
     """Row shape returned by function_app._load_checkout_snapshot's SELECT.
@@ -124,7 +154,13 @@ def _snapshot(org=ORG, seats=10, credits=30, total=34_700, currency="usd",
     The last element is breakdown_json — the version's validator proves the bands are
     contiguous, complete and correctly priced rather than trusting a bare total.
     """
-    bands = _v1_bands(seats) if breakdown is _UNSET else breakdown
+    is_v1 = (version or teams_pricing.PRICING_VERSION) == "teams_basic_v1"
+    if breakdown is _UNSET:
+        bands = _v1_bands(seats) if is_v1 else _v2_band(seats)
+    else:
+        bands = breakdown
+    if total is _UNSET:
+        total = _v1_total(seats) if is_v1 else _v2_total(seats)
     return (org,
             teams_pricing.PRICING_VERSION if version is _UNSET else version,
             teams_pricing.PLAN_ID if plan is _UNSET else plan,
@@ -236,17 +272,18 @@ class QuoteValidation(unittest.TestCase):
         """Body seats/total are ignored entirely; the stored quote is authoritative."""
         resp, m, _, _ = _checkout(
             {"quote_id": QUOTE, "seats": 49, "total_cents": 1},
-            cfg={"quote_row": _quote_row(seats=10, total=34_700)})
+            cfg={"quote_row": _quote_row(seats=10, total=32_000)})
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(json.loads(resp.body)["total_cents"], 34_700)
+        self.assertEqual(json.loads(resp.body)["total_cents"], 32_000)
         self.assertEqual(m.call_args[0][2].seats, 10)
 
     def test_displayed_total_disagreement_is_refused(self):
-        resp, m, _, _ = _checkout({"quote_id": QUOTE, "quoted_total_cents": 32_000},
+        # A number the client claims that the stored quote does not agree with.
+        resp, m, _, _ = _checkout({"quote_id": QUOTE, "quoted_total_cents": 99_999},
                                   cfg={"quote_row": _quote_row()})
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(json.loads(resp.body)["error"], "QUOTE_STALE")
-        self.assertEqual(json.loads(resp.body)["total_cents"], 34_700)
+        self.assertEqual(json.loads(resp.body)["total_cents"], 32_000)
         m.assert_not_called()
 
     def test_quote_is_consumed_exactly_once(self):
@@ -543,7 +580,7 @@ class StrandedAttemptRecovery(unittest.TestCase):
         resp, m, _, _ = self._recover(
             _quote_row(status="consumed", consumed_by=ATT1),
             _live(ATT1, status="creating", url=None, session_id=None,
-                  total=34_700,
+                  total=32_000,
                   breakdown=[{"from_seat": 1, "to_seat": 9, "unit_price_cents": 1,
                               "seats": 9, "subtotal_cents": 9}]))
         self.assertEqual(resp.status_code, 502)
@@ -554,7 +591,11 @@ class QuoteFromSnapshot(unittest.TestCase):
     def test_rebuilds_without_recomputing(self):
         q = teams_pricing.quote_from_snapshot(
             seats=25, credits_per_seat=30, total_cents=82_400,
-            breakdown=LIVE_BREAKDOWN[:1] + [
+            # Explicit v1 bands: this proves a SUPERSEDED version rebuilds verbatim,
+            # so it must not borrow whatever shape the current version happens to use.
+            breakdown=[
+                {"from_seat": 1, "to_seat": 9, "unit_price_cents": 3500, "seats": 9,
+                 "subtotal_cents": 31_500},
                 {"from_seat": 10, "to_seat": 24, "unit_price_cents": 3200, "seats": 15,
                  "subtotal_cents": 48_000},
                 {"from_seat": 25, "to_seat": 49, "unit_price_cents": 2900, "seats": 1,
@@ -877,10 +918,11 @@ class PricingQuoteEndpoint(unittest.TestCase):
 
     def test_prices_ten_seats_at_the_contract_total(self):
         body = json.loads(self._call({"seats": 10}).body)
-        self.assertEqual(body["total_cents"], 34_700)
+        # v2: every seat at $32.00, so one band and a total that divides evenly.
+        self.assertEqual(body["total_cents"], 32_000)
         self.assertEqual(body["credits_per_seat"], 30)
         self.assertEqual(body["total_credits"], 300)
-        self.assertEqual(len(body["breakdown"]), 2)
+        self.assertEqual(len(body["breakdown"]), 1)
 
     def test_the_quote_is_persisted_with_everything_checkout_will_validate(self):
         cfg = {}
@@ -888,7 +930,7 @@ class PricingQuoteEndpoint(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         params = cfg["issued_quote_params"]
         self.assertIn(25, params)                              # seats
-        self.assertIn(82_400, params)                          # total_cents
+        self.assertIn(68_750, params)                          # total_cents (25 x 2750)
         self.assertIn(30, params)                              # credits_per_seat
         self.assertIn(teams_pricing.PRICING_VERSION, params)   # contract
         self.assertIn(ADMIN, [str(p) for p in params])         # owner
@@ -953,21 +995,22 @@ class WebhookFulfilment(unittest.TestCase):
         self.assertEqual(grant[0][0], 30)
 
     def test_seats_become_authoritative_at_fulfilment(self):
-        cfg = {"checkout_snapshot": _snapshot(seats=25, total=82_400),
+        cfg = {"checkout_snapshot": _snapshot(seats=25, total=68_750),
                "webhook_org_row": (ADMIN, 10)}
-        self._run(cfg, _paid_session(amount=82_400, seats=25))
+        self._run(cfg, _paid_session(amount=68_750, seats=25))
         self.assertTrue(
             any("UPDATE organizations SET seats_purchased" in s for s, _ in cfg["executed"]))
 
     def test_mismatches_fail_closed(self):
         cases = {
-            "underpayment": (_snapshot(), _paid_session(amount=32_000)),
+            "underpayment": (_snapshot(), _paid_session(amount=1_000)),
             "overpayment": (_snapshot(), _paid_session(amount=99_999)),
             "currency": (_snapshot(currency="usd"), _paid_session(currency="eur")),
-            "seats": (_snapshot(seats=10), _paid_session(seats=25)),
+            "seats": (_snapshot(seats=10), _paid_session(seats=25, amount=68_750)),
             "version": (_snapshot(version="teams_basic_v0"), _paid_session()),
-            "impossible snapshot": (_snapshot(seats=10, total=32_000),
-                                    _paid_session(amount=32_000)),
+            # A total no legal 10-seat order could carry under any supported version.
+            "impossible snapshot": (_snapshot(seats=10, total=99_999),
+                                    _paid_session(amount=99_999)),
             "other org": (_snapshot(org=OTHER_ORG), _paid_session(org=ORG)),
         }
         for name, (snap, session) in cases.items():
@@ -1348,7 +1391,7 @@ class CheckoutStatusEndpoint(unittest.TestCase):
             p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
 
     def _row(self, session_status="paid", org_status="active", admin=ADMIN):
-        return (ORG, session_status, 10, 30, 34_700, "usd",
+        return (ORG, session_status, 10, 30, 32_000, "usd",
                 teams_pricing.PRICING_VERSION, org_status, admin)
 
     def test_requires_a_session_id(self):
@@ -1491,7 +1534,7 @@ class BreakdownTravelsFromQuoteToAttempt(unittest.TestCase):
                                     cfg={"quote_row": _quote_row()})
         self.assertEqual(resp.status_code, 200)
         stored = json.loads(self._attempt_params(cfg)[self.BREAKDOWN_PARAM])
-        self.assertEqual(stored, _v1_bands(10))
+        self.assertEqual(stored, _v2_band(10))
         self.assertTrue(stored, "an empty breakdown makes the payment unfulfillable")
 
     def test_what_checkout_STORES_is_what_fulfilment_ACCEPTS(self):
@@ -1505,11 +1548,11 @@ class BreakdownTravelsFromQuoteToAttempt(unittest.TestCase):
             "plan_id": teams_pricing.PLAN_ID,
             "pricing_version": teams_pricing.PRICING_VERSION,
             "currency": "usd", "seats": 10, "credits_per_seat": 30,
-            "expected_total_cents": 34_700, "breakdown": stored,
+            "expected_total_cents": 32_000, "breakdown": stored,
         }
-        session = {"amount_total": 34_700, "currency": "usd"}
+        session = {"amount_total": 32_000, "currency": "usd"}
         self.assertEqual(
-            teams_pricing.validate_teams_basic_v1_snapshot(snapshot, session), [],
+            teams_pricing.snapshot_validator(teams_pricing.PRICING_VERSION)(snapshot, session), [],
             "what checkout stored was rejected by fulfilment")
 
     def test_a_quote_with_no_breakdown_is_refused_before_stripe_is_called(self):
