@@ -84,6 +84,19 @@ PLANS = {
         max_attires=5, max_backgrounds=5, category_rule="mixable",
         plan_type="one_time", credits_per_image=1,
     ),
+    # ── Teams (a purchased SEAT, not a personal purchase) ──
+    # A seat is a Basic pack bought by an organization on a member's behalf: the Teams
+    # contract is 30 headshots per seat at $35 for the first band -- the same price and the
+    # same image count as Basic. Without this entry a team member fell through to
+    # DEFAULT_PLAN_KEY ("trial"), so someone holding 30 paid seat credits was shown
+    # "Free Trial" and CAPPED AT A 4-IMAGE SESSION. price_usd is 0 because the member
+    # themselves pays nothing; the organization already did.
+    "teams_basic": Plan(
+        key="teams_basic", name="Team", price_usd=0, image_count=30,
+        max_attires=2, max_backgrounds=2, category_rule="single_type",
+        plan_type="one_time", credits_per_image=1,
+    ),
+
     # ── Monthly (recurring) ──
     "monthly_basic": Plan(
         key="monthly_basic", name="Basic (Monthly)", price_usd=25, image_count=20,

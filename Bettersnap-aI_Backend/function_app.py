@@ -1480,7 +1480,16 @@ def get_profile(req: func.HttpRequest) -> func.HttpResponse:
     # Resolve the plan so the client gets its limits (max_attires / max_backgrounds /
     # category_rule) + image_count alongside the raw plan key — same source the
     # backend enforces against, so client and server never disagree.
-    plan = get_plan(row[4])
+    #
+    # A TEAM MEMBER IS ON THEIR SEAT, NOT ON users.plan_name. That column is set to the
+    # default ("trial") at registration and only ever moves on a personal purchase, which a
+    # member never makes -- so it stayed "trial" forever. The studio therefore showed a
+    # person holding 30 paid seat credits "Free Trial", and capped them at a 4-IMAGE
+    # session, because trial's limits are what it enforced against.
+    plan_key = row[4]
+    if _active_org_seat(cursor, user_id) is not None:
+        plan_key = "teams_basic"
+    plan = get_plan(plan_key)
     return func.HttpResponse(
         json.dumps({
             "user_id": row[0],
@@ -7803,7 +7812,7 @@ def accept_invitation(req: func.HttpRequest) -> func.HttpResponse:
         # UPDLOCK/HOLDLOCK: hold the invite row for the life of the transaction so a
         # double-click can't have two requests both read 'pending' and both insert.
         cur.execute("""
-            SELECT invitation_id, organization_id, status, expires_at
+            SELECT invitation_id, organization_id, status, expires_at, email
             FROM invitations WITH (UPDLOCK, HOLDLOCK)
             WHERE token = ?
         """, invite_token)
@@ -7813,7 +7822,29 @@ def accept_invitation(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({"error": "INVALID_INVITE"}),
                 mimetype="application/json", status_code=404)
 
-        invitation_id, org_id, inv_status, expires_at = inv
+        invitation_id, org_id, inv_status, expires_at, invited_email = inv
+
+        # THE INVITE BELONGS TO THE ADDRESS IT WAS SENT TO.
+        # This used to look the invitation up by TOKEN ALONE and never compare the invited
+        # address to the caller, so whoever happened to be signed in when they pressed
+        # Accept consumed it. Forwarding the email -- or an admin opening a member's link
+        # to see what it looked like -- was enough to burn a paid seat on the wrong person,
+        # and the seat is not recoverable without an operator. Bound now, case-insensitively
+        # because mail addresses are not case-sensitive in practice.
+        cur.execute("SELECT email FROM users WHERE user_id = ?", user_id)
+        caller = cur.fetchone()
+        caller_email = (caller[0] if caller else "") or ""
+        if caller_email.strip().lower() != (invited_email or "").strip().lower():
+            conn.rollback()
+            logging.warning(
+                f"accept_invitation: invitation {invitation_id} was sent to "
+                f"{invited_email!r} but is being accepted by {caller_email!r}; refused")
+            return func.HttpResponse(
+                json.dumps({"error": "INVITE_WRONG_ACCOUNT",
+                            "invited_email": invited_email,
+                            "message": "This invitation was sent to a different email "
+                                       "address. Sign in as that address to accept it."}),
+                mimetype="application/json", status_code=403)
 
         if inv_status != "pending":
             # 409, not 404: the link is real, it has just been used or revoked.
