@@ -2667,5 +2667,75 @@ class OrgPaymentReceiptTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIsNone(body["latest_payment"])
 
+class TeamSeatPlanTests(unittest.TestCase):
+    """A team member is on their SEAT, not on users.plan_name.
+
+    That column is set to the default ("trial") at registration and only moves on a
+    personal purchase, which a member never makes. So it stayed "trial" forever, and the
+    studio both LABELLED a person holding 30 paid seat credits "Free Trial" and CAPPED
+    them at a 4-image session -- trial's limits are what it enforced. The cap is the real
+    damage: they paid for 30 headshots and could take 4 at a time.
+    """
+
+    #: users row: user_id, email, full_name, credits_remaining, plan_name, ...
+    USER_ROW = ("user-1", "m@example.com", "Member", 4, "trial", None, None, None, None)
+    SEAT = ("org-1", "acme.inc", 30, 30, "active", 30)
+
+    def _profile(self, seat):
+        outer = self
+
+        class _Cur:
+            def __init__(self):
+                self._fetch = None
+
+            def execute(self, sql, *params):
+                q = " ".join(sql.lower().split())
+                if "from organization_members m" in q:
+                    self._fetch = seat
+                elif "plan_name" in q:
+                    self._fetch = outer.USER_ROW
+                return self
+
+            def fetchone(self):
+                return self._fetch
+
+        conn = mock.Mock()
+        conn.cursor.return_value = _Cur()
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {}
+        patches = [
+            mock.patch.object(function_app, "get_db", return_value=conn),
+            mock.patch.object(function_app, "get_user_id", return_value="user-1"),
+        ]
+        for pt in patches:
+            pt.start()
+        try:
+            res = function_app.get_profile(req)
+        finally:
+            for pt in patches:
+                pt.stop()
+        return json.loads(res.body)
+
+    def test_a_member_gets_the_seat_plan_and_its_real_allowance(self):
+        body = self._profile(self.SEAT)
+        self.assertEqual(body["plan_name"], "teams_basic")
+        self.assertEqual(body["plan"]["image_count"], 30)
+        self.assertNotEqual(body["plan"]["image_count"], 4,
+                            "a paid member was capped at the trial session size")
+
+    def test_an_individual_keeps_their_own_plan(self):
+        body = self._profile(None)
+        self.assertEqual(body["plan_name"], "trial")
+        self.assertEqual(body["plan"]["image_count"], 4)
+
+    def test_the_seat_plan_is_a_real_catalog_entry(self):
+        """It must be resolvable by get_plan, or the studio silently falls back to the
+        default and the cap returns."""
+        from shared.plans import PLANS, DEFAULT_PLAN_KEY
+        self.assertIn("teams_basic", PLANS)
+        self.assertNotEqual("teams_basic", DEFAULT_PLAN_KEY)
+        self.assertEqual(PLANS["teams_basic"].image_count, 30)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1480,7 +1480,16 @@ def get_profile(req: func.HttpRequest) -> func.HttpResponse:
     # Resolve the plan so the client gets its limits (max_attires / max_backgrounds /
     # category_rule) + image_count alongside the raw plan key — same source the
     # backend enforces against, so client and server never disagree.
-    plan = get_plan(row[4])
+    #
+    # A TEAM MEMBER IS ON THEIR SEAT, NOT ON users.plan_name. That column is set to the
+    # default ("trial") at registration and only ever moves on a personal purchase, which a
+    # member never makes -- so it stayed "trial" forever. The studio therefore showed a
+    # person holding 30 paid seat credits "Free Trial", and capped them at a 4-IMAGE
+    # session, because trial's limits are what it enforced against.
+    plan_key = row[4]
+    if _active_org_seat(cursor, user_id) is not None:
+        plan_key = "teams_basic"
+    plan = get_plan(plan_key)
     return func.HttpResponse(
         json.dumps({
             "user_id": row[0],
