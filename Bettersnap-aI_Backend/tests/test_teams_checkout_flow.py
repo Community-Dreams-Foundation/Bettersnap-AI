@@ -43,16 +43,29 @@ OTHER_ORG = "22222222-3333-4444-8555-666666666666"
 ATT1 = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
 
 
+#: Distinguishes "caller did not specify" from "caller explicitly passed None/''".
+#: Without it, `_snapshot(version=None)` silently became a VALID v1 snapshot and the
+#: unknown-version subtests passed vacuously.
+_UNSET = object()
+
 def _quote_row(user=ADMIN, org=ORG, seats=10, total=34_700, credits=30,
-               version=None, status="issued", expires_in=1800, consumed_by=None):
+               version=None, status="issued", expires_in=1800, consumed_by=None,
+               breakdown=_UNSET):
     """Row shape returned by teams_checkout.load_quote_for_update's SELECT.
 
     expires_at is NAIVE, exactly as SQL Server returns it.
+
+    breakdown_json is the LAST column and is not optional: reserve_attempt copies it onto
+    the attempt, and fulfilment validates the payment against it. These fixtures used to
+    omit it entirely, which is precisely why they did not catch the loader dropping it.
     """
     expires = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=expires_in)
+    bands = _v1_bands(seats) if breakdown is _UNSET else breakdown
     return (QUOTE, user, org, seats, total, credits,
             version or teams_pricing.PRICING_VERSION, teams_pricing.PLAN_ID, "usd",
-            expires, status, consumed_by)
+            expires, status, consumed_by,
+            None if bands is None else
+            bands if isinstance(bands, str) else json.dumps(bands))
 
 
 #: The band breakdown as it is persisted on an attempt — the authorised terms recovery
@@ -101,11 +114,6 @@ def _v1_bands(seats):
         lower = lo + n
     return out
 
-
-#: Distinguishes "caller did not specify" from "caller explicitly passed None/''".
-#: Without it, `_snapshot(version=None)` silently became a VALID v1 snapshot and the
-#: unknown-version subtests passed vacuously.
-_UNSET = object()
 
 
 def _snapshot(org=ORG, seats=10, credits=30, total=34_700, currency="usd",
@@ -1449,6 +1457,80 @@ class ReturnUrlAllowlist(unittest.TestCase):
         success, _ = function_app._teams_checkout_urls({})
         self.assertIn("{CHECKOUT_SESSION_ID}", success)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The band breakdown must survive the trip from quote to attempt
+# ═══════════════════════════════════════════════════════════════════════════
+class BreakdownTravelsFromQuoteToAttempt(unittest.TestCase):
+    """A LIVE money bug this suite failed to catch, reproduced.
+
+    reserve_attempt read quote_row.get("breakdown") -- a key load_quote_for_update never
+    selected -- and `or []` turned that None into an empty list that looked entirely
+    valid. So every attempt was written with an EMPTY breakdown, and every paid Teams
+    checkout was then refused at fulfilment by validate_teams_basic_v1_snapshot ("the
+    stored band breakdown is missing or malformed"): the customer was charged, the
+    workspace stayed pending_payment, and no credits were granted. Observed in production
+    on a real $347 payment (org 790E84DC, attempt 2B7E9865) whose quote held the correct
+    two bands while its attempt held [].
+
+    These fixtures previously omitted breakdown_json altogether, which is exactly why the
+    suite agreed with the bug instead of catching it.
+    """
+
+    def _attempt_params(self, cfg):
+        rows = [p for st, p in cfg["executed"]
+                if "INSERT INTO organization_checkout_sessions" in st]
+        self.assertEqual(len(rows), 1, "exactly one attempt row must be inserted")
+        return rows[0]
+
+    #: position of breakdown_json in reserve_attempt's INSERT parameter list
+    BREAKDOWN_PARAM = 10
+
+    def test_the_attempt_stores_the_quotes_real_bands(self):
+        resp, m, cfg, _ = _checkout({"quote_id": QUOTE},
+                                    cfg={"quote_row": _quote_row()})
+        self.assertEqual(resp.status_code, 200)
+        stored = json.loads(self._attempt_params(cfg)[self.BREAKDOWN_PARAM])
+        self.assertEqual(stored, _v1_bands(10))
+        self.assertTrue(stored, "an empty breakdown makes the payment unfulfillable")
+
+    def test_what_checkout_STORES_is_what_fulfilment_ACCEPTS(self):
+        """Closes the loop. The create path and the webhook path are validated against
+        the same bytes, so the two can never again disagree about what a valid attempt
+        looks like."""
+        resp, m, cfg, _ = _checkout({"quote_id": QUOTE},
+                                    cfg={"quote_row": _quote_row()})
+        stored = json.loads(self._attempt_params(cfg)[self.BREAKDOWN_PARAM])
+        snapshot = {
+            "plan_id": teams_pricing.PLAN_ID,
+            "pricing_version": teams_pricing.PRICING_VERSION,
+            "currency": "usd", "seats": 10, "credits_per_seat": 30,
+            "expected_total_cents": 34_700, "breakdown": stored,
+        }
+        session = {"amount_total": 34_700, "currency": "usd"}
+        self.assertEqual(
+            teams_pricing.validate_teams_basic_v1_snapshot(snapshot, session), [],
+            "what checkout stored was rejected by fulfilment")
+
+    def test_a_quote_with_no_breakdown_is_refused_before_stripe_is_called(self):
+        """An attempt that could never be fulfilled must not be created, and the customer
+        must never reach a payment page for it.
+
+        This surfaces as a 500 rather than a mapped 4xx, which is right: once the loader
+        carries the breakdown, a quote without one is a SERVER defect, not something the
+        customer did. What matters is that it fails CLOSED -- no charge can be taken
+        against terms fulfilment would later refuse."""
+        for bad in (None, [], "", "not json"):
+            with self.subTest(breakdown=bad):
+                resp, m, cfg, _ = _checkout(
+                    {"quote_id": QUOTE},
+                    cfg={"quote_row": _quote_row(breakdown=bad)})
+                self.assertGreaterEqual(resp.status_code, 400)
+                m.assert_not_called()          # no Stripe session, so no way to pay
+                self.assertFalse(
+                    [st for st, _ in cfg["executed"]
+                     if "INSERT INTO organization_checkout_sessions" in st],
+                    "no unfulfillable attempt may be recorded")
 
 if __name__ == "__main__":
     unittest.main()

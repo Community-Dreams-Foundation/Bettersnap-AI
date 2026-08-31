@@ -58,6 +58,15 @@ def _mod(name, **attrs):
     return m
 
 
+#: breakdown_json as teams_quotes stores it for a 10-seat v1 quote. Not optional:
+#: reserve_attempt copies it onto the attempt and fulfilment validates against it.
+_V1_10_SEAT_BANDS = json.dumps([
+    {"from_seat": 1, "to_seat": 9, "unit_price_cents": 3500,
+     "seats": 9, "subtotal_cents": 31_500},
+    {"from_seat": 10, "to_seat": 24, "unit_price_cents": 3200,
+     "seats": 1, "subtotal_cents": 3200},
+])
+
 class _FakeFunctionApp:
     def __init__(self, *a, **k):
         pass
@@ -624,7 +633,8 @@ class PaymentGatingTests(unittest.TestCase):
         _exp = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
         _qid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
         cfg["quote_row"] = (_qid, GATING_ADMIN, None, 10, 34700, 30,
-                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None)
+                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None,
+                            _V1_10_SEAT_BANDS)
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(GATING_ADMIN)
         flag = _teams_checkout_on(); flag.start()
@@ -661,7 +671,8 @@ class PaymentGatingTests(unittest.TestCase):
         _exp = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
         _qid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
         cfg["quote_row"] = (_qid, GATING_ADMIN, None, 10, 34700, 30,
-                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None)
+                            "teams_basic_v1", "teams_basic", "usd", _exp, "issued", None,
+                            _V1_10_SEAT_BANDS)
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(GATING_ADMIN)
         flag = _teams_checkout_on(); flag.start()
@@ -1017,7 +1028,8 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
         cfg = {
             "payment_intent_org_row": (stored_admin, 10, "pending_payment"),
             "quote_row": (quote_id, caller, None, 10, 34700, 30,
-                          "teams_basic_v1", "teams_basic", "usd", expires, "issued", None),
+                          "teams_basic_v1", "teams_basic", "usd", expires, "issued", None,
+                          _V1_10_SEAT_BANDS),
         }
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(caller)

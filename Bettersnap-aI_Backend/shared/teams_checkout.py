@@ -63,6 +63,7 @@ BOUNDED MANUAL PROCEDURE, when automatic recovery cannot settle an attempt
       Both statements in ONE transaction, guarded on status = 'creating'.
   4. Never delete the attempt row: it is the audit trail for a session that may exist.
 """
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -220,7 +221,6 @@ def issue_quote(cur, user_id, organization_id, quote, ttl_seconds: int = QUOTE_T
     `quote` is a shared.teams_pricing.TeamsQuote. Every field that checkout will later
     validate against is stored HERE, so consumption never has to trust the client.
     """
-    import json
 
     quote_id = str(uuid.uuid4())
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
@@ -244,7 +244,7 @@ def load_quote_for_update(cur, quote_id):
     cur.execute(
         """SELECT quote_id, user_id, organization_id, seats, total_cents,
                   credits_per_seat, pricing_version, plan_id, currency,
-                  expires_at, status, consumed_by_attempt
+                  expires_at, status, consumed_by_attempt, breakdown_json
            FROM teams_quotes WITH (UPDLOCK, HOLDLOCK)
            WHERE quote_id = ?""",
         quote_id,
@@ -254,8 +254,16 @@ def load_quote_for_update(cur, quote_id):
         return None
     keys = ("quote_id", "user_id", "organization_id", "seats", "total_cents",
             "credits_per_seat", "pricing_version", "plan_id", "currency",
-            "expires_at", "status", "consumed_by_attempt")
-    return dict(zip(keys, row))
+            "expires_at", "status", "consumed_by_attempt", "breakdown_json")
+    quote_row = dict(zip(keys, row))
+    # The band breakdown is part of what the customer was quoted, and fulfilment validates
+    # the payment against it. It MUST travel from the quote onto the attempt -- see
+    # reserve_attempt, where omitting it silently made every Teams payment unfulfillable.
+    try:
+        quote_row["breakdown"] = json.loads(quote_row["breakdown_json"] or "[]")
+    except (TypeError, ValueError):
+        quote_row["breakdown"] = None   # malformed; reserve_attempt refuses rather than guesses
+    return quote_row
 
 
 def _same_id(left, right) -> bool:
@@ -453,10 +461,22 @@ def reserve_attempt(cur, organization_id, quote_row, user_id, quote_id, expires_
     Returns the new attempt_id. The caller MUST commit before calling Stripe: the whole
     point is that no Stripe Session can exist without this row already durable.
     """
-    import json
 
     attempt_id = str(uuid.uuid4())
     expires = expires_at or checkout_session_expires_at()
+
+    # FAIL LOUDLY on a missing breakdown. This used to read quote_row.get("breakdown"),
+    # a key load_quote_for_update never returned, and `or []` turned that None into an
+    # empty list that looked perfectly valid. Every attempt was therefore written with an
+    # empty band breakdown, and every paid Teams checkout was then REFUSED at fulfilment by
+    # validate_teams_basic_v1_snapshot ("the stored band breakdown is missing or
+    # malformed") -- money taken, workspace never activated, and nothing in the create path
+    # complained. An attempt that cannot be fulfilled must never be created in the first
+    # place, so this raises instead of defaulting.
+    breakdown = quote_row.get("breakdown")
+    if not isinstance(breakdown, list) or not breakdown:
+        raise QuoteMalformed(
+            "That quote is missing its price breakdown. Please price your team again.")
     cur.execute(
         """INSERT INTO organization_checkout_sessions
             (attempt_id, organization_id, quote_id, idempotency_key, pricing_version,
@@ -467,7 +487,7 @@ def reserve_attempt(cur, organization_id, quote_row, user_id, quote_id, expires_
         idempotency_key(organization_id, quote_id),
         quote_row["pricing_version"], quote_row["plan_id"], quote_row["seats"],
         quote_row["credits_per_seat"], quote_row["total_cents"], quote_row["currency"],
-        json.dumps(quote_row.get("breakdown") or []), str(user_id),
+        json.dumps(breakdown), str(user_id),
         expires.replace(tzinfo=None) if expires.tzinfo else expires,
     )
     # PRIMARY KEY on organization_id: a concurrent request that got past the applock
