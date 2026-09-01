@@ -1255,44 +1255,50 @@ def teams_checkout_status(req: func.HttpRequest) -> func.HttpResponse:
 def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
     try:
-        payload = validate_token(token)
-        user_id = payload["oid"]
+        user_id = get_user_id(token)
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     organization_id = req.route_params.get("organization_id")
+    try:
+        limit = max(1, min(100, int(req.params.get("limit", "50"))))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(req.params.get("offset", "0")))
+    except (TypeError, ValueError):
+        offset = 0
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT admin_user_id, name, seats_purchased, status FROM organizations WHERE organization_id = ?",
-        organization_id,
+        "SELECT organization_id, admin_user_id, name, seats_purchased, status "
+        "FROM organizations WHERE organization_id = ? AND admin_user_id = ?",
+        organization_id, user_id,
     )
     row = cur.fetchone()
     if not row:
         return func.HttpResponse("Organization not found", status_code=404)
-    admin_user_id, name, seats_purchased, status = row
-    if str(admin_user_id).lower() != str(user_id).lower():
-        return func.HttpResponse("Forbidden", status_code=403)
+    organization_id, admin_user_id, name, seats_purchased, status = row
 
-    cur.execute(
-        "SELECT COUNT(*) FROM organization_members WHERE organization_id = ? AND status = 'active'",
-        organization_id,
+    roster = _organization_roster_payload(
+        cur, organization_id, seats_purchased, active_only=True,
+        limit=limit, offset=offset, admin_user_id=admin_user_id,
     )
-    members_joined = cur.fetchone()[0]
-
-    cur.execute(
-        "SELECT COALESCE(SUM(credits_remaining), 0) FROM organization_members "
-        "WHERE organization_id = ? AND status = 'active'",
-        organization_id,
-    )
-    credits_remaining_total = cur.fetchone()[0]
+    members_joined = roster["seats_used"]
+    credits_remaining_total = sum(member["credits_remaining"] or 0 for member in roster["members"])
 
     cur.execute(
         "SELECT status, COUNT(*) FROM jobs WHERE organization_id = ? GROUP BY status",
         organization_id,
     )
     job_status_counts = {r[0]: r[1] for r in cur.fetchall()}
+    generation_totals = {
+        "total_jobs": sum(job_status_counts.values()),
+        "completed_jobs": job_status_counts.get("completed", 0),
+        "in_progress_jobs": sum(job_status_counts.get(status, 0) for status in ("waiting_lora", "queued", "dispatching", "processing")),
+        "failed_jobs": job_status_counts.get("failed", 0),
+    }
 
     # WHAT THE TEAM PAID. organization_payments recorded the charge from the moment
     # fulfilment landed, but nothing ever read it back -- the table had inserts and no
@@ -1322,13 +1328,18 @@ def org_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps({
-            "organization_id": organization_id,
+            "organization_id": str(organization_id),
             "name": name,
             "status": status,
             "seats_purchased": seats_purchased,
             "members_joined": members_joined,
             "credits_remaining_total": credits_remaining_total,
             "job_status_counts": job_status_counts,
+            "generation_totals": generation_totals,
+            "seats_used": roster["seats_used"],
+            "seats_available": roster["seats_available"],
+            "members": roster["members"],
+            "pending_invitations": roster["pending_invitations"],
             # Receipt for the purchase that activated this workspace. null before payment.
             "latest_payment": latest_payment,
         }),
@@ -2583,7 +2594,102 @@ def job_status(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
+
+@app.route(route="jobs/{job_id}/details", methods=["GET"])
+def user_job_details(req: func.HttpRequest) -> func.HttpResponse:
+    """One owner-authorized history job, used by direct session links.
+
+    History itself is paginated; this keeps a link to an older session valid without
+    re-introducing an unbounded jobs query.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    job_id = _route_job_id(req)
+    if job_id is None:
+        return func.HttpResponse("Not found", status_code=404)
+    cursor = get_db().cursor()
+    cursor.execute(
+        "SELECT job_id, status, job_type, category, job_params, output_blob_path, created_at, completed_at "
+        "FROM jobs WHERE job_id = ? AND user_id = ?",
+        job_id,
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return func.HttpResponse("Not found", status_code=404)
+    try:
+        job_params = json.loads(row[4]) if row[4] else {}
+    except (TypeError, ValueError):
+        job_params = {}
+    return func.HttpResponse(
+        json.dumps({
+            "job_id": str(row[0]),
+            "status": row[1],
+            "job_type": row[2],
+            "category": row[3],
+            "job_params": job_params,
+            "input_blob_path": "",
+            "output_blob_path": _output_blob_paths(row[5]),
+            "created_at": _utc_iso(row[6]),
+            "completed_at": _utc_iso(row[7]),
+        }),
+        mimetype="application/json",
+        status_code=200,
+    )
+
 # ── Get Result URL (SAS) ──────────────────────────────────
+def _output_blob_paths(value):
+    """Normalize the legacy JSON-or-string output column into blob paths."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [path for path in value if path]
+    try:
+        parsed = json.loads(value)
+        paths = parsed if isinstance(parsed, list) else [parsed]
+    except (TypeError, ValueError):
+        paths = [value]
+    return [path for path in paths if path]
+
+
+def _signed_result_urls(blob_paths):
+    """Create owner-authorized, short-lived output URLs for known blob paths."""
+    if not blob_paths:
+        return []
+    blob_client = get_blob_client()
+    account_name = blob_client.account_name
+    account_key = get_secret("storage-account-key")
+    expiry = datetime.now(timezone.utc) + timedelta(hours=2)
+    urls = []
+    for blob_name in blob_paths:
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name="outputs",
+            blob_name=blob_name,
+            account_key=account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry,
+        )
+        urls.append(f"https://{account_name}.blob.core.windows.net/outputs/{blob_name}?{sas_token}")
+    return urls
+
+
+def _result_urls_available(subscription_type, created_at, completed_at):
+    """Whether a dashboard summary may mint result URLs under retention policy."""
+    if subscription_type in ("monthly", "organization"):
+        return True
+    reference_time = completed_at or created_at
+    if reference_time is None:
+        return False
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - reference_time <= timedelta(days=RETENTION_DAYS)
+
+
 @app.route(route="jobs/{job_id}/result-url", methods=["GET"])
 def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -2611,20 +2717,7 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400
         )
 
-    # The inference container stores output_blob_path as json.dumps([...]) — a
-    # JSON array of the 4 result blobs (results/<job>/headshot_N.png). The old
-    # code fed that raw string into generate_blob_sas as a single blob_name, so
-    # the SAS pointed at a non-existent blob literally named '["results/..."]'
-    # and every download 404'd. Parse the array and mint one SAS per image.
-    # Backward-compatible: a legacy single-path string still yields one URL.
-    raw = row[1]
-    try:
-        blob_paths = json.loads(raw)
-        if not isinstance(blob_paths, list):
-            blob_paths = [raw]
-    except (TypeError, ValueError):
-        blob_paths = [raw]
-    blob_paths = [p for p in blob_paths if p]
+    blob_paths = _output_blob_paths(row[1])
     if not blob_paths:
         return func.HttpResponse(
             json.dumps({"error": "No output blobs recorded for this job"}),
@@ -2632,24 +2725,7 @@ def job_result_url(req: func.HttpRequest) -> func.HttpResponse:
             status_code=404
         )
 
-    blob_client = get_blob_client()
-    account_name = blob_client.account_name
-    account_key = get_secret("storage-account-key")
-    expiry = datetime.now(timezone.utc) + timedelta(hours=2)
-
-    urls = []
-    for blob_name in blob_paths:
-        sas_token = generate_blob_sas(
-            account_name=account_name,
-            container_name="outputs",
-            blob_name=blob_name,
-            account_key=account_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=expiry
-        )
-        urls.append(
-            f"https://{account_name}.blob.core.windows.net/outputs/{blob_name}?{sas_token}"
-        )
+    urls = _signed_result_urls(blob_paths)
 
     return func.HttpResponse(
         # `urls` is the full set; `url` kept for any client still reading a single
@@ -2804,28 +2880,25 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
 
     conn = get_db()
     cursor = conn.cursor()
+    try:
+        limit = max(1, min(100, int(req.params.get("limit", "20"))))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        offset = max(0, int(req.params.get("offset", "0")))
+    except (TypeError, ValueError):
+        offset = 0
+
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE user_id = ?", user_id)
+    total = int(cursor.fetchone()[0] or 0)
     cursor.execute("""
-        SELECT job_id, status, job_type, category, output_blob_path, created_at
+        SELECT job_id, status, job_type, category, output_blob_path, created_at, completed_at
         FROM jobs
         WHERE user_id = ?
         ORDER BY created_at DESC
-    """, user_id)
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """, user_id, offset, limit)
     rows = cursor.fetchall()
-
-    def _paths(v):
-        """output_blob_path is stored as a JSON STRING (main.py json.dumps's the list), but
-        the API contract — and every client — expects a real array. Returning the raw column
-        meant the dashboard's "Photos Generated" count could never work: it can't count the
-        images in an opaque string. Parse it here, once, at the boundary."""
-        if not v:
-            return []
-        if isinstance(v, list):
-            return v
-        try:
-            parsed = json.loads(v)
-            return parsed if isinstance(parsed, list) else [parsed]
-        except (TypeError, ValueError):
-            return [v]          # legacy rows that stored a bare path
 
     jobs = [
         {
@@ -2833,16 +2906,80 @@ def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
             "status": r[1],
             "job_type": r[2],
             "category": r[3],
-            "output_blob_path": _paths(r[4]),
-            "created_at": _utc_iso(r[5])
+            "output_blob_path": _output_blob_paths(r[4]),
+            "created_at": _utc_iso(r[5]),
+            "completed_at": _utc_iso(r[6]),
         }
         for r in rows
     ]
 
     return func.HttpResponse(
-        json.dumps({"jobs": jobs}),
+        json.dumps({"jobs": jobs, "total": total, "limit": limit, "offset": offset}),
         mimetype="application/json",
         status_code=200
+    )
+
+
+@app.route(route="users/dashboard-summary", methods=["GET"])
+def user_dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
+    """The customer dashboard's bounded, one-request read model.
+
+    The page used to fan out into separate balance, subscription, full-history, training,
+    and per-job URL calls. This endpoint intentionally returns only the six cards the
+    dashboard can display and signs only those completed jobs' outputs.
+    """
+    token = req.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        user_id = get_user_id(token)
+    except Exception:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    subscription = _subscription_status_payload(cursor, user_id)
+    if subscription is None:
+        return func.HttpResponse("User not found", status_code=404)
+
+    cursor.execute(
+        "SELECT COALESCE(SUM(CASE WHEN ISJSON(job_params) = 1 "
+        "THEN COALESCE(TRY_CONVERT(int, JSON_VALUE(job_params, '$.image_count')), 0) "
+        "ELSE 0 END), 0) FROM jobs WHERE user_id = ? AND status = 'completed'",
+        user_id,
+    )
+    total_images_generated = int(cursor.fetchone()[0] or 0)
+
+    cursor.execute("""
+        SELECT TOP 6 job_id, status, job_type, category, output_blob_path, created_at, completed_at
+        FROM jobs
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+    """, user_id)
+    recent_jobs = []
+    for row in cursor.fetchall():
+        blob_paths = _output_blob_paths(row[4])
+        urls_available = (
+            row[1] == "completed"
+            and _result_urls_available(subscription.get("subscription_type"), row[5], row[6])
+        )
+        recent_jobs.append({
+            "job_id": str(row[0]),
+            "status": row[1],
+            "job_type": row[2],
+            "category": row[3],
+            "output_blob_path": blob_paths,
+            "created_at": _utc_iso(row[5]),
+            "completed_at": _utc_iso(row[6]),
+            "result_urls": _signed_result_urls(blob_paths) if urls_available else [],
+        })
+
+    return func.HttpResponse(
+        json.dumps({
+            "subscription": subscription,
+            "total_images_generated": total_images_generated,
+            "recent_jobs": recent_jobs,
+        }),
+        mimetype="application/json",
+        status_code=200,
     )
 
 # ── Get Attires ───────────────────────────────────────────
@@ -5169,6 +5306,80 @@ def _add_one_month(dt):
     return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
 
 
+def _subscription_status_payload(cursor, user_id):
+    """Return the subscription response shared by billing and dashboard reads.
+
+    Keeping this shape in one place prevents the performance summary endpoint from
+    drifting from the existing billing contract, especially around split monthly and
+    one-time credit balances.
+    """
+    cursor.execute(
+        "SELECT subscription_plan, subscription_type, credits_remaining, "
+        "credits_monthly_limit, subscription_renewed_at, payment_failed_at, "
+        "subscription_cancel_at, one_time_credits_remaining, "
+        "monthly_credits_remaining FROM users WHERE user_id = ?",
+        user_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    cursor.execute(
+        "SELECT purchase_type, plan_key FROM pending_purchases "
+        "WHERE user_id = ? AND status = 'pending'",
+        user_id)
+    prow = cursor.fetchone()
+    queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
+
+    seat = _active_org_seat(cursor, user_id)
+    if seat is not None:
+        return {
+            "subscription_plan": "teams_basic",
+            "subscription_type": "organization",
+            "plan": "teams_basic",
+            "type": "organization",
+            "credits_remaining": seat["credits_remaining"],
+            "one_time_credits_remaining": seat["credits_remaining"],
+            "monthly_credits_remaining": 0,
+            "credits_monthly_limit": None,
+            "monthly_quota": None,
+            "subscription_renewed_at": None,
+            "next_renewal": None,
+            "renewal_date": None,
+            "payment_failed": False,
+            "payment_failed_at": None,
+            "cancel_pending": False,
+            "cancel_at": None,
+            "queued_purchase": queued_purchase,
+            "organization": seat,
+        }
+
+    next_renewal = None
+    if row[1] == "monthly" and row[4]:
+        next_renewal = str(_add_one_month(row[4]))
+
+    return {
+        "subscription_plan": row[0],
+        "subscription_type": row[1],
+        "plan": row[0],
+        "type": row[1],
+        "credits_remaining": row[2] if row[1] == "monthly" else row[7],
+        "one_time_credits_remaining": row[7],
+        "add_on_credits_remaining": row[7],
+        "monthly_credits_remaining": row[8] if row[1] == "monthly" else 0,
+        "credits_monthly_limit": row[3] if row[1] == "monthly" else None,
+        "monthly_quota": row[3] if row[1] == "monthly" else None,
+        "subscription_renewed_at": _utc_iso(row[4]) if row[1] == "monthly" else None,
+        "next_renewal": next_renewal,
+        "renewal_date": next_renewal,
+        "payment_failed": bool(row[5]),
+        "payment_failed_at": _utc_iso(row[5]),
+        "cancel_pending": bool(row[6]),
+        "cancel_at": _utc_iso(row[6]),
+        "queued_purchase": queued_purchase,
+    }
+
+
 @app.route(route="subscriptions/status", methods=["GET"])
 def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
@@ -5179,105 +5390,11 @@ def subscription_status(req: func.HttpRequest) -> func.HttpResponse:
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT subscription_plan, subscription_type, credits_remaining, "
-        "credits_monthly_limit, subscription_renewed_at, payment_failed_at, "
-        "subscription_cancel_at, one_time_credits_remaining, "
-        "monthly_credits_remaining FROM users WHERE user_id = ?",
-        user_id,
-    )
-    row = cursor.fetchone()
-    if not row:
+    payload = _subscription_status_payload(cursor, user_id)
+    if payload is None:
         return func.HttpResponse("User not found", status_code=404)
-
-    # Queued (pay-at-activation) plan purchase, if any (finding #6): the frontend shows it and
-    # lets the user complete checkout once their current product ends. null when nothing queued.
-    cursor.execute(
-        "SELECT purchase_type, plan_key FROM pending_purchases "
-        "WHERE user_id = ? AND status = 'pending'",
-        user_id)
-    prow = cursor.fetchone()
-    queued_purchase = {"type": prow[0], "plan": prow[1]} if prow else None
-
-    # ── Team members report their SEAT, not their personal row ───────────────
-    # Teams credits are per member and live in organization_members. Reading dbo.users
-    # here told a paid member they were on the free tier with 4 credits while their seat
-    # held 30 and generation worked -- the UI was simply reading the wrong table. Returned
-    # early so the individual path below is untouched.
-    seat = _active_org_seat(cursor, user_id)
-    if seat is not None:
-        return func.HttpResponse(
-            json.dumps({
-                "subscription_plan": "teams_basic",
-                "subscription_type": "organization",
-                "plan": "teams_basic",
-                "type": "organization",
-                # The number they can actually spend.
-                "credits_remaining": seat["credits_remaining"],
-                "one_time_credits_remaining": seat["credits_remaining"],
-                "monthly_credits_remaining": 0,
-                # A seat is a one-time grant, not a monthly quota: nothing renews, and
-                # nothing can lapse or be cancelled, so these stay null/false rather than
-                # inventing a billing cycle the member does not have.
-                "credits_monthly_limit": None,
-                "monthly_quota": None,
-                "subscription_renewed_at": None,
-                "next_renewal": None,
-                "renewal_date": None,
-                "payment_failed": False,
-                "payment_failed_at": None,
-                "cancel_pending": False,
-                "cancel_at": None,
-                "queued_purchase": queued_purchase,
-                "organization": seat,
-            }),
-            mimetype="application/json",
-            status_code=200,
-        )
-
-    # Compute the NEXT renewal so the frontend can show "renews {date}". Stripe bills on a
-    # MONTHLY cadence (same day-of-month each cycle), so add one calendar month — NOT 30 days,
-    # which drifts ~5 days/year off the real billing date. Only meaningful for active monthly.
-    next_renewal = None
-    if row[1] == "monthly" and row[4]:
-        next_renewal = str(_add_one_month(row[4]))
-
     return func.HttpResponse(
-        json.dumps({
-            # Frontend (Billing.tsx / getSubscriptionStatus) reads subscription_plan /
-            # subscription_type. Emitting "plan"/"type" made the badge always show "Free"
-            # even after a paid plan updated the row. Send the keys the frontend consumes;
-            # keep plan/type as aliases so any other caller keeps working.
-            "subscription_plan": row[0],
-            "subscription_type": row[1],
-            "plan": row[0],
-            "type": row[1],
-            "credits_remaining": row[2] if row[1] == "monthly" else row[7],
-            "one_time_credits_remaining": row[7],
-            "add_on_credits_remaining": row[7],
-            "monthly_credits_remaining": row[8] if row[1] == "monthly" else 0,
-            "credits_monthly_limit": row[3] if row[1] == "monthly" else None,
-            # ALIAS: Billing.tsx / Dashboard.tsx read `monthly_quota` — a key the backend never
-            # sent, so "X of Y credits" rendered with a BLANK Y. Emit both names so the existing
-            # UI works with no coordinated frontend release.
-            "monthly_quota": row[3] if row[1] == "monthly" else None,
-            "subscription_renewed_at": _utc_iso(row[4]) if row[1] == "monthly" else None,
-            "next_renewal": next_renewal,
-            # ALIAS: Dashboard.tsx / Onboarding.tsx read `renewal_date` — same drift, which is
-            # why "renews on {date}" never appeared.
-            "renewal_date": next_renewal,
-            # Dunning: non-null means the latest monthly renewal charge FAILED and Stripe is
-            # retrying — the UI should prompt "update your card". Cleared on the next success.
-            "payment_failed": bool(row[5]),
-            "payment_failed_at": _utc_iso(row[5]),
-            # Cancellation: non-null means a period-end cancel is scheduled — the UI shows
-            # "cancels on {cancel_at}" and offers Reactivate (POST /subscriptions/reactivate).
-            "cancel_pending": bool(row[6]),
-            "cancel_at": _utc_iso(row[6]),
-            # Queued (pay-at-activation) plan purchase, if any — complete it when the current
-            # product ends. null when nothing is queued.
-            "queued_purchase": queued_purchase,
-        }),
+        json.dumps(payload),
         mimetype="application/json",
         status_code=200,
     )
@@ -7708,6 +7825,84 @@ def _require_org_admin(cursor, user_id, org_id, require_active=True):
     return row, None
 
 
+def _organization_roster_payload(
+    cursor, org_id, seats_purchased, active_only=False, limit=None, offset=0, admin_user_id=None,
+):
+    """Return the roster and live invitation counts shared by Teams views.
+
+    Summary callers page both PII-bearing lists; legacy roster consumers omit
+    ``limit`` and retain their existing full-list response.
+    """
+    member_where = "WHERE m.organization_id = ?"
+    member_args = [org_id]
+    if active_only:
+        member_where += " AND m.status = 'active'"
+    cursor.execute(
+        "SELECT COUNT(*) FROM organization_members m " + member_where,
+        *member_args,
+    )
+    members_total = int(cursor.fetchone()[0] or 0)
+    sql = """
+        SELECT m.membership_id, m.user_id, u.email, u.full_name,
+               m.credits_granted, m.credits_remaining, m.status, m.joined_at,
+               m.invitation_id
+        FROM organization_members m
+        LEFT JOIN users u ON u.user_id = m.user_id
+    """ + member_where
+    args = list(member_args)
+    sql += " ORDER BY m.joined_at ASC"
+    if limit is not None:
+        sql += " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        args.extend((offset, limit))
+    cursor.execute(sql, *args)
+    members = [{
+        "membership_id": str(r[0]),
+        "user_id": str(r[1]),
+        "email": r[2],
+        "full_name": r[3],
+        "credits_granted": r[4],
+        "credits_remaining": r[5],
+        "status": r[6],
+        "joined_at": _utc_iso(r[7]),
+        "is_admin": str(r[1]).lower() == str(admin_user_id).lower() if admin_user_id else r[8] is None,
+    } for r in cursor.fetchall()]
+
+    invitation_sql = """
+        SELECT invitation_id, email, status, expires_at, created_at
+        FROM invitations
+        WHERE organization_id = ? AND status = 'pending'
+              AND expires_at > SYSUTCDATETIME()
+    """
+    cursor.execute("SELECT COUNT(*) FROM (" + invitation_sql + ") AS pending_invitations", org_id)
+    pending_total = int(cursor.fetchone()[0] or 0)
+    invitation_sql += " ORDER BY created_at ASC"
+    invitation_args = [org_id]
+    if limit is not None:
+        invitation_sql += " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        invitation_args.extend((offset, limit))
+    cursor.execute(invitation_sql, *invitation_args)
+    pending = [{
+        "invitation_id": str(r[0]),
+        "email": r[1],
+        "status": r[2],
+        "expires_at": _utc_iso(r[3]),
+        "created_at": _utc_iso(r[4]),
+    } for r in cursor.fetchall()]
+    return {
+        "organization_id": str(org_id),
+        "seats_purchased": seats_purchased,
+        "seats_used": members_total if active_only else sum(1 for member in members if member["status"] == "active"),
+        "seats_available": max(0, seats_purchased - members_total - pending_total) if active_only else max(0, seats_purchased - sum(1 for member in members if member["status"] == "active") - len(pending)),
+        "members": members,
+        "pending_invitations": pending,
+        "members_total": members_total,
+        "pending_invitations_total": pending_total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": bool(limit is not None and (offset + limit < members_total or offset + limit < pending_total)),
+    }
+
+
 # ── Send invitations ──────────────────────────────────────
 @app.route(route="orgs/{org_id}/invitations", methods=["POST"])
 def create_invitations(req: func.HttpRequest) -> func.HttpResponse:
@@ -8017,59 +8212,9 @@ def list_org_members(req: func.HttpRequest) -> func.HttpResponse:
     org, err = _require_org_admin(cur, user_id, org_id)
     if err:
         return err
-    seats_purchased = org[1]
-
-    # LEFT JOIN users: the membership row is the source of truth for who is on the
-    # plan. An INNER JOIN would silently hide a member whose users row is missing.
-    cur.execute("""
-        SELECT m.membership_id, m.user_id, u.email, u.full_name,
-               m.credits_granted, m.credits_remaining, m.status, m.joined_at,
-               m.invitation_id
-        FROM organization_members m
-        LEFT JOIN users u ON u.user_id = m.user_id
-        WHERE m.organization_id = ?
-        ORDER BY m.joined_at ASC
-    """, org_id)
-    members = [{
-        "membership_id": str(r[0]),
-        "user_id": str(r[1]),
-        "email": r[2],
-        "full_name": r[3],
-        "credits_granted": r[4],
-        "credits_remaining": r[5],
-        "status": r[6],
-        "joined_at": _utc_iso(r[7]),
-        # NULL invitation_id = the admin, who created the org rather than accepting a link.
-        "is_admin": r[8] is None,
-    } for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT invitation_id, email, status, expires_at, created_at
-        FROM invitations
-        WHERE organization_id = ? AND status = 'pending'
-              AND expires_at > SYSUTCDATETIME()
-        ORDER BY created_at ASC
-    """, org_id)
-    pending = [{
-        "invitation_id": str(r[0]),
-        "email": r[1],
-        "status": r[2],
-        "expires_at": _utc_iso(r[3]),
-        "created_at": _utc_iso(r[4]),
-    } for r in cur.fetchall()]
-    # Tokens are deliberately NOT returned here — this is a listing view, and a token
-    # is a credential. They are returned once, at creation.
-
-    active_count = sum(1 for m in members if m["status"] == "active")
+    roster = _organization_roster_payload(cur, org_id, org[1])
     return func.HttpResponse(
-        json.dumps({
-            "organization_id": str(org_id),
-            "seats_purchased": seats_purchased,
-            "seats_used": active_count,
-            "seats_available": max(0, seats_purchased - active_count - len(pending)),
-            "members": members,
-            "pending_invitations": pending,
-        }),
+        json.dumps(roster),
         mimetype="application/json", status_code=200)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -8122,7 +8267,7 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
     row = cur.fetchone()
     if not row:
         return func.HttpResponse(
-            json.dumps({"organization": None}),
+            json.dumps({"organization": None, "branding": None}),
             mimetype="application/json", status_code=200)
 
     (org_id, credits_remaining, membership_id, org_name, admin_user_id,
@@ -8134,6 +8279,15 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
     cur.execute("SELECT lora_status FROM users WHERE user_id = ?", user_id)
     urow = cur.fetchone()
     lora_status = (urow[0] or "none").strip() if urow else "none"
+    try:
+        cur.execute(_BRANDING_SELECT, org_id)
+        branding = _branding_row_to_dict(cur.fetchone())
+    except pyodbc.Error as exc:
+        # A backend deploy can briefly precede migration 035. Keep Teams usable
+        # during that drift; the dedicated branding endpoint still surfaces the
+        # configuration problem to the admin who is editing it.
+        logging.warning("organization branding unavailable for org=%s: %s", org_id, exc)
+        branding = None
  
     return func.HttpResponse(
         json.dumps({
@@ -8144,6 +8298,7 @@ def get_my_organization(req: func.HttpRequest) -> func.HttpResponse:
                 "status": org_status,
                 "seats_purchased": seats_purchased,
             },
+            "branding": branding,
             "membership": {
                 "membership_id": str(membership_id),
                 "credits_granted": credits_granted,

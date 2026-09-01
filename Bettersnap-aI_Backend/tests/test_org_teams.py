@@ -161,9 +161,10 @@ import function_app  # noqa: E402
 class FakeRequest:
     """Stands in for func.HttpRequest. route_params and body are the two things
     every Teams endpoint reads besides the Authorization header."""
-    def __init__(self, body=None, route_params=None, auth="Bearer test-token"):
+    def __init__(self, body=None, route_params=None, params=None, auth="Bearer test-token"):
         self._body = body if body is not None else {}
         self.route_params = route_params or {}
+        self.params = params or {}
         self.headers = {"Authorization": auth}
 
     def get_json(self):
@@ -249,10 +250,20 @@ class FakeCursor:
             self._fetch = self.cfg.get("payment_intent_org_row")  # (admin_user_id, seats_purchased, status) or None
 
         # -- org_dashboard_summary --
-        # NOTE the ", name," -- this substring is deliberately DIFFERENT from the
-        # payment-intent branch above, so the two cannot shadow each other.
-        elif "select admin_user_id, name, seats_purchased, status from organizations" in s:
-            self._fetch = self.cfg.get("dashboard_org_row")
+        elif "select organization_id, admin_user_id, name, seats_purchased, status" in s:
+            row = self.cfg.get("dashboard_org_row")
+            requested_admin = params[1] if len(params) > 1 else None
+            self._fetch = (
+                row if row and str(row[1]).lower() == str(requested_admin).lower() else None
+            )
+        elif "select count(*) from organization_members m" in s:
+            self._fetch = (self.cfg.get("dashboard_members_total", len(self.cfg.get("dashboard_member_rows", []))),)
+        elif "from organization_members m" in s and "left join users u" in s:
+            self._fetchall_rows = self.cfg.get("dashboard_member_rows", [])
+        elif "select count(*) from (" in s and "from invitations" in s:
+            self._fetch = (self.cfg.get("dashboard_pending_invitations_total", len(self.cfg.get("dashboard_pending_invitation_rows", []))),)
+        elif "select invitation_id, email, status, expires_at, created_at" in s:
+            self._fetchall_rows = self.cfg.get("dashboard_pending_invitation_rows", [])
         elif "coalesce(sum(credits_remaining), 0) from organization_members" in s:
             self._fetch = (self.cfg.get("org_credits", 0),)
         elif "select status, count(*) from jobs where organization_id" in s:
@@ -1143,9 +1154,10 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
 
     def _dashboard(self, stored_admin, caller):
         cfg = {
-            "dashboard_org_row": (stored_admin, "Acme", 10, "active"),
-            "active_members": 1,
-            "org_credits": 10,
+            "dashboard_org_row": ("org-1", stored_admin, "Acme", 10, "active"),
+            "dashboard_member_rows": [
+                ("member-1", caller, "admin@example.com", "Admin", 30, 10, "active", None, None),
+            ],
             "org_job_counts": [("completed", 2)],
         }
         conn, p1, p2 = _patched(cfg)
@@ -1157,11 +1169,12 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
         finally:
             p1.stop(); p2.stop(); auth1.stop(); auth2.stop()
 
-    def _my_org(self, stored_admin, caller):
+    def _my_org(self, stored_admin, caller, branding_row=None):
         cfg = {
             "my_organization_row": ("org-1", 0, "member-1", "Acme", stored_admin, 10,
                                     0, None, "active", 10),
             "lora_status": "none",
+            "branding_row": branding_row,
         }
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(caller)
@@ -1204,19 +1217,27 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = json.loads(resp.body)
         self.assertEqual(body["job_status_counts"], {"completed": 2})
+        self.assertEqual(body["generation_totals"], {
+            "total_jobs": 2,
+            "completed_jobs": 2,
+            "in_progress_jobs": 0,
+            "failed_jobs": 0,
+        })
         self.assertEqual(body["members_joined"], 1)
         self.assertEqual(body["credits_remaining_total"], 10)
+        self.assertEqual(len(body["members"]), 1)
+        self.assertEqual(body["pending_invitations"], [])
 
     def test_dashboard_accepts_the_reverse_casing_too(self):
         self.assertEqual(self._dashboard(LOWER_ADMIN, UPPER_ADMIN).status_code, 200)
 
     def test_dashboard_rejects_a_different_guid(self):
-        self.assertEqual(self._dashboard(UPPER_ADMIN, OTHER_ADMIN).status_code, 403)
+        self.assertEqual(self._dashboard(UPPER_ADMIN, OTHER_ADMIN).status_code, 404)
 
     def test_dashboard_fails_closed_on_a_malformed_caller_id(self):
         for bad in ("not-a-guid", "", None):
             with self.subTest(caller=bad):
-                self.assertEqual(self._dashboard(UPPER_ADMIN, bad).status_code, 403)
+                self.assertEqual(self._dashboard(UPPER_ADMIN, bad).status_code, 404)
 
     def test_dashboard_404_for_a_missing_org_never_reaches_the_comparison(self):
         """A wrong-org request must not confirm the org exists."""
@@ -1238,7 +1259,15 @@ class TeamsAdminGuidCaseTests(unittest.TestCase):
         dashboard UI -- a wrong answer with a 200, not an error."""
         resp = self._my_org(UPPER_ADMIN, LOWER_ADMIN)
         self.assertEqual(resp.status_code, 200)
-        self.assertTrue(json.loads(resp.body)["organization"]["is_admin"])
+        body = json.loads(resp.body)
+        self.assertTrue(body["organization"]["is_admin"])
+        self.assertIsNone(body["branding"])
+
+    def test_my_organization_embeds_branding_when_configured(self):
+        row = ("attire.navy", "background.studio", "Studio Neutral", "linkedin", 30, "enforce", None)
+        body = json.loads(self._my_org(LOWER_ADMIN, LOWER_ADMIN, row).body)
+        self.assertEqual(body["branding"]["style_key"], "Studio Neutral")
+        self.assertEqual(body["branding"]["enforcement_mode"], "enforce")
 
     def test_is_admin_flag_is_false_for_a_different_guid(self):
         resp = self._my_org(UPPER_ADMIN, OTHER_ADMIN)
@@ -1307,8 +1336,8 @@ class TheseTestsDriveTheRealFunctions(unittest.TestCase):
     def test_the_comparison_is_actually_executed_not_asserted_about(self):
         """Proof the fake reached the real SQL: the endpoint must have issued the
         organizations lookup whose result feeds the comparison."""
-        cfg = {"dashboard_org_row": (UPPER_ADMIN, "Acme", 10, "active"),
-               "active_members": 0, "org_credits": 0, "org_job_counts": []}
+        cfg = {"dashboard_org_row": ("org-1", UPPER_ADMIN, "Acme", 10, "active"),
+               "dashboard_members_total": 0, "org_job_counts": []}
         conn, p1, p2 = _patched(cfg)
         auth1, auth2 = _auth_as(LOWER_ADMIN)
         p1.start(); p2.start(); auth1.start(); auth2.start()
