@@ -515,6 +515,13 @@ class FakeCursor:
             )
         elif "select purchase_type, plan_key from pending_purchases" in s:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
+        # /train/status: the plain lora_status read (distinct from the UPDLOCK variant above,
+        # which is the reservation path). Without this the handler 404s "User not found".
+        elif "select lora_status from users" in s and "updlock" not in s:
+            self._fetch = (self.cfg.get("lora_status", "ready"),)
+        # /train/status: the caller's in-flight job, for rehydrating the Cancel button
+        elif "select top 1 job_id, status, created_at" in s:
+            self._fetch = self.cfg.get("pending_job_row")   # None unless a test sets one
         # /users/dashboard-summary: lifetime delivered images (COMPLETED jobs only)
         elif "select output_blob_path from jobs" in s and "status = 'completed'" in s:
             self._fetchall = self.cfg.get("dashboard_completed_outputs", [])
@@ -2978,6 +2985,57 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(function_app.user_dashboard_summary(r).status_code, 401)
         finally:
             sys.modules["shared.auth"].get_user_id.side_effect = None
+
+
+class TrainingStatusPendingJobTests(unittest.TestCase):
+    """GET /train/status must expose the caller's in-flight job.
+
+    Cancel is only permitted for CANCEL_WINDOW_MINUTES after submit, and the client held
+    the job id in React state — which a refresh destroys. The window kept running while the
+    affordance to use it vanished, so a user who reloaded lost the ability to cancel a job
+    that was still cancellable.
+    """
+
+    def setUp(self):
+        sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+        self._cfg = {"lora_status_row": ("ready",)}
+        self._p = mock.patch.object(function_app, "get_db",
+                                    side_effect=lambda: FakeConn(self._cfg))
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _req(self):
+        r = _HttpRequest()
+        r.headers = {"Authorization": "Bearer t"}
+        return r
+
+    def test_exposes_an_in_flight_job(self):
+        self._cfg["pending_job_row"] = (
+            "job-9", "processing", function_app.datetime(2026, 9, 1, 17, 38, 0),
+        )
+        body = json.loads(function_app.training_status(self._req()).get_body())
+        self.assertEqual(body["pending_job"]["job_id"], "job-9")
+        self.assertEqual(body["pending_job"]["status"], "processing")
+        # created_at is SERVER truth — the client derives the countdown from it, so a
+        # skewed client clock cannot extend its own cancel window.
+        self.assertIn("2026-09-01", body["pending_job"]["created_at"])
+
+    def test_omits_the_key_when_nothing_is_in_flight(self):
+        self._cfg["pending_job_row"] = None
+        body = json.loads(function_app.training_status(self._req()).get_body())
+        self.assertNotIn("pending_job", body)
+
+    def test_terminal_jobs_are_excluded_in_sql(self):
+        """A completed or failed job is not cancellable. Returning one would render a
+        Cancel button that can only ever fail."""
+        function_app.training_status(self._req())
+        sql = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertTrue(
+            any("status not in ('completed', 'failed')" in s for s in sql),
+            "the in-flight lookup must exclude terminal jobs in SQL",
+        )
 
 
 if __name__ == "__main__":

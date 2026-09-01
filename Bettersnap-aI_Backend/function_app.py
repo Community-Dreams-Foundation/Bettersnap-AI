@@ -2247,6 +2247,33 @@ def training_status(req: func.HttpRequest) -> func.HttpResponse:
             "created_at": _utc_iso(t[4]),
             "completed_at": _utc_iso(t[5]),
         }
+
+    # The caller's in-flight generation, so the client can REHYDRATE its Cancel button.
+    # Cancel is only allowed for CANCEL_WINDOW_MINUTES after submit, and the client held the
+    # job id in React state — which a refresh or navigating away destroys. The window kept
+    # running while the affordance to use it disappeared, so a user who reloaded lost the
+    # ability to cancel a job that was still cancellable.
+    #
+    # created_at is server truth, so the countdown cannot be extended by a client with a
+    # skewed clock; the button self-hides when the window closes, and the server re-checks
+    # the window on the cancel call regardless.
+    cur.execute(
+        """
+        SELECT TOP 1 job_id, status, created_at
+        FROM jobs
+        WHERE user_id = ? AND status NOT IN ('completed', 'failed')
+        ORDER BY created_at DESC
+        """,
+        user_id,
+    )
+    j = cur.fetchone()
+    if j:
+        payload["pending_job"] = {
+            "job_id": str(j[0]),
+            "status": j[1],
+            "created_at": _utc_iso(j[2]),
+        }
+
     return func.HttpResponse(json.dumps(payload), mimetype="application/json", status_code=200)
 
 
