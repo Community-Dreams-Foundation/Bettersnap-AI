@@ -130,6 +130,24 @@ REAPER_DISPATCHING_MINUTES = int(os.environ.get("REAPER_DISPATCHING_MINUTES", "1
 _DEAD_EXEC_STATES = {"stopped", "failed", "degraded", "cancelled"}
 
 
+def _same_user(left, right) -> bool:
+    """Compare two user ids that came from DIFFERENT places.
+
+    SQL Server's uniqueidentifier comes back from pyodbc UPPERCASE; the Entra `oid` claim
+    a caller presents is lowercase. A raw `!=` therefore rejects the rightful owner every
+    single time -- cancel_job and delete_job both did exactly that, so the Cancel button
+    returned 403 for the person who started the job and could never have worked for anyone.
+
+    Parsed rather than lowercased, so a non-GUID fails CLOSED instead of silently matching.
+    shared/teams_checkout._same_id is the same guard; that lesson simply never reached the
+    job routes.
+    """
+    try:
+        return uuid.UUID(str(left)) == uuid.UUID(str(right))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _execution_id_for_job(cur, job_id, recorded_execution_id=None):
     """The ACA execution actually running this job.
 
@@ -2765,7 +2783,7 @@ def cancel_job(req: func.HttpRequest) -> func.HttpResponse:
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("Not found", status_code=404)
-    if row[0] != user_id:
+    if not _same_user(row[0], user_id):
         return func.HttpResponse("Forbidden", status_code=403)
     status, exec_id, age_sec = (row[1] or "").strip(), row[2], int(row[3] or 0)
 
@@ -2844,7 +2862,7 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     row = cursor.fetchone()
     if not row:
         return func.HttpResponse("Not found", status_code=404)
-    if row[0] != user_id:
+    if not _same_user(row[0], user_id):
         return func.HttpResponse("Forbidden", status_code=403)
 
     # Authoritative delete FIRST, committed, THEN blob cleanup. Ordering is
@@ -2870,6 +2888,39 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(status_code=204)
 
 # ── User Jobs History ─────────────────────────────────────
+def _job_output_paths(v):
+    """output_blob_path is stored as a JSON STRING (main.py json.dumps's the list), but
+    the API contract — and every client — expects a real array. Returning the raw column
+    meant the dashboard's "Photos Generated" count could never work: it can't count the
+    images in an opaque string. Parse it here, once, at the boundary.
+
+    Module-level rather than nested, so /users/jobs and /users/dashboard-summary cannot
+    drift in how they decode the same column.
+    """
+    if not v:
+        return []
+    if isinstance(v, list):
+        return v
+    try:
+        parsed = json.loads(v)
+        return parsed if isinstance(parsed, list) else [parsed]
+    except (TypeError, ValueError):
+        return [v]          # legacy rows that stored a bare path
+
+
+def _job_row_to_dict(r):
+    """The one job shape every client reads. Shared so a field added for one endpoint
+    cannot go missing from the other."""
+    return {
+        "job_id": str(r[0]),
+        "status": r[1],
+        "job_type": r[2],
+        "category": r[3],
+        "output_blob_path": _job_output_paths(r[4]),
+        "created_at": _utc_iso(r[5]),
+    }
+
+
 @app.route(route="users/jobs", methods=["GET"])
 def user_jobs(req: func.HttpRequest) -> func.HttpResponse:
     token = req.headers.get("Authorization", "").replace("Bearer ", "")

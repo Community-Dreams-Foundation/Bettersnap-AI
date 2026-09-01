@@ -63,6 +63,13 @@ class _HttpResponse:
         self.status_code = status_code
         self.mimetype = mimetype
 
+    def get_body(self):
+        """The real azure.functions.HttpResponse exposes get_body(), not .body. Handlers
+        that compose other handlers (dashboard-summary calls subscription_status) read the
+        inner response through it, so the fake has to offer the same surface or the test
+        passes against an API that does not exist in production."""
+        return self.body
+
 
 class _HttpRequest:  # not exercised here
     pass
@@ -508,6 +515,12 @@ class FakeCursor:
             )
         elif "select purchase_type, plan_key from pending_purchases" in s:
             self._fetch = self.cfg.get("pending_row")   # None unless a test sets one
+        # /users/dashboard-summary: lifetime delivered images (COMPLETED jobs only)
+        elif "select output_blob_path from jobs" in s and "status = 'completed'" in s:
+            self._fetchall = self.cfg.get("dashboard_completed_outputs", [])
+        # /users/dashboard-summary: the recent-generations slice
+        elif "select top" in s and "job_id, status, job_type, category" in s:
+            self._fetchall = self.cfg.get("dashboard_recent_jobs", [])
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
         elif "count(*) from jobs" in s and "user_id" not in s and "created_at" in s:
@@ -2782,6 +2795,190 @@ class TeamSeatPlanTests(unittest.TestCase):
         self.assertIn("teams_basic", PLANS)
         self.assertNotEqual("teams_basic", DEFAULT_PLAN_KEY)
         self.assertEqual(PLANS["teams_basic"].image_count, 30)
+
+class JobOwnershipGuidCaseTests(unittest.TestCase):
+    """The Cancel button returned 403 to the person who started the job.
+
+    SQL Server uniqueidentifier comes back from pyodbc UPPERCASE; the Entra oid claim a
+    caller presents is lowercase. cancel_job and delete_job compared them with a raw `!=`,
+    so the owner never matched and cancel could not work for ANYONE. Observed in production:
+    three consecutive cancel_job requests, all 403, from the job's own owner.
+    """
+
+    UPPER = "60BA6860-75D7-4EF6-AEB7-82F9AE24AD8B"   # as the database returns it
+    LOWER = "60ba6860-75d7-4ef6-aeb7-82f9ae24ad8b"   # as the token carries it
+
+    def _call(self, handler, row_user, caller):
+        class _Cur:
+            def __init__(self):
+                self._fetch = None
+                self.rowcount = 0
+
+            def execute(self, sql, *params):
+                q = " ".join(sql.lower().split())
+                if "from lora_trainings" in q:
+                    self._fetch = None
+                elif "from jobs where job_id" in q:
+                    # (user_id, status, external_execution_id, age_seconds)
+                    self._fetch = (row_user, "processing", None, 30)
+                else:
+                    self._fetch = (row_user, "processing", None)
+                return self
+
+            def fetchone(self):
+                return self._fetch
+
+        conn = mock.Mock()
+        conn.cursor.return_value = _Cur()
+        req = _HttpRequest()
+        req.headers = {"Authorization": "Bearer token"}
+        req.route_params = {"job_id": "11111111-1111-1111-1111-111111111111"}
+        patches = [
+            mock.patch.object(function_app, "get_db", return_value=conn),
+            mock.patch.object(function_app, "get_user_id", return_value=caller),
+            mock.patch.object(function_app, "_mark_failed", return_value="terminalized"),
+        ]
+        for pt in patches:
+            pt.start()
+        try:
+            return handler(req).status_code
+        finally:
+            for pt in patches:
+                pt.stop()
+
+    def test_the_owner_is_not_refused_over_guid_case(self):
+        for handler in (function_app.cancel_job, function_app.delete_job):
+            with self.subTest(handler=handler.__name__):
+                code = self._call(handler, self.UPPER, self.LOWER)
+                self.assertNotEqual(code, 403,
+                                    "the job's own owner was refused")
+
+    def test_identical_casing_still_works(self):
+        for handler in (function_app.cancel_job, function_app.delete_job):
+            with self.subTest(handler=handler.__name__):
+                self.assertNotEqual(self._call(handler, self.UPPER, self.UPPER), 403)
+
+    def test_a_DIFFERENT_user_is_still_refused(self):
+        """The fix must not turn the gate off."""
+        other = "99999999-9999-4999-8999-999999999999"
+        for handler in (function_app.cancel_job, function_app.delete_job):
+            with self.subTest(handler=handler.__name__):
+                self.assertEqual(self._call(handler, self.UPPER, other), 403)
+
+    def test_a_non_guid_fails_closed(self):
+        """Parsed, not lowercased: garbage must not match anything."""
+        for handler in (function_app.cancel_job, function_app.delete_job):
+            with self.subTest(handler=handler.__name__):
+                self.assertEqual(self._call(handler, "not-a-guid", "not-a-guid"), 403)
+
+class DashboardSummaryTests(unittest.TestCase):
+    """GET /users/dashboard-summary — the one read the customer dashboard makes.
+
+    The frontend was shipped calling this endpoint before it existed, so every dashboard
+    rendered "Dashboard summary failed: 404" with 0 credits, 0 photos and "No Plan". These
+    tests pin the contract it expects: {subscription, total_images_generated, recent_jobs}.
+    """
+
+    def setUp(self):
+        sys.modules["shared.auth"].validate_token.return_value = {"oid": "user-1"}
+        self._cfg = {}
+        self._p = mock.patch.object(function_app, "get_db",
+                                    side_effect=lambda: FakeConn(self._cfg))
+        self._p2 = mock.patch.object(function_app, "new_connection",
+                                     side_effect=lambda: FakeConn(self._cfg))
+        self._p.start(); self._p2.start()
+
+    def tearDown(self):
+        self._p.stop(); self._p2.stop()
+
+    def _req(self):
+        r = _HttpRequest()
+        r.headers = {"Authorization": "Bearer t"}
+        return r
+
+    @staticmethod
+    def _job(job_id, status, paths, created=None):
+        """A jobs row in column order, with output_blob_path as the JSON STRING the column
+        actually stores — decoding that is half the point of this endpoint."""
+        return (job_id, status, "headshot", "corporate",
+                json.dumps(paths), created or function_app.datetime(2026, 8, 31, 12, 0, 0))
+
+    def test_returns_the_three_keys_the_dashboard_reads(self):
+        self._cfg["dashboard_recent_jobs"] = [self._job("j1", "completed", ["a.png"])]
+        self._cfg["dashboard_completed_outputs"] = [(json.dumps(["a.png"]),)]
+
+        resp = function_app.user_dashboard_summary(self._req())
+
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(resp.get_body())
+        for key in ("subscription", "total_images_generated", "recent_jobs"):
+            self.assertIn(key, body)
+
+    def test_counts_images_across_completed_jobs_only(self):
+        # The query itself filters to completed; this pins that the JSON-string column is
+        # decoded and SUMMED rather than counted as rows.
+        self._cfg["dashboard_completed_outputs"] = [
+            (json.dumps(["a.png", "b.png", "c.png"]),),
+            (json.dumps(["d.png"]),),
+        ]
+        resp = function_app.user_dashboard_summary(self._req())
+        body = json.loads(resp.get_body())
+        self.assertEqual(body["total_images_generated"], 4)
+
+    def test_only_completed_jobs_are_counted(self):
+        """A failed job can still carry a partial output_blob_path. Counting it would tell
+        the user they received images they never got."""
+        sql = [s for s, _ in self._cfg.get("executed", [])]
+        function_app.user_dashboard_summary(self._req())
+        sql = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertTrue(
+            any("status = 'completed'" in s and "output_blob_path" in s for s in sql),
+            "the lifetime count must be restricted to completed jobs in SQL",
+        )
+
+    def test_output_paths_are_decoded_to_a_real_array(self):
+        self._cfg["dashboard_recent_jobs"] = [self._job("j1", "completed", ["x.png", "y.png"])]
+        resp = function_app.user_dashboard_summary(self._req())
+        body = json.loads(resp.get_body())
+        self.assertEqual(body["recent_jobs"][0]["output_blob_path"], ["x.png", "y.png"])
+
+    def test_recent_jobs_are_bounded(self):
+        """The dashboard renders a fixed-size card. The old client fetched EVERY job the
+        account ever ran and sliced 6 — an unbounded scan that grows forever."""
+        function_app.user_dashboard_summary(self._req())
+        sql = [s.lower() for s, _ in self._cfg["executed"]]
+        self.assertTrue(
+            any(f"select top {function_app.DASHBOARD_RECENT_JOBS}" in s for s in sql),
+            "recent jobs must be limited in SQL, not client-side",
+        )
+
+    def test_subscription_block_is_whatever_subscriptions_status_returns(self):
+        """No second copy of that payload: it carries ~20 fields and deliberate alias pairs
+        (monthly_quota/credits_monthly_limit, renewal_date/next_renewal), and a duplicate
+        would drift — which is exactly how a blank quota shipped to users once before."""
+        self._cfg["sub_status_row"] = (
+            "monthly_pro", "monthly", 120, 200, None, None, None, 40, 120,
+        )
+        summary = json.loads(function_app.user_dashboard_summary(self._req()).get_body())
+        status = json.loads(function_app.subscription_status(self._req()).get_body())
+        self.assertEqual(summary["subscription"], status)
+
+    def test_a_missing_user_is_propagated_not_rendered_as_empty(self):
+        """404 from subscription_status means 'no such user'. Swallowing it would paint a
+        healthy-looking dashboard with zeroes for someone whose account is broken."""
+        self._cfg["sub_status_row"] = None
+        resp = function_app.user_dashboard_summary(self._req())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_requires_authentication(self):
+        sys.modules["shared.auth"].get_user_id.side_effect = Exception("bad token")
+        try:
+            r = _HttpRequest()
+            r.headers = {}
+            self.assertEqual(function_app.user_dashboard_summary(r).status_code, 401)
+        finally:
+            sys.modules["shared.auth"].get_user_id.side_effect = None
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
