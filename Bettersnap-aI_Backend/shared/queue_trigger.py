@@ -12,14 +12,25 @@ from azure.mgmt.appcontainers.models import (
     JobExecutionTemplate, Container, EnvironmentVar, ContainerResources,
 )
 
-SUBSCRIPTION_ID = "cf197124-2e9a-48d5-af4b-de22fbbd683e"
-RESOURCE_GROUP = "bettersnap-ai-rg"
-JOB_NAME = "bettersnapai-if"
-# EVERY job that consumes the A100 workload profile. There is now exactly ONE such job
-# (bettersnapai-if on profile bettersnapaiWPn, Consumption-GPU-NC24-A100, 24 CPU/220Gi):
-# a training execution and an inference execution both land on it, so counting its live
-# executions IS the cap. (Listing a retired job's executions would raise, so the trainer
-# name is intentionally NOT here.)
+# Which ACA job the GPU work runs on. Overridable by app setting so the region can be
+# changed without a code edit — East US stopped allocating A100s on 2026-08-31 (every
+# execution died at BackoffLimitExceeded +1s, before any image pull) and the only fix was
+# to move regions. Defaults reproduce the original East US values, so an app with no
+# settings behaves exactly as before.
+#
+# These three are read by BOTH dispatch (queue_trigger, training_trigger) and
+# reconciliation (reaper, training_watcher, the GPU cap). They MUST move together: a
+# dispatcher pointing at one region while the reconciler reads another makes every job
+# look dead the moment it starts, and the reaper fails and refunds a healthy run.
+SUBSCRIPTION_ID = os.environ.get(
+    "ACA_SUBSCRIPTION_ID", "cf197124-2e9a-48d5-af4b-de22fbbd683e")
+RESOURCE_GROUP = os.environ.get("ACA_RESOURCE_GROUP", "bettersnap-ai-rg")
+JOB_NAME = os.environ.get("ACA_JOB_NAME", "bettersnapai-if")
+# EVERY job that consumes the A100 workload profile. There is exactly ONE such job at a
+# time (Consumption-GPU-NC24-A100, 24 CPU/220Gi): a training execution and an inference
+# execution both land on it, so counting its live executions IS the cap. Derived from
+# JOB_NAME so it follows the region override automatically — hardcoding it would leave
+# the cap counting a job nothing dispatches to, i.e. no cap at all.
 GPU_JOB_NAMES = (JOB_NAME,)
 
 # Execution states that mean an A100 replica is (or may be) consuming GPU.
