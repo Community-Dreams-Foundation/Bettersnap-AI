@@ -14,9 +14,15 @@ from azure.mgmt.appcontainers.models import (
 
 # Which ACA job the GPU work runs on. Overridable by app setting so the region can be
 # changed without a code edit — East US stopped allocating A100s on 2026-08-31 (every
-# execution died at BackoffLimitExceeded +1s, before any image pull) and the only fix was
-# to move regions. Defaults reproduce the original East US values, so an app with no
-# settings behaves exactly as before.
+# execution died at BackoffLimitExceeded +1s, before any image pull, quota confirmed
+# clear at 0/2) and the only fix was to move regions.
+#
+# The DEFAULT is the West US 3 job, deliberately. It was East US, on the reasoning that a
+# default should preserve existing behaviour — but on 2026-09-01 this setting was cleared
+# by something outside this repo and production silently began routing generation into the
+# region that cannot allocate a GPU, discoverable only from failed jobs minutes later. A
+# default that fails into a known-broken region is not a safe default. Setting
+# ACA_JOB_NAME=bettersnapai-if is now the explicit opt-in for going back.
 #
 # These three are read by BOTH dispatch (queue_trigger, training_trigger) and
 # reconciliation (reaper, training_watcher, the GPU cap). They MUST move together: a
@@ -25,7 +31,7 @@ from azure.mgmt.appcontainers.models import (
 SUBSCRIPTION_ID = os.environ.get(
     "ACA_SUBSCRIPTION_ID", "cf197124-2e9a-48d5-af4b-de22fbbd683e")
 RESOURCE_GROUP = os.environ.get("ACA_RESOURCE_GROUP", "bettersnap-ai-rg")
-JOB_NAME = os.environ.get("ACA_JOB_NAME", "bettersnapai-if")
+JOB_NAME = os.environ.get("ACA_JOB_NAME", "bettersnapai-if-wus3-canary")
 # EVERY job that consumes the A100 workload profile. There is exactly ONE such job at a
 # time (Consumption-GPU-NC24-A100, 24 CPU/220Gi): a training execution and an inference
 # execution both land on it, so counting its live executions IS the cap. Derived from
