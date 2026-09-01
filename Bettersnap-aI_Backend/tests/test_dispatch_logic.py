@@ -32,6 +32,20 @@ if BACKEND_DIR not in sys.path:
 
 # ── Stub heavy deps BEFORE importing function_app ─────────────────────────
 def _mod(name, **attrs):
+    """Only installs a stub if nothing has claimed this module name yet.
+
+    This USED to overwrite unconditionally, which was safe only while this file happened to
+    be imported first. It stopped being true when a test module sorting before it appeared,
+    and the failure was vicious: shared/outbox.py binds `from .queue_client import _send` at
+    IMPORT time, so once outbox is imported it calls that exact function object forever.
+    Overwriting sys.modules afterwards swapped the module the TESTS assert on while the code
+    kept calling the original — `_send.assert_called_once()` saw zero calls for a send that
+    definitely happened, in a different file, only in full-suite runs.
+
+    Deferring matches test_org_teams.py, which documented this reasoning first.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
     m = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(m, k, v)
@@ -68,11 +82,18 @@ class _HttpResponse:
         that compose other handlers (dashboard-summary calls subscription_status) read the
         inner response through it, so the fake has to offer the same surface or the test
         passes against an API that does not exist in production."""
-        return self.body
+        body = self.body
+        return body.encode("utf-8") if isinstance(body, str) else body
 
 
-class _HttpRequest:  # not exercised here
-    pass
+class _HttpRequest:
+    """Mirrors what handlers read off a request. `params` is the query string —
+    paginated endpoints read it, and whichever test module wins the _mod() race
+    decides which fake the whole suite sees, so both must carry it."""
+    def __init__(self, params=None, route_params=None, headers=None):
+        self.params = params or {}
+        self.route_params = route_params or {}
+        self.headers = headers or {}
 
 
 class _QueueMessage:
@@ -522,12 +543,6 @@ class FakeCursor:
         # /train/status: the caller's in-flight job, for rehydrating the Cancel button
         elif "select top 1 job_id, status, created_at" in s:
             self._fetch = self.cfg.get("pending_job_row")   # None unless a test sets one
-        # /users/dashboard-summary: lifetime delivered images (COMPLETED jobs only)
-        elif "select output_blob_path from jobs" in s and "status = 'completed'" in s:
-            self._fetchall = self.cfg.get("dashboard_completed_outputs", [])
-        # /users/dashboard-summary: the recent-generations slice
-        elif "select top" in s and "job_id, status, job_type, category" in s:
-            self._fetchall = self.cfg.get("dashboard_recent_jobs", [])
         elif "count(*) from jobs where user_id" in s:
             self._fetch = (self.cfg.get("user_count", 0),)
         elif "count(*) from jobs" in s and "user_id" not in s and "created_at" in s:
@@ -2684,19 +2699,38 @@ class OrgPaymentReceiptTests(unittest.TestCase):
             def execute(self, sql, *params):
                 q = " ".join(sql.lower().split())
                 if "from organizations where" in q:
-                    self._fetch = ("admin-1", "e2e aug 30", 10, "active")
+                    # Column order follows the handler's SELECT:
+                    #   organization_id, admin_user_id, name, seats_purchased, status
+                    # organization_id was added to that SELECT when the dashboard read
+                    # model landed; this fake still returned the old four values, so the
+                    # handler's unpack raised before any assertion could run.
+                    self._fetch = ("org-1", "admin-1", "e2e aug 30", 10, "active")
                 elif "count(*) from organization_members" in q:
                     self._fetch = (2,)
                 elif "sum(credits_remaining)" in q:
                     self._fetch = (56,)
                 elif "from organization_payments" in q:
                     self._fetch = payment
+                self._last_q = q
                 return self
 
             def fetchone(self):
                 return self._fetch
 
             def fetchall(self):
+                # The dashboard read model gained a ROSTER query, whose rows are indexed up
+                # to r[8]. One fixed 2-tuple satisfied the old job-status aggregate and blew
+                # up on the roster with IndexError, so branch on the query like execute does.
+                q = getattr(self, "_last_q", "")
+                if "from organization_members m" in q:
+                    return [(
+                        "mem-1", "admin-1", "admin@test", "Admin",
+                        30, 28, "active", None, None,
+                    )]
+                if "from invitations" in q:
+                    # This test is about the payment receipt; no pending invites is the
+                    # simplest state that still exercises the roster path.
+                    return []
                 return [("completed", 1)]
 
         conn = mock.Mock()
@@ -2877,115 +2911,6 @@ class JobOwnershipGuidCaseTests(unittest.TestCase):
         for handler in (function_app.cancel_job, function_app.delete_job):
             with self.subTest(handler=handler.__name__):
                 self.assertEqual(self._call(handler, "not-a-guid", "not-a-guid"), 403)
-
-class DashboardSummaryTests(unittest.TestCase):
-    """GET /users/dashboard-summary — the one read the customer dashboard makes.
-
-    The frontend was shipped calling this endpoint before it existed, so every dashboard
-    rendered "Dashboard summary failed: 404" with 0 credits, 0 photos and "No Plan". These
-    tests pin the contract it expects: {subscription, total_images_generated, recent_jobs}.
-    """
-
-    def setUp(self):
-        sys.modules["shared.auth"].validate_token.return_value = {"oid": "user-1"}
-        self._cfg = {}
-        self._p = mock.patch.object(function_app, "get_db",
-                                    side_effect=lambda: FakeConn(self._cfg))
-        self._p2 = mock.patch.object(function_app, "new_connection",
-                                     side_effect=lambda: FakeConn(self._cfg))
-        self._p.start(); self._p2.start()
-
-    def tearDown(self):
-        self._p.stop(); self._p2.stop()
-
-    def _req(self):
-        r = _HttpRequest()
-        r.headers = {"Authorization": "Bearer t"}
-        return r
-
-    @staticmethod
-    def _job(job_id, status, paths, created=None):
-        """A jobs row in column order, with output_blob_path as the JSON STRING the column
-        actually stores — decoding that is half the point of this endpoint."""
-        return (job_id, status, "headshot", "corporate",
-                json.dumps(paths), created or function_app.datetime(2026, 8, 31, 12, 0, 0))
-
-    def test_returns_the_three_keys_the_dashboard_reads(self):
-        self._cfg["dashboard_recent_jobs"] = [self._job("j1", "completed", ["a.png"])]
-        self._cfg["dashboard_completed_outputs"] = [(json.dumps(["a.png"]),)]
-
-        resp = function_app.user_dashboard_summary(self._req())
-
-        self.assertEqual(resp.status_code, 200)
-        body = json.loads(resp.get_body())
-        for key in ("subscription", "total_images_generated", "recent_jobs"):
-            self.assertIn(key, body)
-
-    def test_counts_images_across_completed_jobs_only(self):
-        # The query itself filters to completed; this pins that the JSON-string column is
-        # decoded and SUMMED rather than counted as rows.
-        self._cfg["dashboard_completed_outputs"] = [
-            (json.dumps(["a.png", "b.png", "c.png"]),),
-            (json.dumps(["d.png"]),),
-        ]
-        resp = function_app.user_dashboard_summary(self._req())
-        body = json.loads(resp.get_body())
-        self.assertEqual(body["total_images_generated"], 4)
-
-    def test_only_completed_jobs_are_counted(self):
-        """A failed job can still carry a partial output_blob_path. Counting it would tell
-        the user they received images they never got."""
-        sql = [s for s, _ in self._cfg.get("executed", [])]
-        function_app.user_dashboard_summary(self._req())
-        sql = [s.lower() for s, _ in self._cfg["executed"]]
-        self.assertTrue(
-            any("status = 'completed'" in s and "output_blob_path" in s for s in sql),
-            "the lifetime count must be restricted to completed jobs in SQL",
-        )
-
-    def test_output_paths_are_decoded_to_a_real_array(self):
-        self._cfg["dashboard_recent_jobs"] = [self._job("j1", "completed", ["x.png", "y.png"])]
-        resp = function_app.user_dashboard_summary(self._req())
-        body = json.loads(resp.get_body())
-        self.assertEqual(body["recent_jobs"][0]["output_blob_path"], ["x.png", "y.png"])
-
-    def test_recent_jobs_are_bounded(self):
-        """The dashboard renders a fixed-size card. The old client fetched EVERY job the
-        account ever ran and sliced 6 — an unbounded scan that grows forever."""
-        function_app.user_dashboard_summary(self._req())
-        sql = [s.lower() for s, _ in self._cfg["executed"]]
-        self.assertTrue(
-            any(f"select top {function_app.DASHBOARD_RECENT_JOBS}" in s for s in sql),
-            "recent jobs must be limited in SQL, not client-side",
-        )
-
-    def test_subscription_block_is_whatever_subscriptions_status_returns(self):
-        """No second copy of that payload: it carries ~20 fields and deliberate alias pairs
-        (monthly_quota/credits_monthly_limit, renewal_date/next_renewal), and a duplicate
-        would drift — which is exactly how a blank quota shipped to users once before."""
-        self._cfg["sub_status_row"] = (
-            "monthly_pro", "monthly", 120, 200, None, None, None, 40, 120,
-        )
-        summary = json.loads(function_app.user_dashboard_summary(self._req()).get_body())
-        status = json.loads(function_app.subscription_status(self._req()).get_body())
-        self.assertEqual(summary["subscription"], status)
-
-    def test_a_missing_user_is_propagated_not_rendered_as_empty(self):
-        """404 from subscription_status means 'no such user'. Swallowing it would paint a
-        healthy-looking dashboard with zeroes for someone whose account is broken."""
-        self._cfg["sub_status_row"] = None
-        resp = function_app.user_dashboard_summary(self._req())
-        self.assertEqual(resp.status_code, 404)
-
-    def test_requires_authentication(self):
-        sys.modules["shared.auth"].get_user_id.side_effect = Exception("bad token")
-        try:
-            r = _HttpRequest()
-            r.headers = {}
-            self.assertEqual(function_app.user_dashboard_summary(r).status_code, 401)
-        finally:
-            sys.modules["shared.auth"].get_user_id.side_effect = None
-
 
 class TrainingStatusPendingJobTests(unittest.TestCase):
     """GET /train/status must expose the caller's in-flight job.

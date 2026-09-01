@@ -62,6 +62,10 @@ CANONICAL_MIGRATIONS = (
     "032_fix_org_status_constraint.sql", "033_provisioning_retry.sql",
     "034_fused_job_link.sql", "035_organization_branding.sql",
     "036_teams_pricing_snapshot.sql", "037_unify_credit_buckets.sql",
+    # Covering indexes for the bounded dashboard read model and the team roster. Both are
+    # already applied in production; registering them here is what keeps this list honest
+    # about what the schema actually contains.
+    "038_dashboard_history_index.sql", "039_team_dashboard_roster_index.sql",
 )
 
 # SQL Server native error numbers raised by migration 034's shape guards.

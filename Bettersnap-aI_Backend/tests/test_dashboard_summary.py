@@ -10,7 +10,18 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-import function_app
+# Importing this module installs the azure/shared stubs and imports function_app — the same
+# convention test_teams_checkout_flow.py follows.
+#
+# This is load-bearing, not tidiness. Every test module is imported into ONE process before
+# any test runs, and _mod() only claims a module name nothing else has taken — so whichever
+# file is imported FIRST decides which stubs the entire suite sees. Importing function_app
+# here without them pulled in the REAL azure.functions and handed every later test a real
+# HttpResponse where it expected the fake: 184 failures suite-wide, while this file's own
+# tests passed in isolation.
+from tests.test_org_teams import _mod  # noqa: E402,F401  (side effect: installs the stubs)
+
+import function_app  # noqa: E402
 
 
 class _Request:

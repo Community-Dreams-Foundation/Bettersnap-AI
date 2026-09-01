@@ -92,9 +92,28 @@ class _HttpResponse:
         self.status_code = status_code
         self.mimetype = mimetype
 
+    def get_body(self):
+        """The real azure.functions.HttpResponse exposes get_body(), not .body.
+
+        Every test module installs its stubs through _mod(), which only claims a name
+        nothing else has taken — so whichever file pytest imports first decides which fake
+        the WHOLE suite sees. That makes any gap between these fakes an order-dependent
+        failure: a handler that composes another handler reads the inner response through
+        get_body(), and a test asserting on .body reads the attribute. Both surfaces have
+        to exist here or the suite passes or fails depending on collection order.
+        """
+        body = self.body
+        return body.encode("utf-8") if isinstance(body, str) else body
+
 
 class _HttpRequest:
-    pass
+    """Mirrors the attributes handlers actually read off a request. `params` is the query
+    string; endpoints that paginate (History) read it, so a fake without it fails only when
+    this module happens to win the _mod() race."""
+    def __init__(self, params=None, route_params=None, headers=None):
+        self.params = params or {}
+        self.route_params = route_params or {}
+        self.headers = headers or {}
 
 
 _mod("azure")
@@ -144,6 +163,12 @@ _mod("shared.gpu_lease",
      acquire_dispatch_lease=mock.Mock(return_value="owner-1"),
      release_dispatch_lease=mock.Mock(),
      mark_dispatched=mock.Mock(),
+     # Must match test_dispatch_logic.py's stub attribute-for-attribute. _mod() only claims
+     # a name nothing else has taken, so whichever module is imported first supplies the
+     # stub the WHOLE suite gets — and test_dispatch_logic's setUp reset_mock()s each of
+     # these by name. A missing attribute here therefore breaks tests in a different file,
+     # and only when collection order happens to put this module first.
+     clear_dispatch_pending=mock.Mock(),
      recent_dispatch_pending=mock.Mock(return_value=False),
      DispatchConfigError=_DispatchConfigError)
 
