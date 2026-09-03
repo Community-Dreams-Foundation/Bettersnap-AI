@@ -500,11 +500,15 @@ class FakeCursor:
         elif "select stripe_checkout_token from users" in s:
             token = self.cfg.get("stripe_checkout_token")
             self._fetch = (token,) if token else None
-        elif ("select plan_name from users" in s
+        elif ("select plan_name" in s and "from users" in s
               and "subscription_type = 'monthly'" in s):
-            self._fetch = (
-                self.cfg.get("plan_name", "monthly_pro"),
-            ) if self.cfg.get("subscription_type", "monthly") == "monthly" else None
+            # _handle_topup also reads subscription_plan, so it can recover the
+            # monthly rate when plan_name is not a monthly key.
+            row = (self.cfg.get("plan_name", "monthly_pro"),)
+            if "subscription_plan" in s:
+                row += (self.cfg.get("subscription_plan", "pro"),)
+            self._fetch = row if self.cfg.get(
+                "subscription_type", "monthly") == "monthly" else None
         elif ("select subscription_type, credits_remaining, one_time_credits_remaining" in s
               and "with (updlock, holdlock)" in s):
             self._fetch = (
@@ -522,6 +526,8 @@ class FakeCursor:
                 self.cfg.get("subscription_plan", "pro"),
                 self.cfg.get("monthly_credits", 120),
                 self.cfg.get("one_time_credits", 250),
+                self.cfg.get("one_time_plan"),
+                self.cfg.get("one_time_plan_name"),
             )
         elif "update users with (updlock, rowlock) set" in s:
             if self.cfg.get("subscription_type") == "monthly" and self.cfg.get("stripe_subscription_id"):
@@ -956,6 +962,51 @@ class DailyCapTests(unittest.TestCase):
         self.assertTrue(job_inserts, "no jobs INSERT recorded")
         self.assertIn("source_type", job_inserts[0][0].lower())
         self.assertIsNotNone(job_inserts[0][1][-1])
+
+    def test_one_time_plan_can_spend_a_converted_partial_balance(self):
+        self._cfg.update(
+            plan_name="expert",
+            credits=20,
+            one_time_credits=20,
+            user_count=0,
+            global_count=0,
+        )
+
+        resp = function_app.submit_job(self._req())
+
+        self.assertEqual(resp.status_code, 202)
+        inserted_params = next(
+            params for sql, params in self._cfg["executed"]
+            if "insert into jobs" in sql.lower()
+        )
+        stored = json.loads(inserted_params[3])
+        self.assertEqual(stored["plan_name"], "expert")
+        self.assertEqual(stored["image_count"], 20)
+        self.assertEqual(stored["credit_cost"], 20)
+
+    def test_monthly_addon_is_not_double_counted_when_sizing_a_job(self):
+        self._cfg.update(
+            plan_name="monthly_basic",
+            credits=25,
+            one_time_credits=25,
+            user_count=0,
+            global_count=0,
+        )
+        req = self._req()
+        body = req.get_json()
+        body["image_count"] = 10
+        req.get_json = lambda: body
+
+        resp = function_app.submit_job(req)
+
+        self.assertEqual(resp.status_code, 202)
+        inserted_params = next(
+            params for sql, params in self._cfg["executed"]
+            if "insert into jobs" in sql.lower()
+        )
+        stored = json.loads(inserted_params[3])
+        self.assertEqual(stored["image_count"], 5)
+        self.assertEqual(stored["credit_cost"], 25)
 
     def test_send_failure_keeps_job_and_returns_202(self):
         # Transactional outbox: the queue message was written ATOMICALLY with the job + credit
@@ -1664,8 +1715,9 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(params[3], 30)
 
     def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
-        self._cfg.update(plan_name="monthly_pro", monthly_credits=120,
-                         one_time_credits=250)
+        self._cfg.update(plan_name="monthly_basic", monthly_credits=80,
+                         one_time_credits=250, one_time_plan="pro",
+                         one_time_plan_name="pro")
         function_app._handle_subscription_ended(
             {"id": "sub_123", "status": "canceled"},
             "evt_subscription_ended",
@@ -1678,6 +1730,8 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertIn("credits_remaining = ?", downgrade_sql.lower())
         params = next(params for sql, params in self._cfg["executed"] if sql == downgrade_sql)
         self.assertEqual(params[3], 50)  # 250 add-on credits ÷ 5 credits/image
+        self.assertEqual(params[0], "pro")  # preserve the add-on pack, not monthly Basic
+        self.assertEqual(params[2], "pro")
         self.assertIn("credits_monthly_limit = null", downgrade_sql.lower())
 
     def test_invoice_paid_resets_only_monthly_balance(self):
@@ -1719,7 +1773,7 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(params[0], 250)
         self.assertEqual(params[1], 250)
         self.assertEqual(params[2], "pro")
-        self.assertEqual(params[3], "monthly_pro")
+        self.assertEqual(params[3], "pro")
 
     def test_monthly_job_spends_monthly_then_addon_credits(self):
         from shared.job_reservation import reserve_job_slot
@@ -2222,7 +2276,8 @@ class PublicCatalogPrivacyTests(unittest.TestCase):
 class SubscriptionDowngradeTests(unittest.TestCase):
     def test_ended_subscription_preserves_one_time_credits(self):
         cfg = {"plan_name": "monthly_pro", "monthly_credits": 20,
-               "one_time_credits": 250}
+               "one_time_credits": 250, "one_time_plan": "basic",
+               "one_time_plan_name": "basic"}
         with mock.patch.object(function_app, "new_connection",
                                return_value=FakeConn(cfg)):
             function_app._handle_subscription_ended(
@@ -2240,6 +2295,7 @@ class SubscriptionDowngradeTests(unittest.TestCase):
         # subscription id bind now.
         self.assertIn("credits_remaining = ?", sql.lower())
         self.assertIn("monthly_credits_remaining = 0", sql.lower())
+        self.assertEqual(params[0], "basic")
         self.assertEqual(params[3], 50)
         self.assertEqual(params[-2], function_app.RETENTION_DAYS)
         self.assertEqual(params[-1], "sub-ended")

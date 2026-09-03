@@ -264,6 +264,10 @@ from shared.keyvault import get_secret
 from shared.plans import (
     get_plan, credit_cost, public_plans, REGISTRATION_CREDITS, DEFAULT_PLAN_KEY,
     FREE_RETRAINS, RETRAIN_CREDITS, MAX_TRAININGS_PER_DAY, plan_key_for,
+    resolve_monthly_plan,
+)
+from shared.credit_units import (
+    credits_to_images, images_to_credits, one_time_key_for_monthly,
 )
 from shared import catalog
 from shared.stripe_client import (
@@ -2462,9 +2466,10 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({"error": "image_count must be a number"}),
                 mimetype="application/json", status_code=400)
-        max_by_credits = (
-            credits_remaining + one_time_credits_remaining
-        ) // plan.credits_per_image
+        # credits_remaining is already the aggregate mirror of monthly + add-on buckets.
+        # Adding the add-on bucket again overstates affordability and can size a request
+        # that reserve_job_slot must reject even though a smaller request is affordable.
+        max_by_credits = credits_remaining // plan.credits_per_image
         # Honor the min-session floor normally, but NEVER floor above what the user's remaining
         # credits can pay for — otherwise a user with less than one full session's worth of
         # credits could never spend them (every submit asked for the floor and 402'd, stranding
@@ -2473,7 +2478,13 @@ def submit_job(req: func.HttpRequest) -> func.HttpResponse:
         floor = min(plan.min_session_images, max_by_credits)
         image_count = max(1, floor, upper)
     else:
-        image_count = plan.image_count
+        # One-time packs normally run in one batch.  A converted monthly add-on can hold
+        # fewer images than the original pack size, though (for example after some of the
+        # add-on was spent while the subscription was active).  Let that final remainder
+        # be generated instead of permanently stranding paid images behind the full-pack
+        # affordability check.
+        available_images = one_time_credits_remaining or credits_remaining
+        image_count = min(plan.image_count, max(1, available_images))
     cost = credit_cost(plan, image_count)
 
     job_params = json.dumps({
@@ -5468,7 +5479,19 @@ def _subscription_status_payload(cursor, user_id):
     is_monthly = row[1] == "monthly"
     # row[0] is also a valid plan key; the fallback keeps compatibility with older test/
     # read replicas that have not yet projected plan_name in this response query.
-    credits_per_image = get_plan(row[9] if len(row) > 9 else row[0]).credits_per_image
+    stored_key = row[9] if len(row) > 9 else None
+    if is_monthly:
+        # NEVER decode a monthly balance at a one-time rate — see resolve_monthly_plan.
+        rate_plan, recovered = resolve_monthly_plan(stored_key, row[0])
+        if rate_plan is None:
+            rate_plan = get_plan(plan_key_for(row[0], "monthly"))
+        if recovered:
+            logging.error(
+                "SUBSCRIPTION_RATE_FALLBACK: user=%s plan_name=%r subscription_plan=%r; "
+                "reporting at %r", user_id, stored_key, row[0], rate_plan.key)
+    else:
+        rate_plan = get_plan(stored_key or row[0])
+    credits_per_image = rate_plan.credits_per_image
     add_on_balance = int(row[7] or 0)
     monthly_balance = int(row[8] or 0) if is_monthly else 0
     return {
@@ -6750,9 +6773,29 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             raise RetryableStripeWebhookError(
                 f"monthly activation matched no user: user_id={user_id} plan={plan}")
         was_monthly = old[0] == "monthly"
-        old_persistent = int(old[2] or 0) if was_monthly else int(old[1] or 0)
-        persistent_credits = (old_persistent if was_monthly else
-                              old_persistent * monthly_rate)
+        if was_monthly:
+            # Already in credit units; carrying it across is not a conversion.
+            old_persistent = int(old[2] or 0)
+            persistent_credits = old_persistent
+        else:
+            # SPENDABLE balance first. credits_remaining is the legacy aggregate that
+            # get_credits explicitly refuses to trust ("stale for any user who
+            # purchased/renewed after the split"); scaling it by credits_per_image would
+            # multiply any drift by 5 at the money boundary. Fall back to it only when
+            # the bucket is empty, exactly as get_credits does for pre-migration rows.
+            bucket = int(old[2] or 0)
+            old_persistent = bucket if bucket > 0 else int(old[1] or 0)
+            try:
+                persistent_credits = images_to_credits(old_persistent, monthly_rate)
+            except ValueError as exc:
+                # A negative balance is data corruption, not a customer state. Refuse to
+                # scale it into a wrong entitlement; retry is safe because the claim above
+                # is rolled back with it.
+                conn.rollback()
+                logging.critical(
+                    "PLAN_UNIT_CONVERSION_BLOCKED (activation): user=%s balance=%s rate=%s: %s",
+                    user_id, old_persistent, monthly_rate, exc)
+                raise RetryableStripeWebhookError(str(exc))
         conversion_delta = persistent_credits - old_persistent
         old_plan = old[3] or old[4]
         cur.execute(
@@ -6783,7 +6826,7 @@ def _handle_monthly_checkout(session: dict, event_id: str):
               AND (stripe_checkout_token IS NULL OR stripe_checkout_token = ?)""",
             plan, monthly_plan_key, customer, sub_id,
             credits, persistent_credits, credits, persistent_credits,
-            old_plan, old_plan,
+            old_plan, old_plan, credits,
             user_id, sub_id, checkout_token,
         )
         applied = cur.rowcount
@@ -6832,7 +6875,8 @@ def _handle_topup(session: dict, event_id: str):
             logging.info(f"Stripe event {event_id} already processed; skipping topup.")
             return
         cur.execute(
-            "SELECT plan_name FROM users WHERE user_id = ? AND subscription_type = 'monthly'",
+            "SELECT plan_name, subscription_plan FROM users "
+            "WHERE user_id = ? AND subscription_type = 'monthly'",
             user_id)
         prow = cur.fetchone()
         if not prow:
@@ -6842,7 +6886,27 @@ def _handle_topup(session: dict, event_id: str):
                 f"account. MANUAL RECONCILIATION REQUIRED (grant {images} images once fixed).")
             raise RetryableStripeWebhookError(
                 f"topup matched no active monthly user: user_id={user_id} pack={pack}")
-        monthly_plan = get_plan(prow[0])
+        # NEVER price a paid top-up with get_plan: it maps a NULL / unknown /
+        # bare-tier plan_name to the TRIAL plan at 1 credit/image, so the customer
+        # is granted a FIFTH of the images they paid for. Fail closed instead.
+        monthly_plan, recovered = resolve_monthly_plan(prow[0], prow[1])
+        if monthly_plan is None:
+            conn.rollback()
+            logging.critical(
+                "TOPUP_RATE_UNRESOLVED: user=%s plan_name=%r subscription_plan=%r "
+                "pack=%s images=%s; NOT granting at a guessed rate",
+                user_id, prow[0], prow[1], pack, images)
+            _write_event(user_id, "billing.topup_rate_unresolved", target=event_id,
+                         detail={"plan_name": prow[0], "subscription_plan": prow[1],
+                                 "pack": pack, "images": images})
+            raise RetryableStripeWebhookError(
+                f"topup cannot resolve a monthly rate: user_id={user_id} "
+                f"plan_name={prow[0]!r}")
+        if recovered:
+            logging.error(
+                "TOPUP_RATE_RECOVERED: user=%s plan_name=%r is not a monthly key; "
+                "priced at %s (%s credits/image). Repair users.plan_name.",
+                user_id, prow[0], monthly_plan.key, monthly_plan.credits_per_image)
         add_on_credits = images * monthly_plan.credits_per_image
         cur.execute(
             """UPDATE users SET
@@ -6851,7 +6915,7 @@ def _handle_topup(session: dict, event_id: str):
                 one_time_plan = ?,
                 one_time_plan_name = ?
             WHERE user_id = ? AND subscription_type = 'monthly'""",
-            add_on_credits, add_on_credits, pack, prow[0], user_id,
+            add_on_credits, add_on_credits, pack, pack, user_id,
         )
         credit_ledger.record(cur, user_id, add_on_credits, credit_ledger.REASON_TOPUP)
         conn.commit()  # claim + grant + ledger row commit atomically
@@ -7110,7 +7174,8 @@ def _handle_subscription_ended(sub: dict, event_id: str):
                 return
             cur.execute(
                 "SELECT user_id, plan_name, subscription_plan, monthly_credits_remaining, "
-                "one_time_credits_remaining FROM users WITH (UPDLOCK, HOLDLOCK) "
+                "one_time_credits_remaining, one_time_plan, one_time_plan_name "
+                "FROM users WITH (UPDLOCK, HOLDLOCK) "
                 "WHERE stripe_subscription_id = ?", sub_id)
             old = cur.fetchone()
             if not old:
@@ -7120,19 +7185,50 @@ def _handle_subscription_ended(sub: dict, event_id: str):
             user_id, plan_name, subscription_plan = old[0], old[1], old[2]
             monthly_remaining = int(old[3] or 0)
             add_on_credits = int(old[4] or 0)
-            monthly_key = plan_name or plan_key_for(subscription_plan, "monthly")
-            monthly_rate = get_plan(monthly_key).credits_per_image
+            stored_one_time_key = old[5] or old[6]
+            monthly_plan, rate_recovered = resolve_monthly_plan(
+                plan_name, subscription_plan)
+            if monthly_plan is None:
+                conn.rollback()
+                logging.critical(
+                    "DOWNGRADE_RATE_UNRESOLVED: subscription=%s plan_name=%r "
+                    "subscription_plan=%r add_on=%s; refusing to convert at a guess",
+                    sub_id, plan_name, subscription_plan, int(old[4] or 0))
+                _write_event(user_id, "billing.downgrade_rate_unresolved",
+                             target=sub_id,
+                             detail={"plan_name": plan_name,
+                                     "subscription_plan": subscription_plan})
+                return
+            if rate_recovered:
+                logging.error(
+                    "DOWNGRADE_RATE_RECOVERED: subscription=%s plan_name=%r is not a "
+                    "monthly key; converting at %s. Repair users.plan_name.",
+                    sub_id, plan_name, monthly_plan.key)
+            monthly_key = monthly_plan.key
+            monthly_rate = monthly_plan.credits_per_image
             try:
-                from shared.credit_units import credits_to_images, one_time_key_for_monthly
                 remaining_images = credits_to_images(add_on_credits, monthly_rate)
             except ValueError as exc:
+                # A remainder is PERMANENT: no number of redeliveries can make it
+                # divisible. Raising a retryable error here made Stripe redeliver until
+                # it gave up, which risks the endpoint being disabled for every other
+                # event. Consume the event, leave the row exactly as it is (a partial
+                # downgrade would be worse than none), and alert for manual repair.
                 conn.rollback()
                 logging.critical(
                     "PLAN_UNIT_CONVERSION_BLOCKED: subscription=%s add_on_credits=%s "
                     "rate=%s; manual reconciliation required: %s",
                     sub_id, add_on_credits, monthly_rate, exc)
-                raise RetryableStripeWebhookError(str(exc))
-            one_time_key = one_time_key_for_monthly(monthly_key)
+                _write_event(user_id, "billing.unit_conversion_blocked", target=sub_id,
+                             detail={"add_on_credits": add_on_credits,
+                                     "credits_per_image": monthly_rate,
+                                     "monthly_credits_remaining": monthly_remaining,
+                                     "event_id": event_id})
+                return
+            # A top-up records the one-time pack the customer actually bought. Preserve
+            # that entitlement on downgrade; falling back to the monthly tier is only for
+            # converted balances that predate the stored one-time plan fields.
+            one_time_key = one_time_key_for_monthly(stored_one_time_key or monthly_key)
             # Subscription is truly over → the user keeps their data for RETENTION_DAYS
             # more, then the hourly cleanup deletes the blobs.
             cur.execute(

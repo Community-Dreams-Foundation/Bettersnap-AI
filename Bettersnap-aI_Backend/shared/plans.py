@@ -139,8 +139,37 @@ def affordable(plan: Plan, credits: int) -> bool:
 
 def get_plan(plan_key: str | None) -> Plan:
     """Resolve a plan by key, falling back to the default when unset/unknown so a
-    missing users.plan_name never crashes submit."""
+    missing users.plan_name never crashes submit.
+
+    ⚠️ This FAILS OPEN at 1 credit/image (the trial rate). Never use it to price a
+    MONTHLY account — use resolve_monthly_plan() instead, which fails closed."""
     return PLANS.get((plan_key or "").strip().lower(), PLANS[DEFAULT_PLAN_KEY])
+
+
+def resolve_monthly_plan(plan_name: str | None,
+                         subscription_plan: str | None = None):
+    """The monthly Plan for an account whose subscription_type is 'monthly'.
+
+    get_plan() maps a NULL, unknown, or BARE-TIER key to the trial plan at 1
+    credit/image. For a monthly account that silently misprices everything by 5x:
+    an add-on top-up grants a fifth of the credits the customer paid for, and a
+    cancellation converts add-on credits to five times the images they own.
+    users.subscription_plan holds the bare tier ('pro') for a monthly account, so
+    it is the natural recovery source.
+
+    Returns (plan, recovered). `plan` is None when no monthly plan can be
+    resolved at all — callers MUST fail closed rather than price at a guess.
+    """
+    plan = get_plan(plan_name)
+    if plan.plan_type == "monthly":
+        return plan, False
+    for candidate in (subscription_plan, plan_name):
+        if not candidate:
+            continue
+        recovered = PLANS.get(plan_key_for(candidate, "monthly"))
+        if recovered is not None and recovered.plan_type == "monthly":
+            return recovered, True
+    return None, True
 
 
 def credit_cost(plan: Plan, image_count: int) -> int:
