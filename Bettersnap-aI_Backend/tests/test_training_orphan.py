@@ -17,6 +17,7 @@ No Azure, no database, no queue, no GPU.
 
 Run: python -m unittest tests.test_training_orphan   (from the backend dir)
 """
+import json
 import os
 import sys
 import unittest
@@ -127,9 +128,13 @@ class _Base(unittest.TestCase):
                              monthly_credit_cost=self.monthly_charge,
                              one_time_credit_cost=self.one_time_charge)
         # two parked jobs owned by the missing user — they must NOT be swept
-        self.db.add_job("PARK1", user_id=UID, status="waiting_lora")
+        parked_params = json.dumps({"credit_cost": 40, "monthly_credit_cost": 0,
+                                    "one_time_credit_cost": 40})
+        self.db.add_job("PARK1", user_id=UID, status="waiting_lora",
+                        source_type="monthly", job_params=parked_params)
         self.db.add_reserve("PARK1", user_id=UID)
-        self.db.add_job("PARK2", user_id=UID, status="waiting_lora")
+        self.db.add_job("PARK2", user_id=UID, status="waiting_lora",
+                        source_type="monthly", job_params=parked_params)
         self.db.add_reserve("PARK2", user_id=UID)
         self._patches = [
             mock.patch.object(function_app, "credit_ledger", FakeLedgerModule),

@@ -626,13 +626,20 @@ def apply_refund_plan(cur, plan, job_id=None):
             plan["aggregate_delta"], user_id, plan["organization_id"])
         return _balance_moved(cur)
     if plan["funding"] == FUNDING_BUCKETED:
+        # A plan transition changes the persistent bucket's UNIT (images on one-time,
+        # credits on monthly). Never apply an old-unit refund to a new-unit account: keep
+        # the existing durable refund marker for Support review instead of creating a 5x
+        # over/under-credit. Normal immediate refunds still take this path unchanged.
+        if job_id is not None:
+            cur.execute("SELECT source_type FROM jobs WHERE job_id = ?", job_id)
+            source_row = cur.fetchone()
+            cur.execute("SELECT subscription_type FROM users WHERE user_id = ?", user_id)
+            user_row = cur.fetchone()
+            if not source_row or not user_row or source_row[0] != user_row[0]:
+                return False
         cur.execute(
-            # The CASE is preserved from the original: a user whose monthly subscription has
-            # lapsed does not get monthly credits back into a bucket they can no longer spend
-            # from, but the aggregate is still restored in full.
             "UPDATE users SET "
-            "monthly_credits_remaining = monthly_credits_remaining + "
-            "CASE WHEN subscription_type = 'monthly' THEN ? ELSE 0 END, "
+            "monthly_credits_remaining = monthly_credits_remaining + ?, "
             "one_time_credits_remaining = one_time_credits_remaining + ?, "
             "credits_remaining = credits_remaining + ? "
             "WHERE user_id = ?",

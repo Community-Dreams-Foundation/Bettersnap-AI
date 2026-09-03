@@ -93,14 +93,17 @@ def setUpModule():
 
 class _Cur:
     """Answers TOP-1 event / status selects with a scripted latest event."""
-    def __init__(self, latest=None):
+    def __init__(self, latest=None, terms_accepted_at="2026-01-01T00:00:00Z"):
         self.latest = latest  # None | ("given",...) | ("revoked",...)
+        self.terms_accepted_at = terms_accepted_at
         self._fetch = None
         self.consent_inserts = []
         self.audit_inserts = []
     def execute(self, sql, *params):
         s = " ".join(sql.split()).lower()
-        if "insert into dbo.biometric_consent" in s:
+        if "select terms_accepted_at from users" in s:
+            self._fetch = (self.terms_accepted_at,)
+        elif "insert into dbo.biometric_consent" in s:
             self.consent_inserts.append(params)
             self._fetch = None
         elif "insert into dbo.audit_log" in s:
@@ -185,6 +188,18 @@ class UploadTrainGuard(unittest.TestCase):
         # Default off -> no consent check -> "No photo provided" (400), never 403.
         resp = self._run_upload(required=False, latest=None)
         self.assertEqual(resp.status_code, 400)
+
+    def test_terms_guard_blocks_upload_before_biometric_or_file_checks(self):
+        with _db(_Cur(terms_accepted_at=None)):
+            resp = function_app.upload_photo(_Req(files={}))
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(json.loads(resp.body)["error"], "terms_acceptance_required")
+
+    def test_terms_guard_blocks_training_before_biometric_or_crop_imports(self):
+        with _db(_Cur(terms_accepted_at=None)):
+            resp = function_app.start_training(_Req(body={}))
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(json.loads(resp.body)["error"], "terms_acceptance_required")
 
 
 class AuditEvent(unittest.TestCase):

@@ -306,6 +306,9 @@ class UploadServerNamingTests(unittest.TestCase):
         function_app.upload_blob.reset_mock()
         function_app.upload_blob.return_value = "https://storage/upload"
         sys.modules["shared.auth"].get_user_id.return_value = "user-1"
+        # Upload now enforces the server-side Terms gate; these tests exercise blob naming,
+        # so model an already-consented user and keep the concern under test isolated.
+        function_app.get_db.return_value.cursor.return_value.fetchone.return_value = (object(),)
 
     def test_duplicate_client_filenames_get_distinct_server_blob_names(self):
         first = function_app.upload_photo(self._request("image.jpg"))
@@ -502,6 +505,24 @@ class FakeCursor:
             self._fetch = (
                 self.cfg.get("plan_name", "monthly_pro"),
             ) if self.cfg.get("subscription_type", "monthly") == "monthly" else None
+        elif ("select subscription_type, credits_remaining, one_time_credits_remaining" in s
+              and "with (updlock, holdlock)" in s):
+            self._fetch = (
+                self.cfg.get("subscription_type", "one_time"),
+                self.cfg.get("credits", 20),
+                self.cfg.get("one_time_credits", 20),
+                self.cfg.get("subscription_plan", "basic"),
+                self.cfg.get("plan_name", "basic"),
+            )
+        elif ("select user_id, plan_name, subscription_plan" in s
+              and "with (updlock, holdlock)" in s):
+            self._fetch = (
+                "user-1",
+                self.cfg.get("plan_name", "monthly_pro"),
+                self.cfg.get("subscription_plan", "pro"),
+                self.cfg.get("monthly_credits", 120),
+                self.cfg.get("one_time_credits", 250),
+            )
         elif "update users with (updlock, rowlock) set" in s:
             if self.cfg.get("subscription_type") == "monthly" and self.cfg.get("stripe_subscription_id"):
                 self.rowcount = 0
@@ -1593,6 +1614,8 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertIn("not_an_upgrade", response.body)
 
     def test_monthly_checkout_parks_existing_one_time_balance(self):
+        self._cfg.update(subscription_type="one_time", credits=20,
+                         one_time_credits=20, plan_name="basic")
         function_app._handle_monthly_checkout(
             {
                 "metadata": {
@@ -1606,21 +1629,16 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             "evt_monthly_checkout",
         )
 
-        activation_sql = next(
-            sql for sql, _ in self._cfg["executed"]
+        activation_sql, activation_params = next(
+            (sql, params) for sql, params in self._cfg["executed"]
             if "monthly_credits_remaining" in sql.lower()
             and "stripe_checkout_token" in sql.lower()
             and "update users set" in sql.lower()
         )
-        self.assertIn(
-            "one_time_credits_remaining = case when subscription_type = 'monthly'",
-            activation_sql.lower(),
-        )
-        self.assertIn("else credits_remaining end", activation_sql.lower())
-        self.assertIn(
-            "credits_remaining = ? +",
-            activation_sql.lower(),
-        )
+        self.assertIn("one_time_credits_remaining = ?", activation_sql.lower())
+        self.assertIn("credits_remaining = ? + ?", activation_sql.lower())
+        self.assertEqual(activation_params[5], 100)  # 20 images × 5 credits/image
+        self.assertEqual(activation_params[7], 100)  # persistent add-on bucket
 
     def test_repeated_one_time_purchase_rebuilds_total_and_clears_monthly_state(self):
         function_app._handle_onetime_payment(
@@ -1646,6 +1664,8 @@ class SubscriptionReliabilityTests(unittest.TestCase):
         self.assertEqual(params[3], 30)
 
     def test_subscription_end_clears_monthly_and_restores_one_time_balance(self):
+        self._cfg.update(plan_name="monthly_pro", monthly_credits=120,
+                         one_time_credits=250)
         function_app._handle_subscription_ended(
             {"id": "sub_123", "status": "canceled"},
             "evt_subscription_ended",
@@ -1655,14 +1675,9 @@ class SubscriptionReliabilityTests(unittest.TestCase):
             sql for sql, _ in self._cfg["executed"]
             if "monthly_credits_remaining = 0" in sql.lower()
         )
-        self.assertIn(
-            "credits_remaining = one_time_credits_remaining",
-            downgrade_sql.lower(),
-        )
-        self.assertIn(
-            "subscription_type = case when one_time_credits_remaining > 0",
-            downgrade_sql.lower(),
-        )
+        self.assertIn("credits_remaining = ?", downgrade_sql.lower())
+        params = next(params for sql, params in self._cfg["executed"] if sql == downgrade_sql)
+        self.assertEqual(params[3], 50)  # 250 add-on credits ÷ 5 credits/image
         self.assertIn("credits_monthly_limit = null", downgrade_sql.lower())
 
     def test_invoice_paid_resets_only_monthly_balance(self):
@@ -2206,7 +2221,8 @@ class PublicCatalogPrivacyTests(unittest.TestCase):
 
 class SubscriptionDowngradeTests(unittest.TestCase):
     def test_ended_subscription_preserves_one_time_credits(self):
-        cfg = {}
+        cfg = {"plan_name": "monthly_pro", "monthly_credits": 20,
+               "one_time_credits": 250}
         with mock.patch.object(function_app, "new_connection",
                                return_value=FakeConn(cfg)):
             function_app._handle_subscription_ended(
@@ -2222,10 +2238,11 @@ class SubscriptionDowngradeTests(unittest.TestCase):
         # Separate-balance downgrade: keep any remaining one-time credits (revert to a one_time
         # account) instead of wiping to the trial/registration limit. Only RETENTION_DAYS + the
         # subscription id bind now.
-        self.assertIn("credits_remaining = one_time_credits_remaining", sql.lower())
+        self.assertIn("credits_remaining = ?", sql.lower())
         self.assertIn("monthly_credits_remaining = 0", sql.lower())
-        self.assertEqual(params[0], function_app.RETENTION_DAYS)
-        self.assertEqual(params[1], "sub-ended")
+        self.assertEqual(params[3], 50)
+        self.assertEqual(params[-2], function_app.RETENTION_DAYS)
+        self.assertEqual(params[-1], "sub-ended")
 
 
 class StripePaidGrantTests(unittest.TestCase):

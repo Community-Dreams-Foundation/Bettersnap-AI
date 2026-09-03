@@ -1661,6 +1661,14 @@ def update_profile(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
     )
 
+# ── Terms ────────────────────────────────────────────────
+def _terms_accepted(cursor, user_id) -> bool:
+    """Return whether the authenticated user has accepted the Terms flow."""
+    cursor.execute("SELECT terms_accepted_at FROM users WHERE user_id = ?", user_id)
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
+
+
 # ── Terms: Status ────────────────────────────────────────
 @app.route(route="users/terms-status", methods=["GET"])
 def terms_status(req: func.HttpRequest) -> func.HttpResponse:
@@ -1808,9 +1816,18 @@ def upload_photo(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
+    # The onboarding modal is a UX control, not an authorization boundary. Enforce
+    # acceptance here so a direct API caller cannot store facial photos without it.
+    cursor = get_db().cursor()
+    if not _terms_accepted(cursor, user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "terms_acceptance_required",
+                        "message": "Accept the Terms and Privacy Policy before uploading photos."}),
+            mimetype="application/json", status_code=403)
+
     # BIPA/GDPR guard: no facial-data upload without active server-side biometric consent.
     # Env-gated (default off) so it can't break uploads before the consent flow + migration are live.
-    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(cursor, user_id):
         return func.HttpResponse(
             json.dumps({"error": "biometric_consent_required",
                         "message": "Explicit biometric consent is required before uploading photos."}),
@@ -1956,9 +1973,19 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return func.HttpResponse("Unauthorized", status_code=401)
 
+    # Training persists a facial model, so enforce the same server-side Terms
+    # boundary as upload rather than relying on the frontend wizard.
+    conn = get_db()
+    cur = conn.cursor()
+    if not _terms_accepted(cur, user_id):
+        return func.HttpResponse(
+            json.dumps({"error": "terms_acceptance_required",
+                        "message": "Accept the Terms and Privacy Policy before training."}),
+            mimetype="application/json", status_code=403)
+
     # BIPA/GDPR guard: training turns facial data into a persisted per-user model — require
     # active server-side biometric consent (env-gated, default off).
-    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(get_db().cursor(), user_id):
+    if BIOMETRIC_CONSENT_REQUIRED and not _biometric_consent_active(cur, user_id):
         return func.HttpResponse(
             json.dumps({"error": "biometric_consent_required",
                         "message": "Explicit biometric consent is required before training."}),
@@ -1976,8 +2003,6 @@ def start_training(req: func.HttpRequest) -> func.HttpResponse:
     force = bool(body.get("force"))
 
     # ── Don't start a second run for a user who already has one ──────────────
-    conn = get_db()
-    cur = conn.cursor()
     cur.execute(
         "SELECT lora_status, credits_remaining, retrain_count, plan_name, "
         "one_time_credits_remaining, monthly_credits_remaining FROM users WHERE user_id = ?",
@@ -5395,7 +5420,7 @@ def _subscription_status_payload(cursor, user_id):
         "SELECT subscription_plan, subscription_type, credits_remaining, "
         "credits_monthly_limit, subscription_renewed_at, payment_failed_at, "
         "subscription_cancel_at, one_time_credits_remaining, "
-        "monthly_credits_remaining FROM users WHERE user_id = ?",
+        "monthly_credits_remaining, plan_name FROM users WHERE user_id = ?",
         user_id,
     )
     row = cursor.fetchone()
@@ -5419,6 +5444,10 @@ def _subscription_status_payload(cursor, user_id):
             "credits_remaining": seat["credits_remaining"],
             "one_time_credits_remaining": seat["credits_remaining"],
             "monthly_credits_remaining": 0,
+            "images_remaining": seat["credits_remaining"],
+            "add_on_images_remaining": 0,
+            "balance_unit": "images",
+            "credits_per_image": 1,
             "credits_monthly_limit": None,
             "monthly_quota": None,
             "subscription_renewed_at": None,
@@ -5436,15 +5465,27 @@ def _subscription_status_payload(cursor, user_id):
     if row[1] == "monthly" and row[4]:
         next_renewal = str(_add_one_month(row[4]))
 
+    is_monthly = row[1] == "monthly"
+    # row[0] is also a valid plan key; the fallback keeps compatibility with older test/
+    # read replicas that have not yet projected plan_name in this response query.
+    credits_per_image = get_plan(row[9] if len(row) > 9 else row[0]).credits_per_image
+    add_on_balance = int(row[7] or 0)
+    monthly_balance = int(row[8] or 0) if is_monthly else 0
     return {
         "subscription_plan": row[0],
         "subscription_type": row[1],
         "plan": row[0],
         "type": row[1],
-        "credits_remaining": row[2] if row[1] == "monthly" else row[7],
+        "credits_remaining": row[2] if is_monthly else row[7],
         "one_time_credits_remaining": row[7],
-        "add_on_credits_remaining": row[7],
-        "monthly_credits_remaining": row[8] if row[1] == "monthly" else 0,
+        "add_on_credits_remaining": add_on_balance if is_monthly else 0,
+        "monthly_credits_remaining": monthly_balance,
+        "images_remaining": ((monthly_balance + add_on_balance) // credits_per_image
+                             if is_monthly else add_on_balance),
+        "add_on_images_remaining": (add_on_balance // credits_per_image
+                                    if is_monthly else add_on_balance),
+        "balance_unit": "credits" if is_monthly else "images",
+        "credits_per_image": credits_per_image,
         "credits_monthly_limit": row[3] if row[1] == "monthly" else None,
         "monthly_quota": row[3] if row[1] == "monthly" else None,
         "subscription_renewed_at": _utc_iso(row[4]) if row[1] == "monthly" else None,
@@ -6687,6 +6728,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
         return
 
     credits = MONTHLY_PLANS[plan]["credits"]
+    monthly_plan_key = plan_key_for(plan, "monthly")
+    monthly_rate = get_plan(monthly_plan_key).credits_per_image
     conn = new_connection()
     try:
         cur = conn.cursor()
@@ -6695,6 +6738,23 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             conn.rollback()
             logging.info(f"Stripe event {event_id} already processed; skipping monthly activation.")
             return
+        # Lock and snapshot the old entitlement before changing its unit. A one-time
+        # balance is an IMAGE count; the monthly add-on bucket is a CREDIT count.
+        cur.execute(
+            "SELECT subscription_type, credits_remaining, one_time_credits_remaining, "
+            "subscription_plan, plan_name FROM users WITH (UPDLOCK, HOLDLOCK) "
+            "WHERE user_id = ?", user_id)
+        old = cur.fetchone()
+        if not old:
+            conn.rollback()
+            raise RetryableStripeWebhookError(
+                f"monthly activation matched no user: user_id={user_id} plan={plan}")
+        was_monthly = old[0] == "monthly"
+        old_persistent = int(old[2] or 0) if was_monthly else int(old[1] or 0)
+        persistent_credits = (old_persistent if was_monthly else
+                              old_persistent * monthly_rate)
+        conversion_delta = persistent_credits - old_persistent
+        old_plan = old[3] or old[4]
         cur.execute(
             """UPDATE users SET
                 subscription_plan       = ?,
@@ -6702,21 +6762,17 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 plan_name               = ?,
                 stripe_customer_id      = ?,
                 stripe_subscription_id  = ?,
-                credits_remaining       = ? +
-                    CASE WHEN subscription_type = 'monthly'
-                         THEN one_time_credits_remaining ELSE credits_remaining END,
+                credits_remaining       = ? + ?,
                 monthly_credits_remaining = ?,
-                one_time_credits_remaining =
-                    CASE WHEN subscription_type = 'monthly'
-                         THEN one_time_credits_remaining ELSE credits_remaining END,
+                one_time_credits_remaining = ?,
                 one_time_plan =
                     CASE WHEN subscription_type = 'monthly'
                          THEN one_time_plan
-                         ELSE ISNULL(one_time_plan, ISNULL(subscription_plan, plan_name)) END,
+                         ELSE ISNULL(one_time_plan, ?) END,
                 one_time_plan_name =
                     CASE WHEN subscription_type = 'monthly'
                          THEN one_time_plan_name
-                         ELSE ISNULL(one_time_plan_name, plan_name) END,
+                         ELSE ISNULL(one_time_plan_name, ?) END,
                 credits_monthly_limit   = ?,
                 subscription_renewed_at = GETUTCDATE(),
                 retention_expires_at    = NULL,
@@ -6725,8 +6781,9 @@ def _handle_monthly_checkout(session: dict, event_id: str):
             WHERE user_id = ?
               AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?)
               AND (stripe_checkout_token IS NULL OR stripe_checkout_token = ?)""",
-            plan, plan_key_for(plan, "monthly"), customer, sub_id,
-            credits, credits, credits,
+            plan, monthly_plan_key, customer, sub_id,
+            credits, persistent_credits, credits, persistent_credits,
+            old_plan, old_plan,
             user_id, sub_id, checkout_token,
         )
         applied = cur.rowcount
@@ -6744,6 +6801,8 @@ def _handle_monthly_checkout(session: dict, event_id: str):
                 f"monthly activation matched no user: user_id={user_id} plan={plan}")
         _clear_pending_purchase(cur, user_id)  # they completed a purchase; clear any queued one
         credit_ledger.record(cur, user_id, credits, credit_ledger.REASON_PURCHASE_MONTHLY)
+        credit_ledger.record(cur, user_id, conversion_delta,
+                             credit_ledger.REASON_PLAN_UNIT_CONVERSION)
         conn.commit()  # claim + activation + ledger row commit atomically
         logging.info(f"Monthly subscription activated: user={user_id} plan={plan} credits={credits}")
         _write_event(user_id, "payment.monthly", target=event_id,
@@ -7049,6 +7108,31 @@ def _handle_subscription_ended(sub: dict, event_id: str):
                 conn.rollback()
                 logging.info(f"Stripe event {event_id} already processed; skipping downgrade.")
                 return
+            cur.execute(
+                "SELECT user_id, plan_name, subscription_plan, monthly_credits_remaining, "
+                "one_time_credits_remaining FROM users WITH (UPDLOCK, HOLDLOCK) "
+                "WHERE stripe_subscription_id = ?", sub_id)
+            old = cur.fetchone()
+            if not old:
+                conn.rollback()
+                raise RetryableStripeWebhookError(
+                    f"subscription end matched no user: subscription={sub_id}")
+            user_id, plan_name, subscription_plan = old[0], old[1], old[2]
+            monthly_remaining = int(old[3] or 0)
+            add_on_credits = int(old[4] or 0)
+            monthly_key = plan_name or plan_key_for(subscription_plan, "monthly")
+            monthly_rate = get_plan(monthly_key).credits_per_image
+            try:
+                from shared.credit_units import credits_to_images, one_time_key_for_monthly
+                remaining_images = credits_to_images(add_on_credits, monthly_rate)
+            except ValueError as exc:
+                conn.rollback()
+                logging.critical(
+                    "PLAN_UNIT_CONVERSION_BLOCKED: subscription=%s add_on_credits=%s "
+                    "rate=%s; manual reconciliation required: %s",
+                    sub_id, add_on_credits, monthly_rate, exc)
+                raise RetryableStripeWebhookError(str(exc))
+            one_time_key = one_time_key_for_monthly(monthly_key)
             # Subscription is truly over → the user keeps their data for RETENTION_DAYS
             # more, then the hourly cleanup deletes the blobs.
             cur.execute(
@@ -7056,28 +7140,40 @@ def _handle_subscription_ended(sub: dict, event_id: str):
                     -- Separate-balance downgrade: when the subscription ends, keep any remaining
                     -- one-time credits (revert to a one_time account) rather than wiping them;
                     -- fall back to free only when there are none.
-                    subscription_plan      =
-                        CASE WHEN one_time_credits_remaining > 0
-                             THEN ISNULL(one_time_plan, ISNULL(one_time_plan_name, 'free'))
-                             ELSE 'free' END,
-                    subscription_type      =
-                        CASE WHEN one_time_credits_remaining > 0
-                             THEN 'one_time' ELSE NULL END,
-                    plan_name              =
-                        CASE WHEN one_time_credits_remaining > 0
-                             THEN ISNULL(one_time_plan_name, 'trial') ELSE 'trial' END,
+                    subscription_plan      = ?,
+                    subscription_type      = ?,
+                    plan_name              = ?,
                     stripe_subscription_id = NULL,
-                    credits_remaining      = one_time_credits_remaining,
+                    credits_remaining      = ?,
+                    one_time_credits_remaining = ?,
+                    one_time_plan          = ?,
+                    one_time_plan_name     = ?,
                     monthly_credits_remaining = 0,
                     credits_monthly_limit  = NULL,
                     subscription_cancel_at = NULL,
                     payment_failed_at      = NULL,
                     retention_expires_at   = DATEADD(DAY, ?, GETUTCDATE())
                 WHERE stripe_subscription_id = ?""",
+                one_time_key if remaining_images else "free",
+                "one_time" if remaining_images else None,
+                one_time_key if remaining_images else "trial",
+                remaining_images, remaining_images,
+                one_time_key if remaining_images else None,
+                one_time_key if remaining_images else None,
                 RETENTION_DAYS, sub_id,
             )
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise RetryableStripeWebhookError(
+                    f"subscription end update matched no user: subscription={sub_id}")
+            credit_ledger.record(cur, user_id, -monthly_remaining,
+                                 credit_ledger.REASON_MONTHLY_EXPIRATION)
+            credit_ledger.record(cur, user_id, remaining_images - add_on_credits,
+                                 credit_ledger.REASON_PLAN_UNIT_CONVERSION)
             conn.commit()
-            logging.info(f"Subscription {sub_id} ended → free; retention starts (+{RETENTION_DAYS}d)")
+            logging.info(
+                f"Subscription {sub_id} ended; monthly={monthly_remaining} expired, "
+                f"add-on={add_on_credits} credits converted to {remaining_images} images")
         finally:
             conn.close()
 

@@ -171,6 +171,12 @@ class TxCursor:
             r = self._job(params[0])
             self._fetch = ((r["job_params"], r["user_id"], r["source_type"],
                             r["organization_id"]) if r else None)
+        elif s.startswith("select source_type from jobs"):
+            r = self._job(params[0])
+            self._fetch = (r["source_type"],) if r else None
+        elif s.startswith("select subscription_type from users"):
+            r = self.conn.view_users().get(params[0])
+            self._fetch = (r["subscription_type"],) if r else None
         elif s.startswith("update organization_members set credits_remaining"):
             amount, uid, org = params
             members = self.conn.view_members()

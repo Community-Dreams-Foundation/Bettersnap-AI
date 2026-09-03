@@ -297,12 +297,12 @@ class DelayedCompensationRestoresEveryBucket(_Fixture):
         self.assertEqual(self.balances(db), (7, 0, 0),
                          "a legacy job has no buckets to restore")
 
-    def test_lapsed_subscription_gets_the_aggregate_but_not_the_monthly_bucket(self):
+    def test_lapsed_subscription_refund_stays_pending_for_support_review(self):
         db, ledger, result, _ = self.owe_then_settle(
             "mixed_monthly_and_one_time", subscription_type="one_time")
-        self.assertEqual(result, pr.REFUND_DONE)
-        self.assertEqual(self.balances(db), (50, 0, 30),
-                         "no monthly credits into a bucket they can no longer spend from")
+        self.assertEqual(result, pr.REFUND_PENDING)
+        self.assertEqual(self.balances(db), (0, 0, 0),
+                         "old monthly units must not be paid into an image balance")
 
     def test_organization_refund(self):
         db, cur, ledger, _ = self.make("one_time_only", seed_user=False)
@@ -318,6 +318,14 @@ class DelayedCompensationRestoresEveryBucket(_Fixture):
 
 
 class DelayedCompensationFailsClosed(_Fixture):
+    def test_one_time_job_refund_after_monthly_switch_stays_pending(self):
+        db, cur, ledger, _ = self.make("one_time_only", subscription_type="monthly")
+        transitioned, amount, state = pr.terminalize_and_refund(
+            cur, "J1", credit_ledger=ledger)
+        self.assertTrue(transitioned)
+        self.assertEqual((amount, state), (40, pr.REFUND_PENDING))
+        self.assertEqual(self.balances(db), (0, 0, 0))
+
     def test_malformed_marker_stays_pending_and_is_not_cleared(self):
         db, cur, ledger, _ = self.make("mixed_monthly_and_one_time", seed_user=False)
         pr.terminalize_and_refund(cur, "J1", credit_ledger=ledger)

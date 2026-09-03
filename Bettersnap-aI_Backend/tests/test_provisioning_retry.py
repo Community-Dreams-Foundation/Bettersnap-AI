@@ -207,6 +207,12 @@ class FakeCursor:
         elif s.startswith("select job_params, user_id, source_type from jobs"):
             r = self._job(params[0])
             self._fetch = (r["job_params"], r["user_id"], r["source_type"]) if r else None
+        elif s.startswith("select source_type from jobs"):
+            r = self._job(params[0])
+            self._fetch = (r["source_type"],) if r else None
+        elif s.startswith("select subscription_type from users"):
+            r = self.db.users.get(params[0])
+            self._fetch = (r["subscription_type"],) if r else None
         elif s.startswith("select organization_id from jobs"):
             r = self._job(params[0])
             self._fetch = (r["organization_id"],) if r else None
@@ -320,7 +326,7 @@ class FakeCursor:
             r = self._job(params[0])
             self._fetch = ((r["job_params"], r["user_id"], r["source_type"],
                             r["organization_id"]) if r else None)
-        elif s.startswith("update users set monthly_credits_remaining = monthly_credits_remaining + case"):
+        elif s.startswith("update users set monthly_credits_remaining = monthly_credits_remaining + ?"):
             monthly, one_time, aggregate, uid = params
             self._credit_user(uid, aggregate, monthly=monthly, one_time=one_time)
         elif s.startswith("update users set credits_remaining = credits_remaining + ? where user_id = ?"):
@@ -729,6 +735,7 @@ class Exhaustion(unittest.TestCase):
         self.assertEqual(self.db.orgs, {})
 
     def test_monthly_split_refund(self):
+        self.db.users["11111111-1111-4111-8111-111111111111"]["subscription_type"] = "monthly"
         self._job(source_type="monthly",
                   job_params=json.dumps({"credit_cost": 40, "monthly_credit_cost": 30,
                                          "one_time_credit_cost": 10}))
