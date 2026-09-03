@@ -17,7 +17,7 @@ only be proven against a real engine:
 | the filtered unique index blocks double-binding | no index enforcement |
 | the trusted FK blocks orphan links | no constraint engine |
 | a rollback undoes a partial refund | modelled, but not by the engine that will run it |
-| migrations 000–034 apply cleanly and are replayable | no DDL engine |
+| migrations 000–040 apply cleanly and are replayable | no DDL engine |
 | `THROW 50034 / 50035` fire on a wrong-shaped object | no `sys.*` catalog |
 
 ## Runtime and image
@@ -29,7 +29,7 @@ Use the **existing container runtime only** (Docker Desktop, already present —
 |---|---|
 | image | `mcr.microsoft.com/mssql/server` pinned **by digest** — see "Pinning" below |
 | pull size | ~1.5 GB compressed, **~2.9 GB on disk** |
-| data volume | ~500 MB for an empty DB + 35 migrations; allow **4 GB total** |
+| data volume | ~500 MB for an empty DB + 41 migrations; allow **4 GB total** |
 | container RAM | 2 GB minimum (SQL Server refuses to start below it) |
 | host port | **11433** → container 1433 (deliberately NOT 1433, so it cannot collide with, or be mistaken for, a local/prod instance) |
 | lifetime | ephemeral; destroyed with its volume at the end |
@@ -155,7 +155,7 @@ dozen misleading failures.
 
 | # | reachability | case | prerequisites | exercises (REAL runtime function) |
 |---|---|---|---|---|
-| 1 | reachable | migrations 000-034 apply to an empty database (exact canonical set) | — · **foundational** | `scripts/run_migrations.apply_migration + verify_runtime_schema` |
+| 1 | reachable | migrations 000-040 apply to an empty database (exact canonical set) | — · **foundational** | `scripts/run_migrations.apply_migration + verify_runtime_schema` |
 | 2 | reachable | re-running every migration is a no-op (replay / idempotency) | 1 | `scripts/run_migrations.split_batches` |
 | 3 | reachable | FK_lora_trainings_fused_job exists, is enabled and is TRUSTED | 1 · **foundational** | `migrations/034_fused_job_link.sql` |
 | 4 | reachable | FK_credit_tx_user exists, is enabled and is TRUSTED | 1 · **foundational** | `migrations/000_baseline.sql — the premise of the paid-orphan reasoning` |

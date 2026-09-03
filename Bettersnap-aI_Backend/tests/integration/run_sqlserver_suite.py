@@ -66,6 +66,7 @@ CANONICAL_MIGRATIONS = (
     # already applied in production; registering them here is what keeps this list honest
     # about what the schema actually contains.
     "038_dashboard_history_index.sql", "039_team_dashboard_roster_index.sql",
+    "040_repair_legacy_addon_units.sql",
 )
 
 # SQL Server native error numbers raised by migration 034's shape guards.
