@@ -84,6 +84,13 @@ export interface SuperAdminCreditsResponse{entries:SuperAdminCreditEntry[];total
 export interface SuperAdminAuditEvent{event_id:string;actor_email:string;action:string;target_type:string;target_id:string;previous_value:unknown;new_value:unknown;reason:string;result:string;created_at:string}
 export interface SuperAdminAuditResponse{events:SuperAdminAuditEvent[];total:number;limit:number;offset:number}
 export interface SuperAdminSystemHealth{sql:string|Record<string,unknown>;blob:string|Record<string,unknown>;gpu_active_executions:number;queue_depth:number;failed_jobs_24h:number}
+export interface SuperAdminDashboardSummary{
+  users:{total:number;new_30d:number;active_30d:number;paying:number}
+  jobs:{total:number;today:number;completed_today:number;failed_today:number;queue_depth:number;avg_processing_seconds:number|null}
+  billing:{credits_purchased_30d:number;note?:string}
+  organizations:{total:number}
+  support:{open:number;note?:string}
+}
 
 export interface SuperAdminUser{
   user_id:string

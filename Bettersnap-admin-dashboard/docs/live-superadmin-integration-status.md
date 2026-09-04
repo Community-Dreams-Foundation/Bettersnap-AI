@@ -6,7 +6,7 @@ The frontend uses `/api/superadmin/*`, never `/api/admin/*`. Microsoft Entra use
 
 | Dashboard capability | Backend endpoint | UI |
 |---|---|---|
-| Dashboard aggregates | `GET /superadmin/users`, `/jobs`, `/payments`, `/subscriptions`, `/credits`, `/system-health`, `/audit-logs` | The frontend composes dashboard values from complete paginated responses; there is no summary endpoint dependency |
+| Dashboard aggregates | `GET /superadmin/dashboard/summary`, `/system-health`, `/audit-logs` | The frontend uses server-side aggregates and does not download complete paginated datasets |
 | User directory/search | `GET /superadmin/users?q=&limit=&offset=` | Users list and pagination |
 | User detail | `GET /superadmin/users/{user_id}` | Account, subscription fields, recent jobs, and per-user credit ledger |
 | Jobs directory/filter | `GET /superadmin/jobs?status=&user_id=&limit=&offset=` | Jobs list and pagination |
